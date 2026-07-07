@@ -1,6 +1,7 @@
 .venv/
 models/
 outputs/
+offline/wheelhouse/
 eval/corpus/
 eval/runs/
 __pycache__/

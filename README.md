@@ -29,6 +29,17 @@ E:\ChineseASR\models\modelscope
 
 如果你要完全避免外网下载，请先把 PyTorch / FunASR / ModelScope wheel 放到本地 wheelhouse，再用 `scripts\install-torch-cu128-direct.ps1 -Wheelhouse <目录>`。
 
+项目也提供轻量离线恢复链路，用于把当前可工作的 Python 依赖冻结成 lock，再下载 wheel 并生成 SHA256 校验：
+
+```powershell
+.\scripts\export-lock.ps1
+.\scripts\build-wheelhouse.ps1
+.\scripts\verify-wheelhouse.ps1
+.\scripts\install-offline.ps1 -Venv E:\ChineseASR\.venv-offline-smoke
+```
+
+`build-wheelhouse.ps1` 会先清空代理环境变量，PyTorch 走 `https://download.pytorch.org/whl/cu128`，普通 Python 包默认走清华 PyPI 源。`offline\wheelhouse\` 只存大 wheel 文件并被 Git 忽略；`offline\manifests\` 用于保存 `requirements-lock.txt`、`wheelhouse.sha256` 和 `wheelhouse.json` 这类小清单。第一版只覆盖 Python wheel 依赖，模型权重仍由 ModelScope 缓存和 `download-models.ps1` 管理。
+
 ## 安装顺序
 
 在 PowerShell 中运行：
