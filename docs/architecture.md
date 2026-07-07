@@ -93,12 +93,29 @@ API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 8765` 提供，主
 
 新增不同运行时，例如 Whisper 本地实现、其他 LLM 音频模型或云 API 时，应新增 adapter，并保持 pipeline 只依赖统一的 `build_model(...)` / `generate(...)` 形状。当前已有 `funasr` 和 `qwen-asr` 两个 adapter。
 
-后续扩展时应增加：
+## 已实现的审计闭环
 
-- 音频 hash 和输入元数据。
-- 顶级 LLM 仲裁，用于对模型分歧给最终猜测和置信说明。
-- 疑似幻觉片段标记。
-- CER/WER/CER-like 中文评测集。
+当前个人使用版已经闭合以下能力，作为已交付范围记录：
+
+- 输入与运行可追踪：`manifest.json` / `metrics.json` 记录音频 hash、truth hash、模型配置 hash、选中模型、命令、运行时和耗时。
+- 双模型审计：strict 输出 `strict.md`、`strict.audit.md`、`strict.audit.json` 和两路 raw JSON，最终稿与证据分离。
+- 幻觉规则库：静音出字、常见模板废话、异常重复、双模型大分歧、繁体残留、超长无标点都会进入 audit / metrics / review。
+- 评测与 benchmark：内置隐私友好的合成/对抗评测集；用户私有音频可通过同名 audio/truth 目录跑 `benchmark.md`、`benchmark.json`、`review.md`。
+- 人工复核队列：`review.md` 按 P0/P1/P2 排序，给出复核原因、建议动作、截断证据和源文件路径。
+- 可选 LLM 仲裁：长音频模式可接本地 Ollama，只对不确定 chunk 做 evidence-only 仲裁，结果写入 audit / metrics，不改写 raw ASR 证据。
+
+LLM 仲裁刻意默认关闭。这是资源和可信度边界：默认转写链路必须在没有 Ollama、没有额外 GPU 驻留、没有顶级模型猜测的情况下稳定工作；需要最终猜测时再显式打开。
+
+固定时长长音频切片也不是当前关闭阻塞项。现有 manifest/schema 已支持断点续跑和未来替换 planner；后续如果真实长录音暴露边界切断问题，可以把 planner 升级为 VAD 静音边界切片，而不改变输出契约。
+
+个人使用版关闭标准：
+
+1. `doctor.ps1` 能确认无代理、CUDA、模型配置和依赖状态。
+2. 单元测试全通过。
+3. `smoke-asr-smart.ps1 -Json` 能完成 strict smart job，并产出 final、audit、audit JSON 和两路 raw JSON。
+4. 公开仓库只包含源码、脚本、配置、测试和文档，不包含模型权重、用户音频、输出转写或 wheelhouse 大文件。
+
+真实私人录音 benchmark 属于后续校准，不是公开项目或本地工具链的关闭阻塞项。
 
 ## 下载策略
 

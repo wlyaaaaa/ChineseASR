@@ -11,6 +11,15 @@ ChineseASR is a local-first Chinese speech-to-text project focused on low halluc
 - **Agent-safe execution**: `scripts\asr-smart.ps1` submits a job to a local API and returns quickly instead of blocking the caller indefinitely.
 - **No proxy by default**: wrapper scripts clear proxy environment variables before setup, download, evaluation, and transcription commands.
 
+## Closeout Status
+
+Personal-use v0.1 is considered closed when `scripts\doctor.ps1`, unit tests,
+and `scripts\smoke-asr-smart.ps1 -Json` pass, and the public repository
+boundary remains clean. Remaining activities are optional calibration or future
+optimization: running private real-audio benchmarks with human truth, enabling
+local Ollama arbitration for difficult long-audio disagreements, or replacing
+fixed chunking with VAD-boundary chunk planning.
+
 ## Current Default Engines
 
 | Mode | Default | Purpose |
