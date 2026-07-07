@@ -119,7 +119,7 @@ E:\ChineseASR\configs\models.yaml
 
 - `metrics.json`：schema v2 运行账本，含模型配置快照、命令、运行环境、耗时、CER、模型分歧、文本相似度、风险标记、`rule_hits`、false confident 统计。
 - `benchmark.md`：整体分数表。
-- `review.md`：最值得人工复核的样本队列，会列出命中的规则 ID 和短证据。
+- `review.md`：按 `P0/P1/P2` 排序的人工复核队列，会列出原因、建议动作、音频/audit/raw JSON 路径和截断文本证据。
 
 `benchmark.ps1` 用于已有人工标准答案的真实/公开/第三方音频批次。音频和标准答案按文件名 stem 匹配：
 
@@ -136,7 +136,7 @@ truth\
 
 - `benchmark.json`：机器可读结果，复用 schema v2 运行账本，并补充 benchmark 的音频目录、truth 目录和 manifest 路径。
 - `benchmark.md`：人工可读汇总表。
-- `review.md`：缺 truth、模型分歧、疑似幻觉和 false confident 样本。
+- `review.md`：缺 truth、模型分歧、疑似幻觉和 false confident 样本；`P0` 优先回听，`P1` 核对后再信任，`P2` 补 truth 或确认跳过。
 
 `benchmark.ps1` 不会复制你的源音频或标准答案，只在输出目录下写 `_manifest\manifest.json` 记录路径、音频/truth hash、模型配置快照和运行清单。缺少对应 `.txt` 的音频不会评分，会进 `review.md`。
 

@@ -24,6 +24,7 @@ from .text_normalizer import to_simplified
 
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH_BYTES = 2
+REVIEW_TEXT_LIMIT = 120
 
 TTS_CASES = (
     {
@@ -646,35 +647,121 @@ def _write_benchmark(path: Path, summary: EvalSummary) -> None:
 
 
 def _write_review(path: Path, summary: EvalSummary) -> None:
-    review_items = [
-        item
-        for item in summary.cases
-        if item.false_confident or item.needs_review or item.empty_audio_text_len > 0 or item.skipped
+    review_items = sorted(
+        (
+            item
+            for item in summary.cases
+            if item.false_confident or item.needs_review or item.empty_audio_text_len > 0 or item.skipped
+        ),
+        key=lambda item: (_review_priority_rank(item), item.case_id),
+    )
+    lines = [
+        "# Evaluation Review Queue",
+        "",
+        f"- Review items: `{len(review_items)}`",
+        "- Priority guide: `P0` 优先回听；`P1` 核对后再信任；`P2` 补 truth 或确认跳过。",
+        "",
     ]
-    lines = ["# Evaluation Review Queue", ""]
     if not review_items:
         lines.append("- No review items.")
     else:
         for item in review_items:
-            flags = ", ".join(item.risk_flags) if item.risk_flags else "none"
+            priority = _review_priority(item)
             rule_hits = "; ".join(f"{hit.id} ({hit.severity}, {hit.evidence})" for hit in item.rule_hits) or "none"
-            if item.false_confident:
-                flags = f"{flags}, false_confident" if flags != "none" else "false_confident"
             lines.extend(
                 [
-                    f"## {item.case_id}",
+                    f"## {priority} {item.case_id}",
                     "",
                     f"- Kind: `{item.kind}`",
-                    f"- Flags: `{flags}`",
+                    f"- Reasons: `{', '.join(_review_reasons(item)) or 'needs_review'}`",
+                    f"- Action: `{_review_action(item)}`",
+                    f"- Metrics: `CER={_format_metric(item.cer)}; similarity={item.primary_secondary_similarity:.3f}; empty_text_len={item.empty_audio_text_len}`",
+                    f"- Audio: `{_path_or_none(item.audio)}`",
+                    f"- Audit JSON: `{_path_or_none(item.audit_json)}`",
+                    f"- Primary raw JSON: `{_path_or_none(item.primary_json)}`",
+                    f"- Secondary raw JSON: `{_path_or_none(item.secondary_json)}`",
                     f"- Rule hits: `{rule_hits}`",
-                    f"- Truth: `{item.truth_text}`",
-                    f"- Final: `{item.final_text}`",
+                    f"- Truth: `{_clip_review_text(item.truth_text)}`",
+                    f"- Final: `{_clip_review_text(item.final_text)}`",
+                    f"- Primary: `{_clip_review_text(item.primary_text)}`",
+                    f"- Secondary: `{_clip_review_text(item.secondary_text)}`",
                     f"- Skipped: `{str(item.skipped).lower()}`",
-                    f"- Skip reason: `{item.skip_reason}`",
+                    f"- Skip reason: `{_clip_review_text(item.skip_reason)}`",
                     "",
                 ]
             )
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _review_priority(item: EvalCaseResult) -> str:
+    if (
+        item.false_confident
+        or item.empty_audio_text_len > 0
+        or _has_rule(item, "empty_audio_hallucination")
+        or _has_rule(item, "suspicious_stock_phrase")
+    ):
+        return "P0"
+    if item.skipped:
+        return "P2"
+    return "P1"
+
+
+def _review_priority_rank(item: EvalCaseResult) -> int:
+    return {"P0": 0, "P1": 1, "P2": 2}[_review_priority(item)]
+
+
+def _review_reasons(item: EvalCaseResult) -> list[str]:
+    reasons: list[str] = []
+    if item.false_confident:
+        reasons.append("false_confident")
+    reasons.extend(hit.id for hit in item.rule_hits)
+    reasons.extend(item.risk_flags)
+    if item.skipped:
+        reasons.append(f"skipped: {item.skip_reason}")
+    return _dedupe_strings(reasons)
+
+
+def _review_action(item: EvalCaseResult) -> str:
+    if item.skipped:
+        return "补充同名 truth 文本后重跑，或确认该音频本轮不评分。"
+    if item.empty_audio_text_len > 0 or _has_rule(item, "empty_audio_hallucination"):
+        return "回听原音频，确认空音频/负样本是否被模型编出了文字。"
+    if _has_rule(item, "suspicious_stock_phrase"):
+        return "回听原音频，确认模板套话是否为模型幻觉。"
+    if _has_rule(item, "model_conflict") or "model_conflict" in item.risk_flags:
+        return "回听原音频，在两路模型文本中选择可信版本，必要时人工改写。"
+    if item.cer is not None and item.cer > 0.1:
+        return "对照 truth 和原音频，确认是模型错误还是标准答案需要修订。"
+    return "快速核对原音频和 audit，确认该条是否可以信任。"
+
+
+def _has_rule(item: EvalCaseResult, rule_id: str) -> bool:
+    return any(hit.id == rule_id for hit in item.rule_hits)
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        clean = value.strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        deduped.append(clean)
+    return deduped
+
+
+def _format_metric(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.3f}"
+
+
+def _path_or_none(path: Path | None) -> str:
+    return str(path) if path else "none"
+
+
+def _clip_review_text(text: str, limit: int = REVIEW_TEXT_LIMIT) -> str:
+    clean = " ".join(str(text).split())
+    return clean if len(clean) <= limit else f"{clean[:limit]}..."
 
 
 def _sha256(path: Path) -> str:

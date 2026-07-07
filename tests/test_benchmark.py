@@ -119,8 +119,11 @@ class BenchmarkTests(unittest.TestCase):
         self.assertTrue(scored_case["paths"]["primary_raw_json"].endswith(".raw.json"))
         self.assertIn("rule_hits", scored_case)
         self.assertIn("001", benchmark_md)
-        self.assertIn("missing", review_md)
+        self.assertIn("- Review items: `1`", review_md)
+        self.assertIn("## P2 missing", review_md)
         self.assertIn("Missing truth file", review_md)
+        self.assertIn("- Action: `补充同名 truth 文本后重跑，或确认该音频本轮不评分。`", review_md)
+        self.assertIn("- Audio: `", review_md)
 
 
 if __name__ == "__main__":

@@ -170,7 +170,17 @@ class EvalPackTests(unittest.TestCase):
         self.assertIn("suspicious_stock_phrase", silence_rule_ids)
         self.assertIn("silence-001", review)
         self.assertIn("false_confident", review)
-        self.assertIn("Rule hits:", review)
+        self.assertIn("- Review items: `3`", review)
+        self.assertIn("## P0 silence-001", review)
+        self.assertIn("## P1 tone-001", review)
+        self.assertLess(review.index("## P0 silence-001"), review.index("## P1 tone-001"))
+        self.assertIn("- Action: `回听原音频，确认空音频/负样本是否被模型编出了文字。`", review)
+        self.assertIn("- Audio: `", review)
+        self.assertIn("- Audit JSON: `", review)
+        self.assertIn("- Primary: `谢谢观看`", review)
+        self.assertIn("- Secondary: `谢谢观看`", review)
+        self.assertIn("- Metrics: `CER=n/a; similarity=0.200; empty_text_len=4`", review)
+        self.assertIn("- Rule hits: `", review)
         self.assertIn("empty_audio_hallucination", review)
         self.assertIn("tts-clean-001", benchmark)
 
@@ -193,6 +203,67 @@ class EvalPackTests(unittest.TestCase):
         )
 
         self.assertEqual(result["audio_name"], "sample.wav")
+
+    def test_review_queue_promotes_stock_phrase_hits_to_p0(self):
+        from zh_asr.eval_pack import EvalCaseResult, EvalSummary, _write_review
+        from zh_asr.risk_rules import RuleHit
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            item = EvalCaseResult(
+                case_id="stock-phrase",
+                category="benchmark",
+                kind="wav",
+                audio=root / "stock-phrase.wav",
+                audio_sha256="audiohash",
+                truth_sha256="truthhash",
+                truth_text="今天下午开会。",
+                final_text="谢谢观看。",
+                cer=1.0,
+                disagreement_score=0.0,
+                audit_status="suspicious",
+                primary_engine="sensevoice",
+                primary_text="谢谢观看。",
+                secondary_engine="qwen3-asr-1.7b",
+                secondary_text="谢谢观看。",
+                primary_secondary_similarity=1.0,
+                timing_total_sec=1.0,
+                timing_primary_sec=0.5,
+                timing_secondary_sec=0.5,
+                audit_json=root / "stock-phrase.strict.audit.json",
+                primary_json=root / "stock-phrase.sensevoice.raw.json",
+                secondary_json=root / "stock-phrase.qwen3-asr-1.7b.raw.json",
+                empty_audio_text_len=0,
+                risk_flags=("suspicious_stock_phrase",),
+                rule_hits=(
+                    RuleHit(
+                        id="suspicious_stock_phrase",
+                        severity="high",
+                        message="stock phrase",
+                        evidence="phrase=谢谢观看",
+                    ),
+                ),
+                false_confident=False,
+                simplified_only=True,
+                needs_review=True,
+            )
+            review_path = root / "review.md"
+            _write_review(
+                review_path,
+                EvalSummary(
+                    corpus_dir=root,
+                    out_dir=root,
+                    total=1,
+                    evaluated=1,
+                    skipped=0,
+                    hallucination_count=0,
+                    false_confident_count=0,
+                    cases=(item,),
+                ),
+            )
+            review = review_path.read_text(encoding="utf-8")
+
+        self.assertIn("## P0 stock-phrase", review)
 
 
 if __name__ == "__main__":
