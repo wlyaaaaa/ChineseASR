@@ -81,8 +81,8 @@ E:\ChineseASR\configs\models.yaml
 `strict` 是重要音频模式，默认会顺序运行 `qwen3-asr-1.7b` 和 `sensevoice`，输出：
 
 - `*.strict.md`：最终稿。正文尽量干净，只有严重分歧或听不清时才内联 `[疑似]` / `[听不清]`。
-- `*.strict.audit.md`：审计稿，记录两模型原文、相似度、状态、备选文本和判断依据。
-- `*.strict.audit.json`：机器可读审计数据。
+- `*.strict.audit.md`：审计稿，记录两模型原文、相似度、状态、备选文本、`rule_hits` 和判断依据。
+- `*.strict.audit.json`：机器可读审计数据，包含 `flags` 和结构化 `rule_hits`。
 - `*.qwen3-asr-1.7b.raw.json` / `*.sensevoice.raw.json`：两模型原始结果。
 
 `transcribe-folder.ps1` 是日常批量入口，默认递归扫描 `wav/mp3/m4a/flac`，按每个音频单独建输出目录，并运行 strict 双模型。已经存在 `*.strict.md` 的文件会自动跳过；加 `-Force` 可重跑。批量输出包括：
@@ -117,9 +117,9 @@ E:\ChineseASR\configs\models.yaml
 
 完整评测会复用 strict 双模型，输出：
 
-- `metrics.json`：schema v2 运行账本，含模型配置快照、命令、运行环境、耗时、CER、模型分歧、文本相似度、风险标记、false confident 统计。
+- `metrics.json`：schema v2 运行账本，含模型配置快照、命令、运行环境、耗时、CER、模型分歧、文本相似度、风险标记、`rule_hits`、false confident 统计。
 - `benchmark.md`：整体分数表。
-- `review.md`：最值得人工复核的样本队列。
+- `review.md`：最值得人工复核的样本队列，会列出命中的规则 ID 和短证据。
 
 `benchmark.ps1` 用于已有人工标准答案的真实/公开/第三方音频批次。音频和标准答案按文件名 stem 匹配：
 
@@ -151,6 +151,8 @@ $env:ZH_ASR_MODEL_CONFIG='E:\path\to\models.yaml'
 - 静音和噪声优先交给 VAD，不让 ASR 自由生成。
 - 原始逐字稿、结构化 JSON、后处理文本分层保存。
 - 对低置信片段、疑似套话、模型不一致片段打标，不静默润色。
+- deterministic 风险规则会标记：`empty_audio_hallucination`、`suspicious_stock_phrase`、`abnormal_repetition`、`model_conflict`、`traditional_residue`、`long_unpunctuated_text`。
+- `model_conflict` 只在两路模型都有实质文本且相似度低时触发；单边空输出优先交给静音/模板幻觉规则判断。
 - `transcript.md` 默认保持干净；会改变语义的不确定性才内联 `[疑似]` / `[听不清]`，详细证据放进 `audit.md`。
 - Whisper 只能作为交叉对照，不作为最终单一事实来源。
 

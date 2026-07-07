@@ -59,6 +59,38 @@ class AuditTests(unittest.TestCase):
 
         self.assertIn("suspicious_stock_phrase", report.flags)
         self.assertTrue(report.needs_review)
+        self.assertIn("suspicious_stock_phrase", {hit.id for hit in report.rule_hits})
+
+    def test_repetition_rule_marks_final_text_suspicious(self):
+        from zh_asr.audit import build_audit_report
+
+        repeated = "今天下午开会今天下午开会今天下午开会"
+        report = build_audit_report(
+            primary_engine="sensevoice",
+            primary_text=repeated,
+            secondary_engine="paraformer",
+            secondary_text=repeated,
+        )
+
+        self.assertEqual(report.status, "suspicious")
+        self.assertTrue(report.final_text.startswith("[疑似]"))
+        self.assertIn("abnormal_repetition", report.flags)
+        self.assertIn("abnormal_repetition", {hit.id for hit in report.rule_hits})
+
+    def test_expect_empty_rule_marks_substantive_text_as_hallucination(self):
+        from zh_asr.audit import build_audit_report
+
+        report = build_audit_report(
+            primary_engine="sensevoice",
+            primary_text="开放时间早上九点。",
+            secondary_engine="paraformer",
+            secondary_text="开放时间早上九点。",
+            expect_empty=True,
+        )
+
+        self.assertEqual(report.status, "suspicious")
+        self.assertIn("empty_audio_hallucination", report.flags)
+        self.assertEqual(next(hit for hit in report.rule_hits if hit.id == "empty_audio_hallucination").severity, "high")
 
     def test_short_semantic_difference_is_conflict(self):
         from zh_asr.audit import build_audit_report
@@ -73,6 +105,7 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(report.status, "conflict")
         self.assertTrue(report.needs_review)
         self.assertTrue(report.final_text.startswith("[疑似]"))
+        self.assertIn("model_conflict", {hit.id for hit in report.rule_hits})
 
     def test_final_text_and_comparison_use_simplified_chinese(self):
         from zh_asr.audit import build_audit_report
@@ -89,6 +122,7 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(report.primary_text, "开放时间：早上九点至下午五点。")
         self.assertEqual(report.secondary_text, "开放时间早上九点至下午五点。")
         self.assertEqual(report.similarity, 1.0)
+        self.assertEqual(report.rule_hits, ())
 
 
 if __name__ == "__main__":

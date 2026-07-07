@@ -117,6 +117,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(scored_case["models"]["primary"], "qwen3-asr-1.7b")
         self.assertEqual(scored_case["timing"]["primary_sec"], 0.4)
         self.assertTrue(scored_case["paths"]["primary_raw_json"].endswith(".raw.json"))
+        self.assertIn("rule_hits", scored_case)
         self.assertIn("001", benchmark_md)
         self.assertIn("missing", review_md)
         self.assertIn("Missing truth file", review_md)

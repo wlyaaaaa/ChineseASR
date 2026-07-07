@@ -163,9 +163,36 @@ class EvalPackTests(unittest.TestCase):
         self.assertTrue(clean_case["paths"]["primary_raw_json"].endswith(".raw.json"))
         self.assertTrue(clean_case["paths"]["secondary_raw_json"].endswith(".raw.json"))
         self.assertEqual(clean_case["audit_status"], "consistent")
+        self.assertEqual(clean_case["rule_hits"], [])
+        silence_case = next(case for case in metrics["cases"] if case["id"] == "silence-001")
+        silence_rule_ids = {hit["id"] for hit in silence_case["rule_hits"]}
+        self.assertIn("empty_audio_hallucination", silence_rule_ids)
+        self.assertIn("suspicious_stock_phrase", silence_rule_ids)
         self.assertIn("silence-001", review)
         self.assertIn("false_confident", review)
+        self.assertIn("Rule hits:", review)
+        self.assertIn("empty_audio_hallucination", review)
         self.assertIn("tts-clean-001", benchmark)
+
+    def test_strict_fn_adapter_preserves_positional_audio_argument(self):
+        from zh_asr.eval_pack import _call_strict_fn
+
+        def fake_strict(path, *, primary_engine, secondary_engine, device, out_dir, cache_dir, config):
+            return {"audio_name": path.name}
+
+        result = _call_strict_fn(
+            fake_strict,
+            audio_path=Path("sample.wav"),
+            primary_engine="primary",
+            secondary_engine="secondary",
+            device="cpu",
+            out_dir=Path("out"),
+            cache_dir=None,
+            config=None,
+            expect_empty=True,
+        )
+
+        self.assertEqual(result["audio_name"], "sample.wav")
 
 
 if __name__ == "__main__":

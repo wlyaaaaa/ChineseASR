@@ -17,12 +17,13 @@ def write_strict_bundle(
     secondary_engine: str,
     secondary_result: object,
     out_dir: Path,
+    expect_empty: bool = False,
 ) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = audio_path.stem
     primary_text = extract_text(primary_result)
     secondary_text = extract_text(secondary_result)
-    report = build_audit_report(primary_engine, primary_text, secondary_engine, secondary_text)
+    report = build_audit_report(primary_engine, primary_text, secondary_engine, secondary_text, expect_empty=expect_empty)
 
     final_path = out_dir / f"{stem}.strict.md"
     audit_path = out_dir / f"{stem}.strict.audit.md"
@@ -68,6 +69,10 @@ def _format_final_markdown(audio_path: Path, report: AuditReport) -> str:
 def _format_audit_markdown(audio_path: Path, report: AuditReport) -> str:
     alternatives = "\n".join(f"- {text}" for text in report.alternatives) or "- None"
     flags = ", ".join(report.flags) if report.flags else "none"
+    rule_hits = "\n".join(
+        f"- `{hit.id}` ({hit.severity}): {hit.message} Evidence: `{hit.evidence}`"
+        for hit in report.rule_hits
+    ) or "- None"
     return "\n".join(
         [
             f"# {audio_path.stem} Strict Audit",
@@ -77,6 +82,10 @@ def _format_audit_markdown(audio_path: Path, report: AuditReport) -> str:
             f"- Needs review: `{str(report.needs_review).lower()}`",
             f"- Similarity: `{report.similarity:.3f}`",
             f"- Flags: `{flags}`",
+            "",
+            "## Rule Hits",
+            "",
+            rule_hits,
             "",
             "## Final Guess",
             "",
@@ -100,4 +109,3 @@ def _format_audit_markdown(audio_path: Path, report: AuditReport) -> str:
             "",
         ]
     )
-

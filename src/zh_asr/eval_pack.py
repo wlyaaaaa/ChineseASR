@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import random
@@ -9,7 +10,7 @@ import struct
 import subprocess
 import time
 import wave
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +18,7 @@ from typing import Any, Callable
 from .config import ModelConfig, load_model_config
 from .metadata import capture_invocation, file_metadata, runtime_info, snapshot_model_config
 from .pipeline import strict_transcribe_audio
+from .risk_rules import RuleHit, evaluate_risk_rules
 from .text_normalizer import to_simplified
 
 
@@ -88,6 +90,7 @@ class EvalCaseResult:
     secondary_json: Path | None
     empty_audio_text_len: int
     risk_flags: tuple[str, ...]
+    rule_hits: tuple[RuleHit, ...]
     false_confident: bool
     simplified_only: bool
     needs_review: bool
@@ -214,14 +217,16 @@ def run_evaluation(
         expected_audit = case_out / f"{audio_path.stem}.strict.audit.json"
         case_started_perf = time.perf_counter()
         if not expected_audit.exists() or force:
-            paths = strict_fn(
-                audio_path,
+            paths = _call_strict_fn(
+                strict_fn,
+                audio_path=audio_path,
                 primary_engine=primary,
                 secondary_engine=secondary,
                 device=device,
                 out_dir=case_out,
                 cache_dir=cache_dir,
                 config=model_config,
+                expect_empty=bool(case.get("expect_empty", False)),
             )
             audit_json = paths.get("audit_json", expected_audit)
         else:
@@ -248,6 +253,23 @@ def run_evaluation(
     _write_benchmark(output_root / "benchmark.md", summary)
     _write_review(output_root / "review.md", summary)
     return summary
+
+
+def _call_strict_fn(strict_fn: StrictFn, **kwargs: Any) -> dict[str, Any]:
+    call_kwargs = dict(kwargs)
+    audio_path = call_kwargs.pop("audio_path")
+    if _accepts_keyword(strict_fn, "expect_empty"):
+        return strict_fn(audio_path, **call_kwargs)
+    call_kwargs.pop("expect_empty", None)
+    return strict_fn(audio_path, **call_kwargs)
+
+
+def _accepts_keyword(fn: StrictFn, name: str) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
 
 
 def char_error_rate(reference: str, hypothesis: str) -> float:
@@ -365,7 +387,20 @@ def _evaluate_case(
     cer = None if expect_empty else char_error_rate(truth_text, final_text)
     audit_flags = tuple(str(flag) for flag in audit.get("flags", []))
     needs_review = bool(audit.get("needs_review", False))
+    primary_text = to_simplified(str(audit.get("primary_text", "")))
+    secondary_text = to_simplified(str(audit.get("secondary_text", "")))
+    rule_hits = _merge_rule_hits(
+        _rule_hits_from_audit(audit),
+        evaluate_risk_rules(
+            primary_text=primary_text,
+            secondary_text=secondary_text,
+            final_text=final_text,
+            similarity=similarity,
+            expect_empty=expect_empty,
+        ),
+    )
     risk_flags = list(audit_flags)
+    risk_flags.extend(hit.id for hit in rule_hits)
 
     if expect_empty and empty_len > 0:
         risk_flags.append("empty_audio_hallucination")
@@ -390,9 +425,9 @@ def _evaluate_case(
         disagreement_score=disagreement_score,
         audit_status=str(audit.get("status", "")),
         primary_engine=str(audit.get("primary_engine", "")),
-        primary_text=to_simplified(str(audit.get("primary_text", ""))),
+        primary_text=primary_text,
         secondary_engine=str(audit.get("secondary_engine", "")),
-        secondary_text=to_simplified(str(audit.get("secondary_text", ""))),
+        secondary_text=secondary_text,
         primary_secondary_similarity=similarity,
         timing_total_sec=total_sec,
         timing_primary_sec=_optional_float(timing.get("primary_sec")),
@@ -402,6 +437,7 @@ def _evaluate_case(
         secondary_json=_optional_path(paths.get("secondary_json")),
         empty_audio_text_len=empty_len,
         risk_flags=tuple(sorted(set(risk_flags))),
+        rule_hits=rule_hits,
         false_confident=false_confident,
         simplified_only=final_text == to_simplified(final_text),
         needs_review=needs_review or bool(risk_flags),
@@ -435,12 +471,44 @@ def _skipped_case(case: dict[str, Any], corpus_root: Path, reason: str) -> EvalC
         secondary_json=None,
         empty_audio_text_len=0,
         risk_flags=(),
+        rule_hits=(),
         false_confident=False,
         simplified_only=True,
         needs_review=False,
         skipped=True,
         skip_reason=reason,
     )
+
+
+def _rule_hits_from_audit(audit: dict[str, Any]) -> tuple[RuleHit, ...]:
+    hits = []
+    for item in audit.get("rule_hits", []) or []:
+        if not isinstance(item, dict):
+            continue
+        rule_id = str(item.get("id", "")).strip()
+        if not rule_id:
+            continue
+        hits.append(
+            RuleHit(
+                id=rule_id,
+                severity=str(item.get("severity", "")).strip() or "medium",
+                message=str(item.get("message", "")).strip(),
+                evidence=str(item.get("evidence", "")).strip(),
+            )
+        )
+    return tuple(hits)
+
+
+def _merge_rule_hits(*groups: tuple[RuleHit, ...]) -> tuple[RuleHit, ...]:
+    seen: set[str] = set()
+    merged: list[RuleHit] = []
+    for group in groups:
+        for hit in group:
+            if hit.id in seen:
+                continue
+            seen.add(hit.id)
+            merged.append(hit)
+    return tuple(merged)
 
 
 def _summary(corpus_dir: Path, out_dir: Path, results: list[EvalCaseResult]) -> EvalSummary:
@@ -519,6 +587,7 @@ def _write_metrics(
                 },
                 "empty_audio_text_len": item.empty_audio_text_len,
                 "risk_flags": list(item.risk_flags),
+                "rule_hits": [asdict(hit) for hit in item.rule_hits],
                 "false_confident": item.false_confident,
                 "simplified_only": item.simplified_only,
                 "needs_review": item.needs_review,
@@ -588,6 +657,7 @@ def _write_review(path: Path, summary: EvalSummary) -> None:
     else:
         for item in review_items:
             flags = ", ".join(item.risk_flags) if item.risk_flags else "none"
+            rule_hits = "; ".join(f"{hit.id} ({hit.severity}, {hit.evidence})" for hit in item.rule_hits) or "none"
             if item.false_confident:
                 flags = f"{flags}, false_confident" if flags != "none" else "false_confident"
             lines.extend(
@@ -596,6 +666,7 @@ def _write_review(path: Path, summary: EvalSummary) -> None:
                     "",
                     f"- Kind: `{item.kind}`",
                     f"- Flags: `{flags}`",
+                    f"- Rule hits: `{rule_hits}`",
                     f"- Truth: `{item.truth_text}`",
                     f"- Final: `{item.final_text}`",
                     f"- Skipped: `{str(item.skipped).lower()}`",

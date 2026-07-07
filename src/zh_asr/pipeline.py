@@ -76,6 +76,7 @@ def strict_transcribe_audio(
     out_dir: Path | None = None,
     cache_dir: Path | None = None,
     config: ModelConfig | None = None,
+    expect_empty: bool = False,
 ) -> dict[str, Any]:
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -96,6 +97,7 @@ def strict_transcribe_audio(
         secondary_engine=secondary_name,
         secondary_result=secondary_result,
         out_dir=out_dir or project_root() / "outputs",
+        expect_empty=expect_empty,
     )
     paths["timing"] = {
         "total_sec": time.perf_counter() - total_started,
