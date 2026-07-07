@@ -36,11 +36,23 @@ class BenchmarkTests(unittest.TestCase):
 
             copied_audio = list(manifest_dir.rglob("*.wav")) + list(manifest_dir.rglob("*.mp3"))
 
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertIn("sha256", manifest["model_config"])
+        self.assertIn("qwen3-asr-1.7b", manifest["model_config"]["selected_engines"])
+        self.assertIn("sensevoice", manifest["model_config"]["selected_engines"])
+        self.assertIn("argv", manifest["invocation"])
         self.assertEqual(len(manifest["cases"]), 2)
         self.assertTrue(case_001["available"])
         self.assertEqual(case_001["truth_text"], "开放时间早上九点。")
+        self.assertNotEqual(case_001["audio_sha256"], "")
+        self.assertGreater(case_001["audio_size_bytes"], 0)
+        self.assertNotEqual(case_001["truth_sha256"], "")
+        self.assertGreater(case_001["truth_size_bytes"], 0)
         self.assertFalse(case_002["available"])
         self.assertIn("Missing truth file", case_002["error"])
+        self.assertNotEqual(case_002["audio_sha256"], "")
+        self.assertEqual(case_002["truth_sha256"], "")
+        self.assertEqual(case_002["truth_size_bytes"], 0)
         self.assertEqual(copied_audio, [])
 
     def test_run_benchmark_writes_benchmark_json_markdown_and_review(self):
@@ -64,8 +76,17 @@ class BenchmarkTests(unittest.TestCase):
                 "rationale": "fake",
             }
             audit_json = out_dir / f"{stem}.strict.audit.json"
+            primary_json = out_dir / f"{stem}.{primary_engine}.raw.json"
+            secondary_json = out_dir / f"{stem}.{secondary_engine}.raw.json"
             audit_json.write_text(json.dumps(audit, ensure_ascii=False), encoding="utf-8")
-            return {"audit_json": audit_json}
+            primary_json.write_text(json.dumps([{"text": final_text}], ensure_ascii=False), encoding="utf-8")
+            secondary_json.write_text(json.dumps([{"text": final_text}], ensure_ascii=False), encoding="utf-8")
+            return {
+                "audit_json": audit_json,
+                "primary_json": primary_json,
+                "secondary_json": secondary_json,
+                "timing": {"total_sec": 0.6, "primary_sec": 0.4, "secondary_sec": 0.2},
+            }
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -86,7 +107,16 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(summary.total, 2)
         self.assertEqual(summary.evaluated, 1)
         self.assertEqual(summary.skipped, 1)
+        self.assertEqual(benchmark_json["schema_version"], 2)
         self.assertEqual(benchmark_json["summary"]["evaluated"], 1)
+        self.assertIn("manifest", benchmark_json["benchmark"])
+        self.assertEqual(benchmark_json["benchmark"]["audio_dir"], str(audio_dir.resolve()))
+        self.assertEqual(benchmark_json["benchmark"]["truth_dir"], str(truth_dir.resolve()))
+        scored_case = next(case for case in benchmark_json["cases"] if case["id"] == "001")
+        self.assertNotEqual(scored_case["truth_sha256"], "")
+        self.assertEqual(scored_case["models"]["primary"], "qwen3-asr-1.7b")
+        self.assertEqual(scored_case["timing"]["primary_sec"], 0.4)
+        self.assertTrue(scored_case["paths"]["primary_raw_json"].endswith(".raw.json"))
         self.assertIn("001", benchmark_md)
         self.assertIn("missing", review_md)
         self.assertIn("Missing truth file", review_md)

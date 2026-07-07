@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import gc
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -75,15 +76,20 @@ def strict_transcribe_audio(
     out_dir: Path | None = None,
     cache_dir: Path | None = None,
     config: ModelConfig | None = None,
-) -> dict[str, Path]:
+) -> dict[str, Any]:
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
     model_config = config or load_model_config()
     primary_name = primary_engine or model_config.strict_primary_engine
     secondary_name = secondary_engine or model_config.strict_secondary_engine
+    total_started = time.perf_counter()
+    primary_started = time.perf_counter()
     primary_result = _generate_once(audio_path, primary_name, device, cache_dir, model_config)
+    primary_sec = time.perf_counter() - primary_started
+    secondary_started = time.perf_counter()
     secondary_result = _generate_once(audio_path, secondary_name, device, cache_dir, model_config)
-    return write_strict_bundle(
+    secondary_sec = time.perf_counter() - secondary_started
+    paths = write_strict_bundle(
         audio_path=audio_path,
         primary_engine=primary_name,
         primary_result=primary_result,
@@ -91,6 +97,12 @@ def strict_transcribe_audio(
         secondary_result=secondary_result,
         out_dir=out_dir or project_root() / "outputs",
     )
+    paths["timing"] = {
+        "total_sec": time.perf_counter() - total_started,
+        "primary_sec": primary_sec,
+        "secondary_sec": secondary_sec,
+    }
+    return paths
 
 
 def _generate_once(audio_path: Path, engine: str, device: str, cache_dir: Path | None, config: ModelConfig) -> Any:

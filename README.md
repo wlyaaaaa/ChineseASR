@@ -117,7 +117,7 @@ E:\ChineseASR\configs\models.yaml
 
 完整评测会复用 strict 双模型，输出：
 
-- `metrics.json`：CER、模型分歧、负样本吐字长度、风险标记、false confident 统计。
+- `metrics.json`：schema v2 运行账本，含模型配置快照、命令、运行环境、耗时、CER、模型分歧、文本相似度、风险标记、false confident 统计。
 - `benchmark.md`：整体分数表。
 - `review.md`：最值得人工复核的样本队列。
 
@@ -134,11 +134,11 @@ truth\
 
 运行后会调用 strict 双模型，并输出：
 
-- `benchmark.json`：机器可读结果，含音频 hash、truth hash、CER、模型分歧和风险标记。
+- `benchmark.json`：机器可读结果，复用 schema v2 运行账本，并补充 benchmark 的音频目录、truth 目录和 manifest 路径。
 - `benchmark.md`：人工可读汇总表。
 - `review.md`：缺 truth、模型分歧、疑似幻觉和 false confident 样本。
 
-`benchmark.ps1` 不会复制你的源音频或标准答案，只在输出目录下写 `_manifest\manifest.json` 记录路径和运行清单。缺少对应 `.txt` 的音频不会评分，会进 `review.md`。
+`benchmark.ps1` 不会复制你的源音频或标准答案，只在输出目录下写 `_manifest\manifest.json` 记录路径、音频/truth hash、模型配置快照和运行清单。缺少对应 `.txt` 的音频不会评分，会进 `review.md`。
 
 如需临时使用另一份模型配置，可设置：
 

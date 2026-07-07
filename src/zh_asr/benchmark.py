@@ -7,12 +7,21 @@ from pathlib import Path
 from typing import Any
 
 from .batch import AUDIO_EXTENSIONS
-from .config import ModelConfig
+from .config import ModelConfig, load_model_config
 from .eval_pack import EvalSummary, run_evaluation
+from .metadata import capture_invocation, file_metadata, snapshot_model_config
 from .pipeline import strict_transcribe_audio
 
 
-def build_benchmark_manifest(audio_dir: Path, truth_dir: Path, manifest_dir: Path, force: bool = False) -> Path:
+def build_benchmark_manifest(
+    audio_dir: Path,
+    truth_dir: Path,
+    manifest_dir: Path,
+    force: bool = False,
+    primary_engine: str | None = None,
+    secondary_engine: str | None = None,
+    config: ModelConfig | None = None,
+) -> Path:
     audio_root = audio_dir.resolve()
     truth_root = truth_dir.resolve()
     manifest_root = manifest_dir.resolve()
@@ -29,16 +38,27 @@ def build_benchmark_manifest(audio_dir: Path, truth_dir: Path, manifest_dir: Pat
         shutil.rmtree(manifest_root)
     manifest_root.mkdir(parents=True, exist_ok=True)
 
+    model_config = config or load_model_config()
+    selected_engines = (
+        primary_engine or model_config.strict_primary_engine,
+        secondary_engine or model_config.strict_secondary_engine,
+    )
     cases = []
     for audio_path in _find_audio_files(audio_root):
         case_id = _case_id(audio_root, audio_path)
         truth_path = truth_root / f"{audio_path.stem}.txt"
+        audio_meta = file_metadata(audio_path)
+        truth_meta = file_metadata(truth_path)
         case = {
             "id": case_id,
             "category": "benchmark",
             "kind": audio_path.suffix.lower().lstrip("."),
             "audio": str(audio_path),
+            "audio_sha256": audio_meta["sha256"],
+            "audio_size_bytes": audio_meta["size_bytes"],
             "truth": str(truth_path),
+            "truth_sha256": truth_meta["sha256"],
+            "truth_size_bytes": truth_meta["size_bytes"],
             "truth_text": "",
             "expect_empty": False,
             "available": True,
@@ -52,11 +72,14 @@ def build_benchmark_manifest(audio_dir: Path, truth_dir: Path, manifest_dir: Pat
         cases.append(case)
 
     manifest = {
+        "schema_version": 2,
         "version": 1,
         "generated": datetime.now().isoformat(timespec="seconds"),
         "description": "User-provided ChineseASR benchmark manifest.",
         "audio_dir": str(audio_root),
         "truth_dir": str(truth_root),
+        "model_config": snapshot_model_config(model_config, selected_engines),
+        "invocation": capture_invocation(),
         "cases": cases,
     }
     manifest_path = manifest_root / "manifest.json"
@@ -78,7 +101,16 @@ def run_benchmark(
 ) -> EvalSummary:
     output_root = out_dir.resolve()
     manifest_dir = output_root / "_manifest"
-    manifest_path = build_benchmark_manifest(audio_dir, truth_dir, manifest_dir, force=force)
+    model_config = config or load_model_config()
+    manifest_path = build_benchmark_manifest(
+        audio_dir,
+        truth_dir,
+        manifest_dir,
+        force=force,
+        primary_engine=primary_engine,
+        secondary_engine=secondary_engine,
+        config=model_config,
+    )
     summary = run_evaluation(
         corpus_dir=manifest_dir,
         out_dir=output_root,
@@ -87,7 +119,7 @@ def run_benchmark(
         force=force,
         primary_engine=primary_engine,
         secondary_engine=secondary_engine,
-        config=config,
+        config=model_config,
         strict_fn=strict_fn,
     )
     _write_benchmark_json(output_root / "benchmark.json", output_root / "metrics.json", manifest_path)

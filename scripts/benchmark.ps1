@@ -45,6 +45,7 @@ if (-not [string]::IsNullOrWhiteSpace($SecondaryEngine)) {
   $CliArgs += @('--secondary-engine', $SecondaryEngine)
 }
 
+$env:ZH_ASR_WRAPPER = 'scripts\benchmark.ps1'
 & $Python @CliArgs
 if ($LASTEXITCODE -ne 0) {
   throw "Benchmark failed with exit code $LASTEXITCODE."

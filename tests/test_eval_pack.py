@@ -39,12 +39,23 @@ class EvalPackTests(unittest.TestCase):
             silence_audio_exists = (corpus / silence_case["audio"]).exists()
             normal_truth_exists = (corpus / normal_case["truth"]).exists()
 
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertIn("sha256", manifest["model_config"])
+        self.assertIn("qwen3-asr-1.7b", manifest["model_config"]["selected_engines"])
+        self.assertIn("sensevoice", manifest["model_config"]["selected_engines"])
+        self.assertIn("argv", manifest["invocation"])
         self.assertIn("tts-clean-001", case_ids)
         self.assertIn("silence-001", case_ids)
         self.assertFalse(normal_case["expect_empty"])
         self.assertTrue(silence_case["expect_empty"])
         self.assertEqual(normal_case["truth_text"], "开放时间早上九点至下午五点。")
         self.assertEqual(silence_case["truth_text"], "")
+        self.assertNotEqual(normal_case["audio_sha256"], "")
+        self.assertGreater(normal_case["audio_size_bytes"], 0)
+        self.assertNotEqual(normal_case["truth_sha256"], "")
+        self.assertGreater(normal_case["truth_size_bytes"], 0)
+        self.assertNotEqual(silence_case["audio_sha256"], "")
+        self.assertNotEqual(silence_case["truth_sha256"], "")
         self.assertTrue(normal_audio_exists)
         self.assertTrue(silence_audio_exists)
         self.assertTrue(normal_truth_exists)
@@ -98,8 +109,17 @@ class EvalPackTests(unittest.TestCase):
                 "rationale": "fake",
             }
             audit_json = out_dir / f"{stem}.strict.audit.json"
+            primary_json = out_dir / f"{stem}.{primary_engine}.raw.json"
+            secondary_json = out_dir / f"{stem}.{secondary_engine}.raw.json"
             audit_json.write_text(json.dumps(audit, ensure_ascii=False), encoding="utf-8")
-            return {"audit_json": audit_json}
+            primary_json.write_text(json.dumps([{"text": final_text}], ensure_ascii=False), encoding="utf-8")
+            secondary_json.write_text(json.dumps([{"text": final_text}], ensure_ascii=False), encoding="utf-8")
+            return {
+                "audit_json": audit_json,
+                "primary_json": primary_json,
+                "secondary_json": secondary_json,
+                "timing": {"total_sec": 1.25, "primary_sec": 0.75, "secondary_sec": 0.5},
+            }
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -117,8 +137,32 @@ class EvalPackTests(unittest.TestCase):
             review = (out_dir / "review.md").read_text(encoding="utf-8")
 
         self.assertGreaterEqual(summary.total, 2)
+        self.assertEqual(metrics["schema_version"], 2)
+        self.assertIn("runtime", metrics)
+        self.assertEqual(metrics["runtime"]["device"], "cuda:0")
+        self.assertIn("model_config", metrics)
+        self.assertIn("qwen3-asr-1.7b", metrics["model_config"]["selected_engines"])
+        self.assertIn("invocation", metrics)
+        self.assertIn("elapsed_sec", metrics["summary"])
+        self.assertIn("started_at", metrics["summary"])
+        self.assertIn("finished_at", metrics["summary"])
         self.assertEqual(metrics["summary"]["hallucination_count"], 1)
         self.assertEqual(metrics["summary"]["false_confident_count"], 1)
+        clean_case = next(case for case in metrics["cases"] if case["id"] == "tts-clean-001")
+        self.assertEqual(clean_case["models"]["primary"], "qwen3-asr-1.7b")
+        self.assertEqual(clean_case["models"]["secondary"], "sensevoice")
+        self.assertEqual(clean_case["texts"]["primary"], "开放时间早上九点至下午五点。")
+        self.assertEqual(clean_case["texts"]["secondary"], "开放时间早上九点至下午五点。")
+        self.assertEqual(clean_case["texts"]["final"], "开放时间早上九点至下午五点。")
+        self.assertEqual(clean_case["text_similarity"]["primary_secondary"], 1.0)
+        self.assertEqual(clean_case["text_similarity"]["disagreement_score"], 0.0)
+        self.assertEqual(clean_case["text_similarity"]["cer"], 0.0)
+        self.assertEqual(clean_case["timing"]["total_sec"], 1.25)
+        self.assertEqual(clean_case["timing"]["primary_sec"], 0.75)
+        self.assertTrue(clean_case["paths"]["audit_json"].endswith(".strict.audit.json"))
+        self.assertTrue(clean_case["paths"]["primary_raw_json"].endswith(".raw.json"))
+        self.assertTrue(clean_case["paths"]["secondary_raw_json"].endswith(".raw.json"))
+        self.assertEqual(clean_case["audit_status"], "consistent")
         self.assertIn("silence-001", review)
         self.assertIn("false_confident", review)
         self.assertIn("tts-clean-001", benchmark)

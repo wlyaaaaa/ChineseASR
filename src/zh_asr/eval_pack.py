@@ -7,6 +7,7 @@ import random
 import re
 import struct
 import subprocess
+import time
 import wave
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import ModelConfig, load_model_config
+from .metadata import capture_invocation, file_metadata, runtime_info, snapshot_model_config
 from .pipeline import strict_transcribe_audio
 from .text_normalizer import to_simplified
 
@@ -66,10 +68,24 @@ class EvalCaseResult:
     category: str
     kind: str
     audio: Path | None
+    audio_sha256: str
+    truth_sha256: str
     truth_text: str
     final_text: str
     cer: float | None
     disagreement_score: float
+    audit_status: str
+    primary_engine: str
+    primary_text: str
+    secondary_engine: str
+    secondary_text: str
+    primary_secondary_similarity: float
+    timing_total_sec: float | None
+    timing_primary_sec: float | None
+    timing_secondary_sec: float | None
+    audit_json: Path | None
+    primary_json: Path | None
+    secondary_json: Path | None
     empty_audio_text_len: int
     risk_flags: tuple[str, ...]
     false_confident: bool
@@ -91,7 +107,7 @@ class EvalSummary:
     cases: tuple[EvalCaseResult, ...] = field(default_factory=tuple)
 
 
-StrictFn = Callable[..., dict[str, Path]]
+StrictFn = Callable[..., dict[str, Any]]
 TtsWriter = Callable[[str, Path, int], None]
 
 
@@ -144,10 +160,15 @@ def generate_builtin_corpus(
             _write_adversarial_audio(audio_path, str(spec["kind"]), float(spec["duration_sec"]))
         cases.append(_case_manifest_item(spec, audio, truth, expect_empty=True))
 
+    model_config = load_model_config()
+    cases = [_with_case_file_metadata(corpus_root, case) for case in cases]
     manifest = {
+        "schema_version": 2,
         "version": 1,
         "generated": datetime.now().isoformat(timespec="seconds"),
         "description": "Built-in privacy-free ChineseASR evaluation corpus.",
+        "model_config": snapshot_model_config(model_config),
+        "invocation": capture_invocation(),
         "cases": cases,
     }
     manifest_path = corpus_root / "manifest.json"
@@ -178,6 +199,8 @@ def run_evaluation(
     secondary = secondary_engine or model_config.strict_secondary_engine
     output_root.mkdir(parents=True, exist_ok=True)
 
+    run_started_at = datetime.now()
+    run_started_perf = time.perf_counter()
     results: list[EvalCaseResult] = []
     for case in manifest.get("cases", []):
         case_id = str(case["id"])
@@ -189,6 +212,7 @@ def run_evaluation(
         truth_text = _truth_text(corpus_root, case)
         case_out = output_root / "cases" / case_id
         expected_audit = case_out / f"{audio_path.stem}.strict.audit.json"
+        case_started_perf = time.perf_counter()
         if not expected_audit.exists() or force:
             paths = strict_fn(
                 audio_path,
@@ -202,11 +226,25 @@ def run_evaluation(
             audit_json = paths.get("audit_json", expected_audit)
         else:
             audit_json = expected_audit
+            paths = {"audit_json": audit_json}
+        case_elapsed_sec = time.perf_counter() - case_started_perf
         audit = json.loads(Path(audit_json).read_text(encoding="utf-8"))
-        results.append(_evaluate_case(case, corpus_root, audio_path, truth_text, audit))
+        results.append(_evaluate_case(case, corpus_root, audio_path, truth_text, audit, paths, case_elapsed_sec))
 
     summary = _summary(corpus_root, output_root, results)
-    _write_metrics(output_root / "metrics.json", summary)
+    run_finished_at = datetime.now()
+    run_elapsed_sec = time.perf_counter() - run_started_perf
+    selected_engines = (primary, secondary)
+    _write_metrics(
+        output_root / "metrics.json",
+        summary,
+        model_config=snapshot_model_config(model_config, selected_engines),
+        invocation=dict(manifest.get("invocation") or capture_invocation()),
+        runtime=runtime_info(device),
+        started_at=run_started_at,
+        finished_at=run_finished_at,
+        elapsed_sec=run_elapsed_sec,
+    )
     _write_benchmark(output_root / "benchmark.md", summary)
     _write_review(output_root / "review.md", summary)
     return summary
@@ -233,6 +271,20 @@ def _case_manifest_item(spec: dict[str, Any], audio: Path, truth: Path, expect_e
         "expect_empty": expect_empty,
         "available": True,
         "notes": spec["notes"],
+    }
+
+
+def _with_case_file_metadata(corpus_root: Path, case: dict[str, Any]) -> dict[str, Any]:
+    audio_path = corpus_root / str(case["audio"]) if case.get("audio") else None
+    truth_path = corpus_root / str(case["truth"]) if case.get("truth") else None
+    audio_meta = file_metadata(audio_path)
+    truth_meta = file_metadata(truth_path)
+    return {
+        **case,
+        "audio_sha256": audio_meta["sha256"],
+        "audio_size_bytes": audio_meta["size_bytes"],
+        "truth_sha256": truth_meta["sha256"],
+        "truth_size_bytes": truth_meta["size_bytes"],
     }
 
 
@@ -302,6 +354,8 @@ def _evaluate_case(
     audio_path: Path,
     truth_text: str,
     audit: dict[str, Any],
+    paths: dict[str, Any],
+    elapsed_sec: float,
 ) -> EvalCaseResult:
     final_text = to_simplified(str(audit.get("final_text", "")))
     expect_empty = bool(case.get("expect_empty", False))
@@ -321,15 +375,31 @@ def _evaluate_case(
         risk_flags.append("non_simplified_output")
 
     false_confident = bool(risk_flags) and not needs_review and not audit_flags
+    timing = paths.get("timing") if isinstance(paths.get("timing"), dict) else {}
+    total_sec = _optional_float(timing.get("total_sec")) or elapsed_sec
     return EvalCaseResult(
         case_id=str(case["id"]),
         category=str(case.get("category", "")),
         kind=str(case.get("kind", "")),
         audio=audio_path,
+        audio_sha256=str(case.get("audio_sha256", "")),
+        truth_sha256=str(case.get("truth_sha256", "")),
         truth_text=truth_text,
         final_text=final_text,
         cer=cer,
         disagreement_score=disagreement_score,
+        audit_status=str(audit.get("status", "")),
+        primary_engine=str(audit.get("primary_engine", "")),
+        primary_text=to_simplified(str(audit.get("primary_text", ""))),
+        secondary_engine=str(audit.get("secondary_engine", "")),
+        secondary_text=to_simplified(str(audit.get("secondary_text", ""))),
+        primary_secondary_similarity=similarity,
+        timing_total_sec=total_sec,
+        timing_primary_sec=_optional_float(timing.get("primary_sec")),
+        timing_secondary_sec=_optional_float(timing.get("secondary_sec")),
+        audit_json=_optional_path(paths.get("audit_json")),
+        primary_json=_optional_path(paths.get("primary_json")),
+        secondary_json=_optional_path(paths.get("secondary_json")),
         empty_audio_text_len=empty_len,
         risk_flags=tuple(sorted(set(risk_flags))),
         false_confident=false_confident,
@@ -345,10 +415,24 @@ def _skipped_case(case: dict[str, Any], corpus_root: Path, reason: str) -> EvalC
         category=str(case.get("category", "")),
         kind=str(case.get("kind", "")),
         audio=(corpus_root / str(audio_value)) if audio_value else None,
+        audio_sha256=str(case.get("audio_sha256", "")),
+        truth_sha256=str(case.get("truth_sha256", "")),
         truth_text=str(case.get("truth_text", "")),
         final_text="",
         cer=None,
         disagreement_score=0.0,
+        audit_status="skipped",
+        primary_engine="",
+        primary_text="",
+        secondary_engine="",
+        secondary_text="",
+        primary_secondary_similarity=0.0,
+        timing_total_sec=None,
+        timing_primary_sec=None,
+        timing_secondary_sec=None,
+        audit_json=None,
+        primary_json=None,
+        secondary_json=None,
         empty_audio_text_len=0,
         risk_flags=(),
         false_confident=False,
@@ -373,11 +457,24 @@ def _summary(corpus_dir: Path, out_dir: Path, results: list[EvalCaseResult]) -> 
     )
 
 
-def _write_metrics(path: Path, summary: EvalSummary) -> None:
+def _write_metrics(
+    path: Path,
+    summary: EvalSummary,
+    model_config: dict[str, Any],
+    invocation: dict[str, Any],
+    runtime: dict[str, Any],
+    started_at: datetime,
+    finished_at: datetime,
+    elapsed_sec: float,
+) -> None:
     payload = {
+        "schema_version": 2,
         "summary": {
             "corpus_dir": str(summary.corpus_dir),
             "out_dir": str(summary.out_dir),
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "elapsed_sec": round(elapsed_sec, 6),
             "total": summary.total,
             "evaluated": summary.evaluated,
             "skipped": summary.skipped,
@@ -385,17 +482,41 @@ def _write_metrics(path: Path, summary: EvalSummary) -> None:
             "false_confident_count": summary.false_confident_count,
             "generated": datetime.now().isoformat(timespec="seconds"),
         },
+        "runtime": runtime,
+        "model_config": model_config,
+        "invocation": invocation,
         "cases": [
             {
                 "id": item.case_id,
                 "category": item.category,
                 "kind": item.kind,
                 "audio": str(item.audio) if item.audio else "",
-                "audio_sha256": _sha256(item.audio) if item.audio and item.audio.exists() else "",
+                "audio_sha256": item.audio_sha256 or (_sha256(item.audio) if item.audio and item.audio.exists() else ""),
+                "truth_sha256": item.truth_sha256,
                 "truth_text": item.truth_text,
                 "final_text": item.final_text,
                 "cer": item.cer,
                 "disagreement_score": item.disagreement_score,
+                "audit_status": item.audit_status,
+                "models": {
+                    "primary": item.primary_engine,
+                    "secondary": item.secondary_engine,
+                },
+                "texts": {
+                    "primary": item.primary_text,
+                    "secondary": item.secondary_text,
+                    "final": item.final_text,
+                },
+                "text_similarity": {
+                    "primary_secondary": item.primary_secondary_similarity,
+                    "disagreement_score": item.disagreement_score,
+                    "cer": item.cer,
+                },
+                "timing": {
+                    "total_sec": item.timing_total_sec,
+                    "primary_sec": item.timing_primary_sec,
+                    "secondary_sec": item.timing_secondary_sec,
+                },
                 "empty_audio_text_len": item.empty_audio_text_len,
                 "risk_flags": list(item.risk_flags),
                 "false_confident": item.false_confident,
@@ -403,11 +524,31 @@ def _write_metrics(path: Path, summary: EvalSummary) -> None:
                 "needs_review": item.needs_review,
                 "skipped": item.skipped,
                 "skip_reason": item.skip_reason,
+                "paths": {
+                    "audit_json": str(item.audit_json) if item.audit_json else "",
+                    "primary_raw_json": str(item.primary_json) if item.primary_json else "",
+                    "secondary_raw_json": str(item.secondary_json) if item.secondary_json else "",
+                },
             }
             for item in summary.cases
         ],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_path(value: Any) -> Path | None:
+    if value is None:
+        return None
+    return Path(value)
 
 
 def _write_benchmark(path: Path, summary: EvalSummary) -> None:

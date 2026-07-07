@@ -40,6 +40,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("'--generate'", script)
         self.assertIn("'--no-tts'", script)
         self.assertIn("--cache-dir", script)
+        self.assertIn("$env:ZH_ASR_WRAPPER = 'scripts\\eval.ps1'", script)
         self.assertIn("$LASTEXITCODE", script)
 
     def test_benchmark_script_uses_no_proxy_and_required_dirs(self):
@@ -51,6 +52,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--audio-dir", script)
         self.assertIn("--truth-dir", script)
         self.assertIn("--cache-dir", script)
+        self.assertIn("$env:ZH_ASR_WRAPPER = 'scripts\\benchmark.ps1'", script)
         self.assertIn("$LASTEXITCODE", script)
 
 

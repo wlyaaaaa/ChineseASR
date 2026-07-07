@@ -47,6 +47,7 @@ if (-not [string]::IsNullOrWhiteSpace($SecondaryEngine)) {
   $CliArgs += @('--secondary-engine', $SecondaryEngine)
 }
 
+$env:ZH_ASR_WRAPPER = 'scripts\eval.ps1'
 & $Python @CliArgs
 if ($LASTEXITCODE -ne 0) {
   throw "Evaluation failed with exit code $LASTEXITCODE."
