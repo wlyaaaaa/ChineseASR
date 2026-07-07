@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -51,6 +52,50 @@ class CliTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("FunASR is not installed", result.stderr)
+
+    def test_cli_reads_engine_choices_from_model_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "models.yaml"
+            config.write_text(
+                """
+defaults:
+  engine: custom-primary
+strict:
+  primary_engine: custom-primary
+  secondary_engine: custom-secondary
+aliases: {}
+engines:
+  custom-primary:
+    adapter: funasr
+    role: primary
+    model: iic/CustomPrimary
+    language: zh
+  custom-secondary:
+    adapter: funasr
+    role: baseline
+    model: iic/CustomSecondary
+    language: zh
+""",
+                encoding="utf-8",
+            )
+
+            doctor = self.run_cli("doctor", extra_env={"ZH_ASR_MODEL_CONFIG": str(config)})
+            strict = self.run_cli(
+                "strict",
+                "missing.wav",
+                "--primary-engine",
+                "custom-primary",
+                "--secondary-engine",
+                "custom-secondary",
+                extra_env={"ZH_ASR_MODEL_CONFIG": str(config)},
+            )
+
+        self.assertEqual(doctor.returncode, 0, doctor.stderr)
+        self.assertIn("Default engine: custom-primary", doctor.stdout)
+        self.assertIn("Available engines: custom-primary, custom-secondary", doctor.stdout)
+        self.assertNotEqual(strict.returncode, 0)
+        self.assertIn("Audio file not found", strict.stderr)
+        self.assertNotIn("invalid choice", strict.stderr)
 
 
 if __name__ == "__main__":

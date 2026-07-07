@@ -3,7 +3,9 @@ param(
   [string]$Audio,
 
   [string]$Device = 'cuda:0',
-  [string]$OutDir = 'E:\ChineseASR\outputs\strict'
+  [string]$OutDir = 'E:\ChineseASR\outputs\strict',
+  [string]$PrimaryEngine = '',
+  [string]$SecondaryEngine = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,5 +18,18 @@ if (-not (Test-Path $Python)) {
   throw 'Virtual environment not found. Run scripts\install-torch-cu128-direct.ps1 and scripts\setup-core.ps1 first.'
 }
 
-& $Python -m zh_asr strict $Audio --primary-engine sensevoice --secondary-engine paraformer --device $Device --out-dir $OutDir --cache-dir (Join-Path $Root 'models\modelscope')
+$Args = @(
+  '-m', 'zh_asr',
+  'strict', $Audio,
+  '--device', $Device,
+  '--out-dir', $OutDir,
+  '--cache-dir', (Join-Path $Root 'models\modelscope')
+)
+if (-not [string]::IsNullOrWhiteSpace($PrimaryEngine)) {
+  $Args += @('--primary-engine', $PrimaryEngine)
+}
+if (-not [string]::IsNullOrWhiteSpace($SecondaryEngine)) {
+  $Args += @('--secondary-engine', $SecondaryEngine)
+}
 
+& $Python @Args

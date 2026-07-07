@@ -49,6 +49,14 @@ cd E:\ChineseASR
 .\scripts\strict.ps1 -Audio E:\path\to\audio.wav
 ```
 
+模型注册表在：
+
+```text
+E:\ChineseASR\configs\models.yaml
+```
+
+默认 quick 模型、strict 双模型、FunASR 模型 ID 和 VAD / 标点 / 说话人模型别名都从这个文件读取。同一 `funasr` 适配器内替换或新增模型时，优先只改 YAML；跨运行时模型才需要新增 adapter。
+
 `transcribe` 是 quick 模式，输出包含：
 
 - `*.sensevoice.md`：可读 Markdown 转写
@@ -60,6 +68,12 @@ cd E:\ChineseASR
 - `*.strict.audit.md`：审计稿，记录两模型原文、相似度、状态、备选文本和判断依据。
 - `*.strict.audit.json`：机器可读审计数据。
 - `*.sensevoice.raw.json` / `*.paraformer.raw.json`：两模型原始结果。
+
+如需临时使用另一份模型配置，可设置：
+
+```powershell
+$env:ZH_ASR_MODEL_CONFIG='E:\path\to\models.yaml'
+```
 
 ## 低幻觉原则
 

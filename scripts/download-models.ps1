@@ -1,6 +1,5 @@
 param(
-  [ValidateSet('sensevoice', 'paraformer')]
-  [string]$Engine = 'sensevoice',
+  [string]$Engine = '',
 
   [string]$Device = 'cuda:0'
 )
@@ -17,5 +16,8 @@ if (-not (Test-Path $Python)) {
 
 $CacheDir = Join-Path $Root 'models\modelscope'
 $env:MODELSCOPE_CACHE = $CacheDir
-& $Python -m zh_asr warmup --engine $Engine --device $Device --cache-dir $CacheDir
-
+$Args = @('-m', 'zh_asr', 'warmup', '--device', $Device, '--cache-dir', $CacheDir)
+if (-not [string]::IsNullOrWhiteSpace($Engine)) {
+  $Args += @('--engine', $Engine)
+}
+& $Python @Args

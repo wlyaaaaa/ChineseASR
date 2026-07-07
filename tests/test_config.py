@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 
 class ConfigTests(unittest.TestCase):
@@ -12,6 +14,7 @@ class ConfigTests(unittest.TestCase):
 
         spec = get_engine_spec("sensevoice")
 
+        self.assertEqual(spec.adapter, "funasr")
         self.assertEqual(spec.model, "iic/SenseVoiceSmall")
         self.assertEqual(spec.vad_model, "fsmn-vad")
         self.assertEqual(spec.punc_model, "ct-punc")
@@ -32,7 +35,58 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown ASR engine"):
             get_engine_spec("not-a-model")
 
+    def test_engines_are_loaded_from_yaml_model_registry(self):
+        from zh_asr.config import load_model_config
+
+        config = load_model_config()
+
+        self.assertEqual(config.default_engine, "sensevoice")
+        self.assertEqual(config.strict_primary_engine, "sensevoice")
+        self.assertEqual(config.strict_secondary_engine, "paraformer")
+        self.assertIn("speech_fsmn_vad_zh-cn-16k-common-pytorch", config.model_aliases["fsmn-vad"])
+
+    def test_same_adapter_model_can_be_added_without_code_changes(self):
+        from zh_asr.config import get_engine_spec, load_model_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.yaml"
+            path.write_text(
+                """
+defaults:
+  engine: custom-sensevoice
+strict:
+  primary_engine: custom-sensevoice
+  secondary_engine: conservative-baseline
+aliases:
+  tiny-vad: iic/custom-vad
+engines:
+  custom-sensevoice:
+    adapter: funasr
+    role: primary
+    model: iic/CustomSenseVoice
+    vad_model: tiny-vad
+    punc_model: null
+    spk_model: null
+    language: auto
+    note: Custom primary model.
+  conservative-baseline:
+    adapter: funasr
+    role: baseline
+    model: iic/CustomBaseline
+    language: zh
+""",
+                encoding="utf-8",
+            )
+
+            config = load_model_config(path)
+            spec = get_engine_spec("custom-sensevoice", config=config)
+
+        self.assertEqual(config.default_engine, "custom-sensevoice")
+        self.assertEqual(config.model_aliases["tiny-vad"], "iic/custom-vad")
+        self.assertEqual(spec.adapter, "funasr")
+        self.assertEqual(spec.model, "iic/CustomSenseVoice")
+        self.assertEqual(spec.vad_model, "tiny-vad")
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -1,0 +1,40 @@
+defaults:
+  engine: sensevoice
+
+strict:
+  primary_engine: sensevoice
+  secondary_engine: paraformer
+
+aliases:
+  fsmn-vad: iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
+  ct-punc: iic/punc_ct-transformer_cn-en-common-vocab471067-large
+  cam++: iic/speech_campplus_sv_zh-cn_16k-common
+
+engines:
+  sensevoice:
+    adapter: funasr
+    role: primary
+    model: iic/SenseVoiceSmall
+    vad_model: fsmn-vad
+    punc_model: ct-punc
+    spk_model: cam++
+    language: auto
+    note: Primary local Chinese low-hallucination engine.
+
+  paraformer:
+    adapter: funasr
+    role: baseline
+    model: iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
+    vad_model: fsmn-vad
+    punc_model: ct-punc
+    spk_model: cam++
+    language: zh
+    note: Conservative Mandarin/CN baseline for cross-checking.
+
+  whisper-large-v3:
+    adapter: whisper
+    role: fallback
+    model: openai/whisper-large-v3
+    language: zh
+    is_whisper: true
+    note: Fallback/comparison only; not the primary Chinese low-hallucination path.
