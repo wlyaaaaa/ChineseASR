@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .batch import run_batch
 from .config import list_engine_names, list_transcription_engine_names, load_model_config
+from .eval_pack import generate_builtin_corpus, run_evaluation
 from .pipeline import MissingDependencyError, build_model, default_cache_dir, strict_transcribe_audio, transcribe_audio
 from .proxy_guard import PROXY_ENV_NAMES, sanitize_current_process_env
 
@@ -57,6 +58,19 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--out-dir", type=Path, default=Path("outputs") / "batch")
     batch.add_argument("--cache-dir", type=Path, default=default_cache_dir())
     batch.add_argument("--force", action="store_true")
+
+    eval_cmd = subparsers.add_parser("eval", help="Generate or run a privacy-free local ASR evaluation pack.")
+    eval_cmd.add_argument("--corpus-dir", type=Path, default=Path("eval") / "corpus" / "builtin")
+    eval_cmd.add_argument("--out-dir", type=Path, default=Path("outputs") / "eval")
+    eval_cmd.add_argument("--generate", action="store_true")
+    eval_cmd.add_argument("--generate-only", action="store_true")
+    eval_cmd.add_argument("--no-tts", action="store_true")
+    eval_cmd.add_argument("--primary-engine", choices=transcription_choices, default=model_config.strict_primary_engine)
+    eval_cmd.add_argument("--secondary-engine", choices=transcription_choices, default=model_config.strict_secondary_engine)
+    eval_cmd.add_argument("--device", default="cuda:0")
+    eval_cmd.add_argument("--cache-dir", type=Path, default=default_cache_dir())
+    eval_cmd.add_argument("--force", action="store_true")
+    eval_cmd.add_argument("--fail-on-findings", action="store_true")
 
     args = parser.parse_args(argv)
 
@@ -119,6 +133,41 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Failures: {summary.out_dir / 'failed.jsonl'}", file=sys.stderr)
                 return 1
             return 0
+        if args.command == "eval":
+            manifest_path = args.corpus_dir / "manifest.json"
+            should_generate = args.generate or args.generate_only
+            if should_generate:
+                manifest_path = generate_builtin_corpus(
+                    args.corpus_dir,
+                    include_tts=not args.no_tts,
+                    force=args.force,
+                )
+                print(f"Corpus manifest: {manifest_path}")
+            if args.generate_only:
+                return 0
+            if not manifest_path.exists():
+                raise FileNotFoundError(f"Evaluation manifest not found: {manifest_path}")
+            eval_summary = run_evaluation(
+                corpus_dir=args.corpus_dir,
+                out_dir=args.out_dir,
+                device=args.device,
+                cache_dir=args.cache_dir,
+                force=args.force,
+                primary_engine=args.primary_engine,
+                secondary_engine=args.secondary_engine,
+                config=model_config,
+            )
+            print(f"Metrics: {eval_summary.out_dir / 'metrics.json'}")
+            print(f"Benchmark: {eval_summary.out_dir / 'benchmark.md'}")
+            print(f"Review: {eval_summary.out_dir / 'review.md'}")
+            print(
+                f"Total: {eval_summary.total}; "
+                f"Evaluated: {eval_summary.evaluated}; "
+                f"Skipped: {eval_summary.skipped}; "
+                f"Hallucinations: {eval_summary.hallucination_count}; "
+                f"False confident: {eval_summary.false_confident_count}"
+            )
+            return 1 if args.fail_on_findings and eval_summary.false_confident_count else 0
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         return 2

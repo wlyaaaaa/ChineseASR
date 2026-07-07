@@ -72,6 +72,28 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("Input directory not found", result.stderr)
 
+    def test_eval_generate_only_no_tts_creates_manifest_without_model_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus_dir = root / "corpus"
+            out_dir = root / "runs"
+
+            result = self.run_cli(
+                "eval",
+                "--generate",
+                "--generate-only",
+                "--no-tts",
+                "--corpus-dir",
+                str(corpus_dir),
+                "--out-dir",
+                str(out_dir),
+            )
+            manifest = (corpus_dir / "manifest.json").read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Corpus manifest:", result.stdout)
+        self.assertIn("silence-001", manifest)
+
     def test_warmup_mentions_dependency_when_funasr_is_not_installed(self):
         result = self.run_cli(
             "warmup",

@@ -61,6 +61,7 @@ Qwen 会收到“只输出简体中文”的上下文提示；同时输出层会
 .\.venv\Scripts\python.exe -m zh_asr transcribe E:\path\to\audio.wav --engine sensevoice --device cuda:0 --out-dir E:\ChineseASR\outputs
 .\scripts\strict.ps1 -Audio E:\path\to\audio.wav
 .\scripts\transcribe-folder.ps1 -InputDir E:\path\to\audio-folder
+.\scripts\eval.ps1 -Generate
 ```
 
 模型注册表在：
@@ -94,6 +95,30 @@ E:\ChineseASR\configs\models.yaml
 ```powershell
 .\scripts\transcribe-folder.ps1 -InputDir E:\path\to\audio-folder -Mode quick -Engine sensevoice
 ```
+
+`eval.ps1` 是隐私友好的评测入口，不要求你提供真实录音。它会生成本地可复现的评测语料：
+
+- `synthetic`：Windows 本地中文 TTS 生成的已知答案语音。
+- `adversarial`：静音、白噪声、纯音等负样本，用来测幻觉底线。
+- `truth`：标准答案文本；负样本标准答案为空。
+
+只生成语料、不跑模型：
+
+```powershell
+.\scripts\eval.ps1 -Generate -GenerateOnly
+```
+
+完全跳过 TTS，只生成负样本：
+
+```powershell
+.\scripts\eval.ps1 -Generate -GenerateOnly -NoTts
+```
+
+完整评测会复用 strict 双模型，输出：
+
+- `metrics.json`：CER、模型分歧、负样本吐字长度、风险标记、false confident 统计。
+- `benchmark.md`：整体分数表。
+- `review.md`：最值得人工复核的样本队列。
 
 如需临时使用另一份模型配置，可设置：
 

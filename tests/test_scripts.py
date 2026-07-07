@@ -31,6 +31,17 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("'--force'", script)
         self.assertIn("$LASTEXITCODE", script)
 
+    def test_eval_script_uses_no_proxy_generate_flags_and_cache_dir(self):
+        script = (PROJECT_ROOT / "scripts" / "eval.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("Clear-ProxyEnv", script)
+        self.assertIn("'eval'", script)
+        self.assertIn("[switch]$Generate", script)
+        self.assertIn("'--generate'", script)
+        self.assertIn("'--no-tts'", script)
+        self.assertIn("--cache-dir", script)
+        self.assertIn("$LASTEXITCODE", script)
+
 
 if __name__ == "__main__":
     unittest.main()
