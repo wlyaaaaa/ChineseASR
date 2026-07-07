@@ -102,6 +102,27 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("pip install -e", script)
         self.assertIn("zh_asr doctor", script)
 
+    def test_asr_smart_script_starts_local_api_submits_jobs_and_returns_status(self):
+        script = (PROJECT_ROOT / "scripts" / "asr-smart.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("Clear-ProxyEnv", script)
+        self.assertIn("[int]$WaitSec = 15", script)
+        self.assertIn("[int]$StartupTimeoutSec = 30", script)
+        self.assertIn("Start-Process", script)
+        self.assertIn("-WindowStyle Hidden", script)
+        self.assertIn("Invoke-RestMethod", script)
+        self.assertIn("/jobs/transcribe", script)
+        self.assertIn("/jobs/$($Submit.job.job_id)", script)
+        self.assertIn("allow_gpu_conflicts", script)
+        self.assertIn("[switch]$AllowGpuConflicts", script)
+        self.assertIn("next_status_command", script)
+        self.assertIn("ConvertTo-Json", script)
+        self.assertIn("'serve'", script)
+        self.assertIn("'--host'", script)
+        self.assertIn("'--port'", script)
+        self.assertIn("New-Item -ItemType Directory -Force -Path $OutRootPath", script)
+        self.assertNotIn("Resolve-Path $OutRoot", script)
+
 
 if __name__ == "__main__":
     unittest.main()

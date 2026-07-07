@@ -71,6 +71,7 @@ Qwen 会收到“只输出简体中文”的上下文提示；同时输出层会
 .\scripts\doctor.ps1
 .\.venv\Scripts\python.exe -m zh_asr transcribe E:\path\to\audio.wav --engine sensevoice --device cuda:0 --out-dir E:\ChineseASR\outputs
 .\scripts\strict.ps1 -Audio E:\path\to\audio.wav
+.\scripts\asr-smart.ps1 -Audio E:\path\to\audio.wav -WaitSec 15
 .\scripts\transcribe-folder.ps1 -InputDir E:\path\to\audio-folder
 .\scripts\eval.ps1 -Generate
 .\scripts\benchmark.ps1 -AudioDir E:\path\to\audio -TruthDir E:\path\to\truth
@@ -150,6 +151,36 @@ truth\
 - `review.md`：缺 truth、模型分歧、疑似幻觉和 false confident 样本；`P0` 优先回听，`P1` 核对后再信任，`P2` 补 truth 或确认跳过。
 
 `benchmark.ps1` 不会复制你的源音频或标准答案，只在输出目录下写 `_manifest\manifest.json` 记录路径、音频/truth hash、模型配置快照和运行清单。缺少对应 `.txt` 的音频不会评分，会进 `review.md`。
+
+## 本地 API 和 smart 入口
+
+给 Codex / 自动化调用时，优先使用 smart 入口，避免长时间卡住命令行：
+
+```powershell
+.\scripts\asr-smart.ps1 -Audio E:\path\to\audio.wav -Mode strict -WaitSec 15 -Json
+```
+
+`asr-smart.ps1` 会自动启动本地 API：
+
+```powershell
+.\.venv\Scripts\python.exe -m zh_asr serve --host 127.0.0.1 --port 8765
+```
+
+API 只绑定 `127.0.0.1`，支持：
+
+- `GET /health`：服务状态、队列长度、GPU 冲突。
+- `GET /jobs`：任务列表。
+- `GET /jobs/{job_id}`：任务状态和输出路径。
+- `POST /jobs/transcribe`：提交 quick / strict 转写。
+- `POST /jobs/{job_id}/cancel`：取消排队或运行中的任务。
+
+服务内部只有一个 GPU worker，同一音频和同一配置会自动去重。任务在子 Python 进程里跑现有 CLI，所以 API 请求不会被模型推理长期占住，取消任务时也可以终止子进程。
+
+默认会用 `nvidia-smi` 检测外部 CUDA compute 进程；如果发现 Ollama、LocalOCR、LM Studio、其他 Python 模型进程等正在占 GPU，新任务会返回 `blocked`，不会硬抢显存。你确实想覆盖时再显式加：
+
+```powershell
+.\scripts\asr-smart.ps1 -Audio E:\path\to\audio.wav -AllowGpuConflicts
+```
 
 如需临时使用另一份模型配置，可设置：
 

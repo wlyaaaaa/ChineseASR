@@ -178,6 +178,14 @@ engines:
         self.assertIn("Audio file not found", strict.stderr)
         self.assertNotIn("invalid choice", strict.stderr)
 
+    def test_serve_check_registers_local_api_command_without_model_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli("serve", "--check", "--port", "0", "--state-dir", tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ASR API ready", result.stdout)
+        self.assertIn("127.0.0.1", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

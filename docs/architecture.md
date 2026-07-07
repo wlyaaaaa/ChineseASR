@@ -38,6 +38,25 @@ audio
 
 `strict.md` 是给人读的最终稿，正文尽量干净；当两个模型严重冲突、都为空、或出现常见幻觉套话时才写入 `[疑似]` / `[听不清]`。`strict.audit.md` 保存两模型原文、相似度、备选文本和判断依据。后续接入顶级 LLM 仲裁时，应只读取这个审计输入，不覆盖原始 ASR 证据。
 
+## 本地 API / Smart 调用层
+
+面向 Codex 和自动化调用时，不直接长时间等待 `strict.ps1`。推荐路径是：
+
+```text
+scripts\asr-smart.ps1
+  -> 127.0.0.1 local API
+  -> in-memory job queue
+  -> single GPU worker
+  -> child process: python -m zh_asr strict/transcribe
+  -> outputs\api\<job_id>\
+```
+
+API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 8765` 提供，主要端点是 `/health`、`/jobs`、`/jobs/{job_id}`、`/jobs/transcribe` 和 `/jobs/{job_id}/cancel`。
+
+服务层只负责调度，不在 HTTP 请求线程中加载模型。每个任务在独立 Python 子进程里运行现有 CLI，这样 API 可以快速返回、任务可以取消、模型显存也不会长期留在 API 进程里。
+
+为避免和其他本地模型互相抢 GPU，提交任务前会尝试读取 `nvidia-smi --query-compute-apps`。发现外部 CUDA compute 进程时默认返回 `blocked`；只有显式传入 `allow_gpu_conflicts=true` 或 `scripts\asr-smart.ps1 -AllowGpuConflicts` 才会继续入队。服务不会自动终止 Ollama、LocalOCR、LM Studio 或其他 Python 模型进程。
+
 ## 模型替换边界
 
 同一 adapter 内替换模型时，优先只改 `configs/models.yaml`，然后运行：

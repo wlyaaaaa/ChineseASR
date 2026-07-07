@@ -10,8 +10,9 @@ from .batch import run_batch
 from .benchmark import run_benchmark
 from .config import list_engine_names, list_transcription_engine_names, load_model_config
 from .eval_pack import generate_builtin_corpus, run_evaluation
-from .pipeline import MissingDependencyError, build_model, default_cache_dir, strict_transcribe_audio, transcribe_audio
+from .pipeline import MissingDependencyError, build_model, default_cache_dir, project_root, strict_transcribe_audio, transcribe_audio
 from .proxy_guard import PROXY_ENV_NAMES, sanitize_current_process_env
+from .service import serve_api
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,6 +84,12 @@ def main(argv: list[str] | None = None) -> int:
     benchmark.add_argument("--cache-dir", type=Path, default=default_cache_dir())
     benchmark.add_argument("--force", action="store_true")
     benchmark.add_argument("--fail-on-findings", action="store_true")
+
+    serve = subparsers.add_parser("serve", help="Run the local ASR job API.")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--state-dir", type=Path, default=Path("outputs") / "api")
+    serve.add_argument("--check", action="store_true", help="Validate serve configuration without blocking.")
 
     args = parser.parse_args(argv)
 
@@ -202,6 +209,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"False confident: {benchmark_summary.false_confident_count}"
             )
             return 1 if args.fail_on_findings and benchmark_summary.false_confident_count else 0
+        if args.command == "serve":
+            state_dir = args.state_dir.resolve()
+            if args.check:
+                print(f"ASR API ready at http://{args.host}:{args.port}")
+                print(f"State directory: {state_dir}")
+                return 0
+            return serve_api(args.host, args.port, state_dir, root=project_root())
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         return 2
