@@ -20,6 +20,7 @@ engines:
       dtype: bfloat16
       max_inference_batch_size: 8
       max_new_tokens: 256
+      context: 请只输出简体中文转写文本，不要输出繁体字、解释、翻译或额外说明。
     note: Current accuracy-first strict primary based on public Qwen3-ASR evaluations.
 
   sensevoice:

@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
+from .text_normalizer import to_simplified
+
 
 SUSPICIOUS_STOCK_PHRASES = (
     "谢谢观看",
@@ -37,8 +39,8 @@ def build_audit_report(
     secondary_text: str,
     conflict_threshold: float = 0.95,
 ) -> AuditReport:
-    primary = primary_text.strip()
-    secondary = secondary_text.strip()
+    primary = to_simplified(primary_text.strip())
+    secondary = to_simplified(secondary_text.strip())
     primary_norm = _normalize_for_compare(primary)
     secondary_norm = _normalize_for_compare(secondary)
     similarity = _similarity(primary_norm, secondary_norm)

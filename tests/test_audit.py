@@ -74,6 +74,22 @@ class AuditTests(unittest.TestCase):
         self.assertTrue(report.needs_review)
         self.assertTrue(report.final_text.startswith("[疑似]"))
 
+    def test_final_text_and_comparison_use_simplified_chinese(self):
+        from zh_asr.audit import build_audit_report
+
+        report = build_audit_report(
+            primary_engine="qwen3-asr-1.7b",
+            primary_text="開放時間：早上九點至下午五點。",
+            secondary_engine="sensevoice",
+            secondary_text="开放时间早上九点至下午五点。",
+        )
+
+        self.assertEqual(report.status, "consistent")
+        self.assertEqual(report.final_text, "开放时间：早上九点至下午五点。")
+        self.assertEqual(report.primary_text, "开放时间：早上九点至下午五点。")
+        self.assertEqual(report.secondary_text, "开放时间早上九点至下午五点。")
+        self.assertEqual(report.similarity, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

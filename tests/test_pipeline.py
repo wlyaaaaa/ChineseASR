@@ -73,11 +73,12 @@ class PipelineTests(unittest.TestCase):
 
         class DummyResult:
             language = "zh"
-            text = "开放时间早上九点至下午五点。"
+            text = "開放時間早上九點至下午五點。"
 
         class DummyQwenModel:
-            def transcribe(self, audio, language):
+            def transcribe(self, audio, context, language):
                 self.audio = audio
+                self.context = context
                 self.language = language
                 return [DummyResult()]
 
@@ -87,13 +88,24 @@ class PipelineTests(unittest.TestCase):
             role="primary",
             model="Qwen/Qwen3-ASR-1.7B",
             language="Chinese",
-            options={"dtype": "bfloat16"},
+            options={"dtype": "bfloat16", "context": "请只输出简体中文转写文本。"},
         )
-        wrapper = QwenASRAdapter().wrap_model(DummyQwenModel(), spec)
+        model = DummyQwenModel()
+        wrapper = QwenASRAdapter().wrap_model(model, spec)
 
         result = wrapper.generate(input="sample.wav")
 
-        self.assertEqual(result, [{"text": "开放时间早上九点至下午五点。", "language": "zh"}])
+        self.assertEqual(
+            result,
+            [
+                {
+                    "text": "开放时间早上九点至下午五点。",
+                    "language": "zh",
+                    "original_text": "開放時間早上九點至下午五點。",
+                }
+            ],
+        )
+        self.assertEqual(model.context, "请只输出简体中文转写文本。")
 
     def test_qwen_adapter_uses_local_modelscope_cache_path_when_available(self):
         from zh_asr.adapters.qwen_asr import qwen_from_pretrained_kwargs

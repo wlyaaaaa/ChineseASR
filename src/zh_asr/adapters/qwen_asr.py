@@ -7,6 +7,7 @@ from typing import Any
 
 from zh_asr.adapters.base import MissingDependencyError
 from zh_asr.config import EngineSpec
+from zh_asr.text_normalizer import to_simplified
 
 
 class QwenASRAdapter:
@@ -28,16 +29,24 @@ class QwenASRAdapter:
         return self.wrap_model(model, spec)
 
     def wrap_model(self, model: Any, spec: EngineSpec) -> "QwenASRModelWrapper":
-        return QwenASRModelWrapper(model, language=spec.language)
+        options = spec.options or {}
+        context = str(
+            options.get(
+                "context",
+                "请只输出简体中文转写文本，不要输出繁体字、解释、翻译或额外说明。",
+            )
+        )
+        return QwenASRModelWrapper(model, language=spec.language, context=context)
 
 
 class QwenASRModelWrapper:
-    def __init__(self, model: Any, language: str) -> None:
+    def __init__(self, model: Any, language: str, context: str) -> None:
         self.model = model
         self.language = None if language.lower() == "auto" else language
+        self.context = context
 
     def generate(self, input: str, **_: Any) -> list[dict[str, Any]]:
-        results = self.model.transcribe(audio=input, language=self.language)
+        results = self.model.transcribe(audio=input, context=self.context, language=self.language)
         return [_normalize_qwen_result(item) for item in results]
 
 
@@ -91,14 +100,17 @@ def _resolve_required_local_qwen_model(
 
 def _normalize_qwen_result(item: Any) -> dict[str, Any]:
     if isinstance(item, dict):
-        text = str(item.get("text", ""))
+        original_text = str(item.get("text", ""))
         language = item.get("language")
     else:
-        text = str(getattr(item, "text", ""))
+        original_text = str(getattr(item, "text", ""))
         language = getattr(item, "language", None)
+    text = to_simplified(original_text)
     normalized: dict[str, Any] = {"text": text}
     if language:
         normalized["language"] = str(language)
+    if original_text != text:
+        normalized["original_text"] = original_text
     return normalized
 
 
