@@ -44,6 +44,12 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Audio file not found", result.stderr)
 
+    def test_long_missing_audio_fails_clearly_before_model_load(self):
+        result = self.run_cli("long", "missing.wav")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Audio file not found", result.stderr)
+
     def test_batch_empty_folder_writes_summary_without_model_load(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

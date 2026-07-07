@@ -10,6 +10,8 @@ from .batch import run_batch
 from .benchmark import run_benchmark
 from .config import list_engine_names, list_transcription_engine_names, load_model_config
 from .eval_pack import generate_builtin_corpus, run_evaluation
+from .arbitration import load_arbitration_config, make_arbiter
+from .long_audio import run_long_transcription
 from .pipeline import MissingDependencyError, build_model, default_cache_dir, project_root, strict_transcribe_audio, transcribe_audio
 from .proxy_guard import PROXY_ENV_NAMES, sanitize_current_process_env
 from .service import serve_api
@@ -49,6 +51,17 @@ def main(argv: list[str] | None = None) -> int:
     strict.add_argument("--device", default="cuda:0")
     strict.add_argument("--out-dir", type=Path, default=Path("outputs"))
     strict.add_argument("--cache-dir", type=Path, default=default_cache_dir())
+
+    long_cmd = subparsers.add_parser("long", help="Resumable long-audio strict transcription.")
+    long_cmd.add_argument("audio", type=Path)
+    long_cmd.add_argument("--primary-engine", choices=transcription_choices, default=model_config.strict_primary_engine)
+    long_cmd.add_argument("--secondary-engine", choices=transcription_choices, default=model_config.strict_secondary_engine)
+    long_cmd.add_argument("--device", default="cuda:0")
+    long_cmd.add_argument("--out-dir", type=Path, default=Path("outputs") / "long")
+    long_cmd.add_argument("--cache-dir", type=Path, default=default_cache_dir())
+    long_cmd.add_argument("--chunk-sec", type=int, default=300)
+    long_cmd.add_argument("--overlap-sec", type=int, default=1)
+    long_cmd.add_argument("--force", action="store_true")
 
     batch = subparsers.add_parser("batch", help="Transcribe every supported audio file in a folder.")
     batch.add_argument("input_dir", type=Path)
@@ -128,6 +141,31 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Primary raw JSON: {paths['primary_json']}")
             print(f"Secondary raw JSON: {paths['secondary_json']}")
             return 0
+        if args.command == "long":
+            arbiter = make_arbiter(load_arbitration_config(model_config.path))
+            summary = run_long_transcription(
+                args.audio,
+                args.out_dir,
+                chunk_sec=args.chunk_sec,
+                overlap_sec=args.overlap_sec,
+                primary_engine=args.primary_engine,
+                secondary_engine=args.secondary_engine,
+                device=args.device,
+                cache_dir=args.cache_dir,
+                force=args.force,
+                arbiter=arbiter,
+            )
+            print(f"Transcript: {summary.transcript_path}")
+            print(f"Audit: {summary.audit_path}")
+            print(f"Metrics: {summary.metrics_path}")
+            print(f"Manifest: {summary.manifest_path}")
+            print(
+                f"Total: {summary.total}; "
+                f"Processed: {summary.processed}; "
+                f"Skipped: {summary.skipped}; "
+                f"Failed: {summary.failed}"
+            )
+            return 1 if summary.failed else 0
         if args.command == "batch":
             summary = run_batch(
                 input_dir=args.input_dir,

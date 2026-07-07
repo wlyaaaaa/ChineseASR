@@ -1,7 +1,7 @@
 param(
   [Parameter(Mandatory = $true)]
   [string]$Audio,
-  [ValidateSet('strict', 'quick')]
+  [ValidateSet('strict', 'quick', 'long-strict')]
   [string]$Mode = 'strict',
   [string]$Engine = '',
   [string]$PrimaryEngine = '',
@@ -14,6 +14,8 @@ param(
   [int]$WaitSec = 15,
   [int]$StartupTimeoutSec = 30,
   [int]$PollIntervalSec = 2,
+  [int]$ChunkSec = 300,
+  [int]$OverlapSec = 1,
   [switch]$AllowGpuConflicts,
   [switch]$Force,
   [switch]$Json
@@ -87,6 +89,8 @@ $Payload = [ordered]@{
   audio = $AudioPath
   mode = $Mode
   device = $Device
+  chunk_sec = $ChunkSec
+  overlap_sec = $OverlapSec
   force = [bool]$Force
   allow_gpu_conflicts = [bool]$AllowGpuConflicts
 }

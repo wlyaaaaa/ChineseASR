@@ -50,6 +50,8 @@ class JobRequest:
     device: str
     out_root: Path
     cache_dir: Path | None = None
+    chunk_sec: int = 300
+    overlap_sec: int = 1
     force: bool = False
     allow_gpu_conflicts: bool = False
 
@@ -63,8 +65,8 @@ class JobRequest:
             raise FileNotFoundError(f"Audio file not found: {audio}")
 
         mode = str(payload.get("mode", "strict")).strip().lower()
-        if mode not in {"strict", "quick"}:
-            raise ValueError("mode must be 'strict' or 'quick'")
+        if mode not in {"strict", "quick", "long-strict"}:
+            raise ValueError("mode must be 'strict', 'quick', or 'long-strict'")
 
         fallback_out_root = default_out_root or (root / "outputs" / "api")
         out_root = Path(str(payload.get("out_root") or payload.get("out_dir") or fallback_out_root)).expanduser()
@@ -80,6 +82,8 @@ class JobRequest:
             device=str(payload.get("device", "cuda:0")),
             out_root=out_root.resolve(),
             cache_dir=cache_dir,
+            chunk_sec=int(payload.get("chunk_sec", 300)),
+            overlap_sec=int(payload.get("overlap_sec", 1)),
             force=bool(payload.get("force", False)),
             allow_gpu_conflicts=bool(payload.get("allow_gpu_conflicts", False)),
         )
@@ -97,6 +101,8 @@ class JobRequest:
             "device": self.device,
             "cache_dir": str(self.cache_dir) if self.cache_dir else None,
             "out_root": str(self.out_root),
+            "chunk_sec": self.chunk_sec,
+            "overlap_sec": self.overlap_sec,
         }
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
@@ -111,6 +117,8 @@ class JobRequest:
             "device": self.device,
             "out_root": str(self.out_root),
             "cache_dir": str(self.cache_dir) if self.cache_dir else None,
+            "chunk_sec": self.chunk_sec,
+            "overlap_sec": self.overlap_sec,
             "force": self.force,
             "allow_gpu_conflicts": self.allow_gpu_conflicts,
         }
@@ -330,7 +338,27 @@ class TranscriptionService:
         return Job(job_id=job_id, request=request, out_dir=out_dir, command=command, conflicts=list(conflicts))
 
     def _build_command(self, request: JobRequest, out_dir: Path) -> list[str]:
-        if request.mode == "strict":
+        if request.mode == "long-strict":
+            command = [
+                sys.executable,
+                "-m",
+                "zh_asr",
+                "long",
+                str(request.audio),
+                "--device",
+                request.device,
+                "--out-dir",
+                str(out_dir),
+                "--chunk-sec",
+                str(request.chunk_sec),
+                "--overlap-sec",
+                str(request.overlap_sec),
+            ]
+            if request.primary_engine:
+                command.extend(["--primary-engine", request.primary_engine])
+            if request.secondary_engine:
+                command.extend(["--secondary-engine", request.secondary_engine])
+        elif request.mode == "strict":
             command = [
                 sys.executable,
                 "-m",
@@ -427,7 +455,17 @@ def _collect_outputs(out_dir: Path, mode: str, engine: str | None) -> dict[str, 
     outputs: dict[str, str] = {}
     if not out_dir.exists():
         return outputs
-    if mode == "strict":
+    if mode == "long-strict":
+        for key, name in {
+            "transcript": "transcript.md",
+            "audit": "audit.md",
+            "metrics": "metrics.json",
+            "manifest": "manifest.json",
+        }.items():
+            path = out_dir / name
+            if path.exists():
+                outputs[key] = str(path)
+    elif mode == "strict":
         mapping = {
             "final": "*.strict.md",
             "audit": "*.strict.audit.md",

@@ -68,6 +68,26 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual("queued", job.status)
             self.assertEqual([], job.conflicts)
 
+    def test_submit_accepts_long_strict_mode_and_builds_long_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            service = TranscriptionService(root=root, gpu_process_detector=lambda: [], autostart=False)
+            request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "long-strict", "chunk_sec": 120, "overlap_sec": 2},
+                root=root,
+            )
+
+            job, deduped = service.submit(request)
+
+            self.assertFalse(deduped)
+            self.assertEqual("queued", job.status)
+            self.assertIn("long", job.command)
+            self.assertIn("--chunk-sec", job.command)
+            self.assertIn("120", job.command)
+            self.assertIn("--overlap-sec", job.command)
+            self.assertIn("2", job.command)
+
     def test_run_next_job_marks_success_and_collects_outputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

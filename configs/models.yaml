@@ -5,6 +5,17 @@ strict:
   primary_engine: qwen3-asr-1.7b
   secondary_engine: sensevoice
 
+llm_arbitration:
+  enabled: false
+  provider: ollama
+  base_url: http://127.0.0.1:11434
+  model: qwen-main-v1:latest
+  fallback_model: qwen3.6-27b-256k:latest
+  mode: uncertain_only
+  temperature: 0.1
+  keep_alive: 0
+  timeout_sec: 120
+
 aliases:
   fsmn-vad: iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
   ct-punc: iic/punc_ct-transformer_cn-en-common-vocab471067-large

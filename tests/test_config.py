@@ -2,6 +2,8 @@ import unittest
 import tempfile
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 
 class ConfigTests(unittest.TestCase):
     def test_default_engine_is_sensevoice_for_low_hallucination_chinese(self):
@@ -44,6 +46,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.strict_primary_engine, "qwen3-asr-1.7b")
         self.assertEqual(config.strict_secondary_engine, "sensevoice")
         self.assertIn("speech_fsmn_vad_zh-cn-16k-common-pytorch", config.model_aliases["fsmn-vad"])
+
+    def test_llm_arbitration_defaults_to_disabled_ollama_with_keep_alive_zero(self):
+        import yaml
+
+        data = yaml.safe_load((PROJECT_ROOT / "configs" / "models.yaml").read_text(encoding="utf-8"))
+        arbitration = data["llm_arbitration"]
+
+        self.assertFalse(arbitration["enabled"])
+        self.assertEqual(arbitration["provider"], "ollama")
+        self.assertEqual(arbitration["model"], "qwen-main-v1:latest")
+        self.assertEqual(arbitration["keep_alive"], 0)
 
     def test_qwen3_asr_is_registered_as_strict_primary_candidate(self):
         from zh_asr.config import get_engine_spec

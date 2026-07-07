@@ -72,6 +72,7 @@ Qwen 会收到“只输出简体中文”的上下文提示；同时输出层会
 .\.venv\Scripts\python.exe -m zh_asr transcribe E:\path\to\audio.wav --engine sensevoice --device cuda:0 --out-dir E:\ChineseASR\outputs
 .\scripts\strict.ps1 -Audio E:\path\to\audio.wav
 .\scripts\asr-smart.ps1 -Audio E:\path\to\audio.wav -WaitSec 15
+.\scripts\asr-smart.ps1 -Audio E:\path\to\long.wav -Mode long-strict -ChunkSec 300 -OverlapSec 1 -WaitSec 15
 .\scripts\transcribe-folder.ps1 -InputDir E:\path\to\audio-folder
 .\scripts\eval.ps1 -Generate
 .\scripts\benchmark.ps1 -AudioDir E:\path\to\audio -TruthDir E:\path\to\truth
@@ -181,6 +182,29 @@ API 只绑定 `127.0.0.1`，支持：
 ```powershell
 .\scripts\asr-smart.ps1 -Audio E:\path\to\audio.wav -AllowGpuConflicts
 ```
+
+长音频优先走 `long-strict`，它会把音频切成可恢复 chunk，逐段运行 strict 双模型，并写出：
+
+- `manifest.json`：音频 hash、模型配置 hash、chunk 参数、每段状态和输出路径。
+- `chunks\chunk-000001.wav`：切片音频。
+- `chunks\chunk-000001\`：该段 strict / audit / raw JSON。
+- `transcript.md`：合并后的正文。
+- `audit.md`：合并后的证据和风险记录。
+- `metrics.json`：机器可读运行账本。
+
+同一音频、同一模型配置和同一 chunk 参数重跑时，会自动跳过已成功且输出仍存在的 chunk；`running` 残留会按 stale 处理并重跑。第一版使用固定时长切片，默认 300 秒、1 秒 overlap，后续可以替换成 VAD 静音边界切片。
+
+Ollama LLM 仲裁已预留为可选能力，默认关闭：
+
+```yaml
+llm_arbitration:
+  enabled: false
+  provider: ollama
+  model: qwen-main-v1:latest
+  keep_alive: 0
+```
+
+仲裁只看 ASR 文本和 audit 证据，不听音频；启用后只处理模型分歧、低相似度或规则命中的 chunk。`keep_alive: 0` 用于请求后释放 Ollama 模型，避免和 ASR 抢 GPU。
 
 如需临时使用另一份模型配置，可设置：
 

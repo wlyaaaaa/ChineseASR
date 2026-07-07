@@ -38,6 +38,21 @@ audio
 
 `strict.md` 是给人读的最终稿，正文尽量干净；当两个模型严重冲突、都为空、或出现常见幻觉套话时才写入 `[疑似]` / `[听不清]`。`strict.audit.md` 保存两模型原文、相似度、备选文本和判断依据。后续接入顶级 LLM 仲裁时，应只读取这个审计输入，不覆盖原始 ASR 证据。
 
+长音频模式：
+
+```text
+long audio
+  -> deterministic chunks + manifest.json
+  -> each chunk runs strict
+  -> skip completed chunks on resume
+  -> optional uncertain-only Ollama arbitration
+  -> transcript.md + audit.md + metrics.json
+```
+
+第一版长音频切片采用固定时长和 overlap，默认 `chunk_sec=300`、`overlap_sec=1`。`manifest.json` 记录音频 hash、模型配置 hash、chunk 参数和每个 chunk 的状态；同一输入重跑时，已成功且输出存在的 chunk 会跳过，残留 `running` 会视为 stale 并重跑。后续可以把 planner 替换成 VAD 静音边界切片，但 manifest/schema 不变。
+
+LLM 仲裁默认关闭，配置在 `configs/models.yaml` 的 `llm_arbitration`。当前 provider 是本地 Ollama，默认模型 `qwen-main-v1:latest`，`keep_alive=0`。仲裁只读取 chunk audit 证据，不读取音频；只在 `flags`、`needs_review` 或低相似度 chunk 上触发。仲裁结果写入 merged audit / metrics，不覆盖原始 strict raw JSON。
+
 ## 本地 API / Smart 调用层
 
 面向 Codex 和自动化调用时，不直接长时间等待 `strict.ps1`。推荐路径是：
