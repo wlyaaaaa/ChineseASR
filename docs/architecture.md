@@ -11,7 +11,7 @@
 1. `defaults.engine` 决定 quick 模式默认模型。
 2. `strict.primary_engine` / `strict.secondary_engine` 决定严格模式双模型组合。
 3. `aliases` 记录 VAD、标点、说话人等可复用模型别名。
-4. `engines.*.adapter` 决定运行时适配器；当前已实现 `funasr`。
+4. `engines.*.adapter` 决定运行时适配器；当前已实现 `funasr` 和 `qwen-asr`。
 
 当前默认策略仍然是：
 
@@ -37,6 +37,8 @@ audio
 ```
 
 `strict.md` 是给人读的最终稿，正文尽量干净；当两个模型严重冲突、都为空、或出现常见幻觉套话时才写入 `[疑似]` / `[听不清]`。`strict.audit.md` 保存两模型原文、相似度、备选文本和判断依据。后续接入顶级 LLM 仲裁时，应只读取这个审计输入，不覆盖原始 ASR 证据。
+
+如果 strict 中某个引擎抛错，流程不会直接丢弃整次任务。成功的一路会继续进入最终猜测，正文标记 `[疑似]`，审计报告状态为 `engine_failure`，并在 raw JSON 中保留失败引擎、异常类型和错误摘要。如果两路都失败，则输出 `[听不清]` 并要求人工复核。
 
 长音频模式：
 
@@ -72,13 +74,21 @@ API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 8765` 提供，主
 
 为避免和其他本地模型互相抢 GPU，提交任务前会尝试读取 `nvidia-smi --query-compute-apps`。发现外部 CUDA compute 进程时默认返回 `blocked`；只有显式传入 `allow_gpu_conflicts=true` 或 `scripts\asr-smart.ps1 -AllowGpuConflicts` 才会继续入队。服务不会自动终止 Ollama、LocalOCR、LM Studio 或其他 Python 模型进程。
 
+固定端到端验收入口是：
+
+```powershell
+.\scripts\smoke-asr-smart.ps1 -Json
+```
+
+它会使用本地模型缓存自带的中文样例音频，强制跑一次 strict smart job，并校验 `final`、`audit`、`audit_json`、`primary_raw_json` 和 `secondary_raw_json` 都存在。
+
 ## 模型替换边界
 
 同一 adapter 内替换模型时，优先只改 `configs/models.yaml`，然后运行：
 
 ```powershell
 .\scripts\download-models.ps1 -Engine <engine-name>
-.\scripts\strict.ps1 -Audio E:\path\to\audio.wav
+.\scripts\strict.ps1 -Audio C:\path\to\audio.wav
 ```
 
 新增不同运行时，例如 Whisper 本地实现、其他 LLM 音频模型或云 API 时，应新增 adapter，并保持 pipeline 只依赖统一的 `build_model(...)` / `generate(...)` 形状。当前已有 `funasr` 和 `qwen-asr` 两个 adapter。
@@ -92,7 +102,7 @@ API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 8765` 提供，主
 
 ## 下载策略
 
-脚本层和 Python 层都会清空代理变量。模型默认走 ModelScope ID，并缓存到 `E:\ChineseASR\models\modelscope`。
+脚本层和 Python 层都会清空代理变量。模型默认走 ModelScope ID，并缓存到项目根目录下的 `models\modelscope`。
 
 运行时会优先检查缓存目录：如果 YAML 中的模型 ID 已在本地缓存中，就把它们作为本地路径传给 FunASR，减少日常转写时的网络探测。
 

@@ -3,7 +3,7 @@ param(
   [string]$Audio,
 
   [string]$Device = 'cuda:0',
-  [string]$OutDir = 'E:\ChineseASR\outputs\strict',
+  [string]$OutDir = '',
   [string]$PrimaryEngine = '',
   [string]$SecondaryEngine = ''
 )
@@ -16,6 +16,9 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
 if (-not (Test-Path $Python)) {
   throw 'Virtual environment not found. Run scripts\install-torch-cu128-direct.ps1 and scripts\setup-core.ps1 first.'
+}
+if ([string]::IsNullOrWhiteSpace($OutDir)) {
+  $OutDir = Join-Path $Root 'outputs\strict'
 }
 
 $Args = @(

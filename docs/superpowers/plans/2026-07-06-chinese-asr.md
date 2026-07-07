@@ -10,9 +10,9 @@
 
 ## Global Constraints
 
-- Project root is `E:\ChineseASR`.
+- Project root is `<repo-root>`.
 - Downloads must not use `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, lowercase variants, or inherited proxy variables.
-- Prefer ModelScope model IDs and project-local cache under `E:\ChineseASR\models`.
+- Prefer ModelScope model IDs and project-local cache under `<repo-root>\models`.
 - Core tests must run without installing FunASR, PyTorch, or model weights.
 - Primary engine is `sensevoice`; secondary evaluation engine is `paraformer`; Whisper is fallback/comparison only.
 
@@ -86,4 +86,3 @@
 - [ ] **Step 1: Add docs and scripts**
 - [ ] **Step 2: Run script syntax checks**
 - [ ] **Step 3: Run project tests**
-

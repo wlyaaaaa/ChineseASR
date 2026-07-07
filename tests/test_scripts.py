@@ -141,6 +141,14 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("audit", script)
         self.assertIn("secondary_raw_json", script)
 
+    def test_public_wrappers_use_project_relative_default_output_paths(self):
+        for name in ("strict.ps1", "eval.ps1", "benchmark.ps1", "transcribe-folder.ps1"):
+            with self.subTest(script=name):
+                script = (PROJECT_ROOT / "scripts" / name).read_text(encoding="utf-8")
+
+                self.assertNotIn("E:\\ChineseASR", script)
+                self.assertIn("Join-Path $Root 'outputs", script)
+
 
 if __name__ == "__main__":
     unittest.main()

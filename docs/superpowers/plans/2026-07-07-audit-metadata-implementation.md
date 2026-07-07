@@ -44,7 +44,7 @@ def test_file_metadata_hashes_size_and_missing_paths():
 
 - [x] **Step 2: Run metadata tests and verify failure**
 
-Run: `$env:PYTHONPATH='E:\ChineseASR\src'; .\.venv\Scripts\python.exe -m unittest tests.test_metadata -v`
+Run: `$env:PYTHONPATH='<repo-root>\src'; .\.venv\Scripts\python.exe -m unittest tests.test_metadata -v`
 
 - [x] **Step 3: Implement `metadata.py`**
 
@@ -72,7 +72,7 @@ Assert `_manifest/manifest.json` contains `schema_version`, `model_config.sha256
 
 - [x] **Step 2: Run targeted tests and verify failure**
 
-Run: `$env:PYTHONPATH='E:\ChineseASR\src'; .\.venv\Scripts\python.exe -m unittest tests.test_benchmark tests.test_eval_pack -v`
+Run: `$env:PYTHONPATH='<repo-root>\src'; .\.venv\Scripts\python.exe -m unittest tests.test_benchmark tests.test_eval_pack -v`
 
 - [x] **Step 3: Enrich manifests**
 
@@ -100,7 +100,7 @@ Assert `metrics.json` includes top-level `schema_version`, `runtime`, `model_con
 
 - [x] **Step 2: Run targeted tests and verify failure**
 
-Run: `$env:PYTHONPATH='E:\ChineseASR\src'; .\.venv\Scripts\python.exe -m unittest tests.test_eval_pack tests.test_benchmark -v`
+Run: `$env:PYTHONPATH='<repo-root>\src'; .\.venv\Scripts\python.exe -m unittest tests.test_eval_pack tests.test_benchmark -v`
 
 - [x] **Step 3: Implement timing and metrics serialization**
 
@@ -137,9 +137,9 @@ Document that manifest and metrics now contain hashes, model config, invocation,
 Run:
 
 ```powershell
-$env:PYTHONPATH='E:\ChineseASR\src'; .\.venv\Scripts\python.exe -m unittest discover -s E:\ChineseASR\tests -v
-$env:PYTHONPATH='E:\ChineseASR\src'; .\.venv\Scripts\python.exe -m compileall src tests
-.\scripts\benchmark.ps1 -AudioDir E:\ChineseASR\eval\corpus\smoke-tts\synthetic -TruthDir E:\ChineseASR\eval\corpus\smoke-tts\truth -OutDir E:\ChineseASR\outputs\benchmark-smoke-tts -Force
+$env:PYTHONPATH='<repo-root>\src'; .\.venv\Scripts\python.exe -m unittest discover -s <repo-root>\tests -v
+$env:PYTHONPATH='<repo-root>\src'; .\.venv\Scripts\python.exe -m compileall src tests
+.\scripts\benchmark.ps1 -AudioDir <repo-root>\eval\corpus\smoke-tts\synthetic -TruthDir <repo-root>\eval\corpus\smoke-tts\truth -OutDir <repo-root>\outputs\benchmark-smoke-tts -Force
 ```
 
 Expected: tests pass, compile exits 0, smoke writes schema version 2 `manifest.json`, `metrics.json`, and `benchmark.json`.

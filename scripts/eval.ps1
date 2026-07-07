@@ -1,6 +1,6 @@
 param(
-  [string]$CorpusDir = 'E:\ChineseASR\eval\corpus\builtin',
-  [string]$OutDir = 'E:\ChineseASR\outputs\eval',
+  [string]$CorpusDir = '',
+  [string]$OutDir = '',
   [string]$Device = 'cuda:0',
   [string]$PrimaryEngine = '',
   [string]$SecondaryEngine = '',
@@ -18,6 +18,12 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
 if (-not (Test-Path $Python)) {
   throw 'Virtual environment not found. Run scripts\install-torch-cu128-direct.ps1 and scripts\setup-core.ps1 first.'
+}
+if ([string]::IsNullOrWhiteSpace($CorpusDir)) {
+  $CorpusDir = Join-Path $Root 'eval\corpus\builtin'
+}
+if ([string]::IsNullOrWhiteSpace($OutDir)) {
+  $OutDir = Join-Path $Root 'outputs\eval'
 }
 
 $CliArgs = @(
