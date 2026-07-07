@@ -51,6 +51,8 @@ strict 默认使用 `qwen3-asr-1.7b + sensevoice`。首次启用 Qwen 路线时�
 
 `download-models.ps1 -Engine qwen3-asr-1.7b` 会先通过 ModelScope 下载 `Qwen/Qwen3-ASR-1.7B` 到 `E:\ChineseASR\models\modelscope\Qwen\Qwen3-ASR-1.7B`，再 warmup，避免运行时默认走 Hugging Face 自动下载。
 
+Qwen adapter 会强制使用这个本地目录；如果目录不存在，会直接报错并提示先预取，不会把模型 ID 交给 runtime 自行联网。
+
 ## 使用
 
 ```powershell

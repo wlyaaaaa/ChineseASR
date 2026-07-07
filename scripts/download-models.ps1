@@ -20,7 +20,10 @@ $env:MODELSCOPE_CACHE = $CacheDir
 if ($Engine -eq 'qwen3-asr-1.7b') {
   $QwenDir = Join-Path $CacheDir 'Qwen\Qwen3-ASR-1.7B'
   if (-not (Test-Path $QwenDir)) {
-    & $Python -m modelscope download --model 'Qwen/Qwen3-ASR-1.7B' --local_dir $QwenDir
+    & $Python -c "from modelscope import snapshot_download; snapshot_download('Qwen/Qwen3-ASR-1.7B', local_dir=r'$QwenDir')"
+    if ($LASTEXITCODE -ne 0) {
+      throw "ModelScope prefetch failed for Qwen/Qwen3-ASR-1.7B."
+    }
   }
 }
 
@@ -29,3 +32,6 @@ if (-not [string]::IsNullOrWhiteSpace($Engine)) {
   $Args += @('--engine', $Engine)
 }
 & $Python @Args
+if ($LASTEXITCODE -ne 0) {
+  throw "Warmup failed for engine '$Engine'."
+}

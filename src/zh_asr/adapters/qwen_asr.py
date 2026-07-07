@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 from zh_asr.adapters.base import MissingDependencyError
-from zh_asr.adapters.funasr import resolve_model_ref
 from zh_asr.config import EngineSpec
 
 
@@ -60,8 +59,9 @@ def qwen_from_pretrained_kwargs(
     model_aliases: dict[str, str],
 ) -> dict[str, Any]:
     options = spec.options or {}
+    model_ref = _resolve_required_local_qwen_model(spec.model, cache_dir, model_aliases)
     kwargs: dict[str, Any] = {
-        "model": resolve_model_ref(spec.model, cache_dir, model_aliases),
+        "model": model_ref,
         "device_map": device,
     }
     if "dtype" in options:
@@ -70,6 +70,23 @@ def qwen_from_pretrained_kwargs(
         if key in options:
             kwargs[key] = options[key]
     return kwargs
+
+
+def _resolve_required_local_qwen_model(
+    model_ref: str,
+    cache_dir: Path | None,
+    model_aliases: dict[str, str],
+) -> str:
+    canonical = model_aliases.get(model_ref, model_ref)
+    if cache_dir and "/" in canonical:
+        local = cache_dir / Path(*canonical.split("/"))
+        if local.exists():
+            return str(local)
+        raise FileNotFoundError(
+            f"Qwen ASR model cache not found: {local}. "
+            "Run scripts\\download-models.ps1 -Engine qwen3-asr-1.7b to prefetch from ModelScope."
+        )
+    return canonical
 
 
 def _normalize_qwen_result(item: Any) -> dict[str, Any]:

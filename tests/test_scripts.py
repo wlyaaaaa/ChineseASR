@@ -17,8 +17,9 @@ class ScriptTests(unittest.TestCase):
         script = (PROJECT_ROOT / "scripts" / "download-models.ps1").read_text(encoding="utf-8")
 
         self.assertIn("Qwen/Qwen3-ASR-1.7B", script)
-        self.assertIn("modelscope download", script)
+        self.assertIn("snapshot_download", script)
         self.assertIn("Qwen\\Qwen3-ASR-1.7B", script)
+        self.assertIn("$LASTEXITCODE", script)
 
 
 if __name__ == "__main__":

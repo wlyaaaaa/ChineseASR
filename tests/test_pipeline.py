@@ -118,6 +118,22 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(kwargs["max_new_tokens"], 256)
         self.assertEqual(kwargs["max_inference_batch_size"], 8)
 
+    def test_qwen_adapter_requires_prefetched_local_cache(self):
+        from zh_asr.adapters.qwen_asr import qwen_from_pretrained_kwargs
+        from zh_asr.config import EngineSpec
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = EngineSpec(
+                name="qwen3-asr-1.7b",
+                adapter="qwen-asr",
+                role="primary",
+                model="Qwen/Qwen3-ASR-1.7B",
+                language="Chinese",
+            )
+
+            with self.assertRaisesRegex(FileNotFoundError, "Qwen ASR model cache not found"):
+                qwen_from_pretrained_kwargs(spec, "cuda:0", Path(tmp), {})
+
 
 if __name__ == "__main__":
     unittest.main()
