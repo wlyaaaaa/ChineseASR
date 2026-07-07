@@ -84,12 +84,12 @@ def strict_transcribe_audio(
     primary_name = primary_engine or model_config.strict_primary_engine
     secondary_name = secondary_engine or model_config.strict_secondary_engine
     total_started = time.perf_counter()
-    primary_started = time.perf_counter()
-    primary_result = _generate_once(audio_path, primary_name, device, cache_dir, model_config)
-    primary_sec = time.perf_counter() - primary_started
-    secondary_started = time.perf_counter()
-    secondary_result = _generate_once(audio_path, secondary_name, device, cache_dir, model_config)
-    secondary_sec = time.perf_counter() - secondary_started
+    primary_result, primary_error, primary_sec = _generate_for_strict(
+        audio_path, primary_name, device, cache_dir, model_config
+    )
+    secondary_result, secondary_error, secondary_sec = _generate_for_strict(
+        audio_path, secondary_name, device, cache_dir, model_config
+    )
     paths = write_strict_bundle(
         audio_path=audio_path,
         primary_engine=primary_name,
@@ -98,6 +98,8 @@ def strict_transcribe_audio(
         secondary_result=secondary_result,
         out_dir=out_dir or project_root() / "outputs",
         expect_empty=expect_empty,
+        primary_error=primary_error,
+        secondary_error=secondary_error,
     )
     paths["timing"] = {
         "total_sec": time.perf_counter() - total_started,
@@ -105,6 +107,32 @@ def strict_transcribe_audio(
         "secondary_sec": secondary_sec,
     }
     return paths
+
+
+def _generate_for_strict(
+    audio_path: Path,
+    engine: str,
+    device: str,
+    cache_dir: Path | None,
+    config: ModelConfig,
+) -> tuple[Any, str | None, float]:
+    started = time.perf_counter()
+    try:
+        return _generate_once(audio_path, engine, device, cache_dir, config), None, time.perf_counter() - started
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        return _engine_failure_result(engine, exc), error, time.perf_counter() - started
+
+
+def _engine_failure_result(engine: str, exc: Exception) -> dict[str, Any]:
+    return {
+        "engine": engine,
+        "text": "",
+        "error": {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        },
+    }
 
 
 def _generate_once(audio_path: Path, engine: str, device: str, cache_dir: Path | None, config: ModelConfig) -> Any:

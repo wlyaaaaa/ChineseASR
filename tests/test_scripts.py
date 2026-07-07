@@ -128,6 +128,19 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("New-Item -ItemType Directory -Force -Path $OutRootPath", script)
         self.assertNotIn("Resolve-Path $OutRoot", script)
 
+    def test_smoke_asr_smart_script_runs_strict_local_chinese_audio(self):
+        script = (PROJECT_ROOT / "scripts" / "smoke-asr-smart.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("Clear-ProxyEnv", script)
+        self.assertIn("asr-smart.ps1", script)
+        self.assertIn("-Mode strict", script)
+        self.assertIn("-Force", script)
+        self.assertIn("SenseVoiceSmall", script)
+        self.assertIn("zh.mp3", script)
+        self.assertIn("final", script)
+        self.assertIn("audit", script)
+        self.assertIn("secondary_raw_json", script)
+
 
 if __name__ == "__main__":
     unittest.main()

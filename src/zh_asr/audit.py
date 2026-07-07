@@ -31,12 +31,41 @@ def build_audit_report(
     secondary_text: str,
     conflict_threshold: float = 0.95,
     expect_empty: bool = False,
+    primary_error: str | None = None,
+    secondary_error: str | None = None,
 ) -> AuditReport:
     primary = to_simplified(primary_text.strip())
     secondary = to_simplified(secondary_text.strip())
     primary_norm = _normalize_for_compare(primary)
     secondary_norm = _normalize_for_compare(secondary)
     similarity = _similarity(primary_norm, secondary_norm)
+    error_hits = _engine_error_hits(primary_engine, primary_error, secondary_engine, secondary_error)
+
+    if error_hits:
+        chosen = primary or secondary
+        alternatives = tuple(text for text in (secondary, primary) if text and text != chosen)
+        rule_hits = error_hits + evaluate_risk_rules(
+            primary_text=primary,
+            secondary_text=secondary,
+            final_text=chosen,
+            similarity=similarity,
+            expect_empty=expect_empty,
+        )
+        flags = tuple(sorted(hit.id for hit in rule_hits))
+        return AuditReport(
+            status="engine_failure",
+            final_text=f"[疑似]{chosen}" if chosen else "[听不清]",
+            primary_engine=primary_engine,
+            primary_text=primary,
+            secondary_engine=secondary_engine,
+            secondary_text=secondary,
+            similarity=similarity,
+            needs_review=True,
+            flags=flags,
+            rule_hits=rule_hits,
+            alternatives=alternatives,
+            rationale="One or more ASR engines failed; final text falls back to available evidence and must be reviewed.",
+        )
 
     if not primary_norm and not secondary_norm:
         rule_hits = (
@@ -169,3 +198,32 @@ def _similarity(left: str, right: str) -> float:
     if not left or not right:
         return 0.0
     return SequenceMatcher(a=left, b=right).ratio()
+
+
+def _engine_error_hits(
+    primary_engine: str,
+    primary_error: str | None,
+    secondary_engine: str,
+    secondary_error: str | None,
+) -> tuple[RuleHit, ...]:
+    errors = []
+    if primary_error:
+        errors.append((primary_engine, primary_error))
+    if secondary_error:
+        errors.append((secondary_engine, secondary_error))
+    if not errors:
+        return ()
+    evidence = "; ".join(f"{engine}: {_clip_error(error)}" for engine, error in errors)
+    return (
+        RuleHit(
+            id="engine_failure",
+            severity="high" if len(errors) > 1 else "medium",
+            message="One or more ASR engines failed before returning usable text.",
+            evidence=evidence,
+        ),
+    )
+
+
+def _clip_error(text: str, limit: int = 240) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else f"{text[:limit]}..."

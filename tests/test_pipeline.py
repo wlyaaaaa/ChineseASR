@@ -146,6 +146,41 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "Qwen ASR model cache not found"):
                 qwen_from_pretrained_kwargs(spec, "cuda:0", Path(tmp), {})
 
+    def test_strict_transcribe_writes_audit_when_secondary_engine_fails(self):
+        import json
+        from zh_asr.pipeline import strict_transcribe_audio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "sample.wav"
+            audio.write_bytes(b"fake wav")
+
+            def fake_generate(audio_path, engine, device, cache_dir, config):
+                if engine == "sensevoice":
+                    raise TypeError("'>' not supported between instances of 'float' and 'NoneType'")
+                return [{"text": "开放时间早上九点至下午五点。"}]
+
+            with patch("zh_asr.pipeline._generate_once", side_effect=fake_generate):
+                paths = strict_transcribe_audio(
+                    audio,
+                    primary_engine="qwen3-asr-1.7b",
+                    secondary_engine="sensevoice",
+                    out_dir=root / "outputs",
+                )
+
+            final_text = paths["final"].read_text(encoding="utf-8")
+            audit_text = paths["audit"].read_text(encoding="utf-8")
+            audit_json = json.loads(paths["audit_json"].read_text(encoding="utf-8"))
+            secondary_raw = json.loads(paths["secondary_json"].read_text(encoding="utf-8"))
+
+            self.assertIn("[疑似]开放时间早上九点至下午五点。", final_text)
+            self.assertIn("engine_failure", audit_text)
+            self.assertIn("sensevoice", audit_text)
+            self.assertEqual("engine_failure", audit_json["status"])
+            self.assertIn("engine_failure", audit_json["flags"])
+            self.assertEqual("sensevoice", secondary_raw["engine"])
+            self.assertEqual("TypeError", secondary_raw["error"]["type"])
+
 
 if __name__ == "__main__":
     unittest.main()

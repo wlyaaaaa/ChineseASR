@@ -311,7 +311,13 @@ class TranscriptionService:
                 job.returncode = result.returncode
                 job.stdout_tail = _tail(result.stdout)
                 job.stderr_tail = _tail(result.stderr)
-                job.outputs = _collect_outputs(job.out_dir, job.request.mode, job.request.engine)
+                job.outputs = _collect_outputs(
+                    job.out_dir,
+                    job.request.mode,
+                    job.request.engine,
+                    primary_engine=job.request.primary_engine,
+                    secondary_engine=job.request.secondary_engine,
+                )
                 job.status = "succeeded" if result.returncode == 0 else "failed"
                 job.stage = "finished" if result.returncode == 0 else "failed"
                 job.message = "Completed." if result.returncode == 0 else "Transcription command failed."
@@ -465,7 +471,13 @@ def _parse_gpu_process_line(line: str) -> GpuProcess | None:
     return GpuProcess(pid=pid, process_name=process_name, used_memory_mib=used_memory_mib)
 
 
-def _collect_outputs(out_dir: Path, mode: str, engine: str | None) -> dict[str, str]:
+def _collect_outputs(
+    out_dir: Path,
+    mode: str,
+    engine: str | None,
+    primary_engine: str | None = None,
+    secondary_engine: str | None = None,
+) -> dict[str, str]:
     outputs: dict[str, str] = {}
     if not out_dir.exists():
         return outputs
@@ -484,12 +496,23 @@ def _collect_outputs(out_dir: Path, mode: str, engine: str | None) -> dict[str, 
             "final": "*.strict.md",
             "audit": "*.strict.audit.md",
             "audit_json": "*.strict.audit.json",
-            "primary_raw_json": "*.raw.json",
         }
         for key, pattern in mapping.items():
             matches = sorted(out_dir.glob(pattern))
             if matches:
                 outputs[key] = str(matches[0])
+        primary_name, secondary_name = _strict_engine_names(primary_engine, secondary_engine)
+        raw_matches = sorted(out_dir.glob("*.raw.json"))
+        primary_raw = _find_raw_json(raw_matches, primary_name)
+        secondary_raw = _find_raw_json(raw_matches, secondary_name)
+        if primary_raw is None and raw_matches:
+            primary_raw = raw_matches[0]
+        if secondary_raw is None:
+            secondary_raw = next((path for path in raw_matches if path != primary_raw), None)
+        if primary_raw:
+            outputs["primary_raw_json"] = str(primary_raw)
+        if secondary_raw:
+            outputs["secondary_raw_json"] = str(secondary_raw)
     else:
         pattern = f"*.{engine}.md" if engine else "*.md"
         matches = sorted(out_dir.glob(pattern))
@@ -499,6 +522,25 @@ def _collect_outputs(out_dir: Path, mode: str, engine: str | None) -> dict[str, 
         if json_matches:
             outputs["raw_json"] = str(json_matches[0])
     return outputs
+
+
+def _strict_engine_names(primary_engine: str | None, secondary_engine: str | None) -> tuple[str | None, str | None]:
+    if primary_engine and secondary_engine:
+        return primary_engine, secondary_engine
+    try:
+        from .config import load_model_config
+
+        config = load_model_config()
+        return primary_engine or config.strict_primary_engine, secondary_engine or config.strict_secondary_engine
+    except Exception:
+        return primary_engine, secondary_engine
+
+
+def _find_raw_json(matches: list[Path], engine: str | None) -> Path | None:
+    if not engine:
+        return None
+    suffix = f".{engine}.raw.json"
+    return next((path for path in matches if path.name.endswith(suffix)), None)
 
 
 def _format_conflict_message(conflicts: Iterable[GpuProcess]) -> str:

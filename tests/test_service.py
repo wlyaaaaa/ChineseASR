@@ -121,6 +121,9 @@ class ServiceTests(unittest.TestCase):
                 job.out_dir.mkdir(parents=True, exist_ok=True)
                 (job.out_dir / "sample.strict.md").write_text("正文", encoding="utf-8")
                 (job.out_dir / "sample.strict.audit.md").write_text("审计", encoding="utf-8")
+                (job.out_dir / "sample.strict.audit.json").write_text("{}", encoding="utf-8")
+                (job.out_dir / "sample.qwen3-asr-1.7b.raw.json").write_text("{}", encoding="utf-8")
+                (job.out_dir / "sample.sensevoice.raw.json").write_text("{}", encoding="utf-8")
                 return ProcessResult(returncode=0, stdout="Final: sample.strict.md", stderr="")
 
             service = TranscriptionService(
@@ -138,7 +141,13 @@ class ServiceTests(unittest.TestCase):
             self.assertIsNotNone(refreshed)
             self.assertEqual("succeeded", refreshed.status)
             self.assertIn("final", refreshed.outputs)
+            self.assertIn("audit", refreshed.outputs)
+            self.assertIn("audit_json", refreshed.outputs)
+            self.assertIn("primary_raw_json", refreshed.outputs)
+            self.assertIn("secondary_raw_json", refreshed.outputs)
             self.assertTrue(refreshed.outputs["final"].endswith("sample.strict.md"))
+            self.assertTrue(refreshed.outputs["primary_raw_json"].endswith("sample.qwen3-asr-1.7b.raw.json"))
+            self.assertTrue(refreshed.outputs["secondary_raw_json"].endswith("sample.sensevoice.raw.json"))
 
     def test_http_api_serves_health_submit_status_and_cancel(self):
         with tempfile.TemporaryDirectory() as temp_dir:

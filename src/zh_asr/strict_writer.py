@@ -18,12 +18,22 @@ def write_strict_bundle(
     secondary_result: object,
     out_dir: Path,
     expect_empty: bool = False,
+    primary_error: str | None = None,
+    secondary_error: str | None = None,
 ) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = audio_path.stem
     primary_text = extract_text(primary_result)
     secondary_text = extract_text(secondary_result)
-    report = build_audit_report(primary_engine, primary_text, secondary_engine, secondary_text, expect_empty=expect_empty)
+    report = build_audit_report(
+        primary_engine,
+        primary_text,
+        secondary_engine,
+        secondary_text,
+        expect_empty=expect_empty,
+        primary_error=primary_error,
+        secondary_error=secondary_error,
+    )
 
     final_path = out_dir / f"{stem}.strict.md"
     audit_path = out_dir / f"{stem}.strict.audit.md"
