@@ -106,6 +106,7 @@ def _doctor(model_config) -> int:
     print(f"Available engines: {', '.join(list_engine_names(model_config))}")
     print(f"Proxy variables: {proxy_status}")
     print(f"FunASR installed: {'yes' if importlib.util.find_spec('funasr') else 'no'}")
+    print(f"Qwen ASR installed: {'yes' if importlib.util.find_spec('qwen_asr') else 'no'}")
     print(f"PyTorch installed: {'yes' if importlib.util.find_spec('torch') else 'no'}")
     print(f"Model cache: {default_cache_dir()}")
     return 0

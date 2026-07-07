@@ -6,6 +6,10 @@ from typing import Any, Protocol
 from zh_asr.config import EngineSpec
 
 
+class MissingDependencyError(RuntimeError):
+    pass
+
+
 class ModelAdapter(Protocol):
     name: str
 

@@ -28,7 +28,9 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Default engine: sensevoice", result.stdout)
+        self.assertIn("Strict engines: qwen3-asr-1.7b, sensevoice", result.stdout)
         self.assertIn("Proxy variables: clean", result.stdout)
+        self.assertIn("Qwen ASR installed:", result.stdout)
 
     def test_transcribe_missing_audio_fails_clearly_before_model_load(self):
         result = self.run_cli("transcribe", "missing.wav")
@@ -52,6 +54,18 @@ class CliTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("FunASR is not installed", result.stderr)
+
+    def test_warmup_mentions_qwen_setup_when_qwen_asr_is_not_installed(self):
+        result = self.run_cli(
+            "warmup",
+            "--engine",
+            "qwen3-asr-1.7b",
+            extra_env={"ZH_ASR_TEST_FORCE_MISSING_QWEN_ASR": "1"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Qwen ASR is not installed", result.stderr)
+        self.assertIn("scripts\\setup-qwen.ps1", result.stderr)
 
     def test_cli_reads_engine_choices_from_model_config_file(self):
         with tempfile.TemporaryDirectory() as tmp:

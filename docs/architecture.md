@@ -15,9 +15,10 @@
 
 当前默认策略仍然是：
 
-1. `sensevoice`：默认主线。组合 `iic/SenseVoiceSmall`、`fsmn-vad`、`ct-punc`、`cam++`。
-2. `paraformer`：中文保守对照线。适合做交叉识别和基准回归。
-3. `whisper-large-v3`：只记录为 fallback/comparison，不自动作为主输出。
+1. `qwen3-asr-1.7b`：strict 准确率优先主线。基于 Qwen3-ASR 官方开源权重和 `qwen-asr` runtime。
+2. `sensevoice`：quick 默认和 strict 低幻觉锚点。组合 `iic/SenseVoiceSmall`、`fsmn-vad`、`ct-punc`、`cam++`。
+3. `paraformer`：中文保守备用线。适合普通话生产基线、时间戳、热词和回归对照。
+4. `whisper-large-v3`：只记录为 fallback/comparison，不自动作为主输出。
 
 ## 数据流
 
@@ -29,8 +30,8 @@ audio -> VAD split -> ASR engine -> raw JSON -> Markdown transcript
 
 ```text
 audio
+  -> Qwen3-ASR raw JSON
   -> SenseVoice raw JSON
-  -> Paraformer raw JSON
   -> normalized text comparison
   -> strict.md + strict.audit.md + strict.audit.json
 ```
@@ -39,14 +40,14 @@ audio
 
 ## 模型替换边界
 
-同一 `funasr` 适配器内替换模型时，优先只改 `configs/models.yaml`，然后运行：
+同一 adapter 内替换模型时，优先只改 `configs/models.yaml`，然后运行：
 
 ```powershell
 .\scripts\download-models.ps1 -Engine <engine-name>
 .\scripts\strict.ps1 -Audio E:\path\to\audio.wav
 ```
 
-新增不同运行时，例如 Whisper 本地实现、LLM 音频模型或云 API 时，应新增 adapter，并保持 pipeline 只依赖统一的 `build_model(...)` / `generate(...)` 形状。
+新增不同运行时，例如 Whisper 本地实现、其他 LLM 音频模型或云 API 时，应新增 adapter，并保持 pipeline 只依赖统一的 `build_model(...)` / `generate(...)` 形状。当前已有 `funasr` 和 `qwen-asr` 两个 adapter。
 
 后续扩展时应增加：
 
@@ -60,3 +61,5 @@ audio
 脚本层和 Python 层都会清空代理变量。模型默认走 ModelScope ID，并缓存到 `E:\ChineseASR\models\modelscope`。
 
 运行时会优先检查缓存目录：如果 YAML 中的模型 ID 已在本地缓存中，就把它们作为本地路径传给 FunASR，减少日常转写时的网络探测。
+
+Qwen3-ASR 权重必须先用 `scripts\download-models.ps1 -Engine qwen3-asr-1.7b` 预取。该脚本使用 ModelScope 的 `Qwen/Qwen3-ASR-1.7B`，本地目录是 `models\modelscope\Qwen\Qwen3-ASR-1.7B`。

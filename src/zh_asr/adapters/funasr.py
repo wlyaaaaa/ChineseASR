@@ -6,10 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from zh_asr.config import EngineSpec
-
-
-class MissingDependencyError(RuntimeError):
-    pass
+from zh_asr.adapters.base import MissingDependencyError
 
 
 class FunASRAdapter:

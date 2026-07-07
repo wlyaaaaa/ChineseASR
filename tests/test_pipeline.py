@@ -67,6 +67,57 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(model.kwargs["model"], str(cache / "iic/SenseVoiceSmall"))
 
+    def test_qwen_adapter_wraps_transcribe_results_for_common_writer(self):
+        from zh_asr.adapters.qwen_asr import QwenASRAdapter
+        from zh_asr.config import EngineSpec
+
+        class DummyResult:
+            language = "zh"
+            text = "开放时间早上九点至下午五点。"
+
+        class DummyQwenModel:
+            def transcribe(self, audio, language):
+                self.audio = audio
+                self.language = language
+                return [DummyResult()]
+
+        spec = EngineSpec(
+            name="qwen3-asr-1.7b",
+            adapter="qwen-asr",
+            role="primary",
+            model="Qwen/Qwen3-ASR-1.7B",
+            language="Chinese",
+            options={"dtype": "bfloat16"},
+        )
+        wrapper = QwenASRAdapter().wrap_model(DummyQwenModel(), spec)
+
+        result = wrapper.generate(input="sample.wav")
+
+        self.assertEqual(result, [{"text": "开放时间早上九点至下午五点。", "language": "zh"}])
+
+    def test_qwen_adapter_uses_local_modelscope_cache_path_when_available(self):
+        from zh_asr.adapters.qwen_asr import qwen_from_pretrained_kwargs
+        from zh_asr.config import EngineSpec
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            (cache / "Qwen/Qwen3-ASR-1.7B").mkdir(parents=True)
+            spec = EngineSpec(
+                name="qwen3-asr-1.7b",
+                adapter="qwen-asr",
+                role="primary",
+                model="Qwen/Qwen3-ASR-1.7B",
+                language="Chinese",
+                options={"dtype": "bfloat16", "max_new_tokens": 256, "max_inference_batch_size": 8},
+            )
+
+            kwargs = qwen_from_pretrained_kwargs(spec, "cuda:0", cache, {})
+
+        self.assertEqual(kwargs["model"], str(cache / "Qwen/Qwen3-ASR-1.7B"))
+        self.assertEqual(kwargs["device_map"], "cuda:0")
+        self.assertEqual(kwargs["max_new_tokens"], 256)
+        self.assertEqual(kwargs["max_inference_batch_size"], 8)
+
 
 if __name__ == "__main__":
     unittest.main()

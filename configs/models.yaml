@@ -2,8 +2,8 @@ defaults:
   engine: sensevoice
 
 strict:
-  primary_engine: sensevoice
-  secondary_engine: paraformer
+  primary_engine: qwen3-asr-1.7b
+  secondary_engine: sensevoice
 
 aliases:
   fsmn-vad: iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
@@ -11,9 +11,20 @@ aliases:
   cam++: iic/speech_campplus_sv_zh-cn_16k-common
 
 engines:
+  qwen3-asr-1.7b:
+    adapter: qwen-asr
+    role: primary
+    model: Qwen/Qwen3-ASR-1.7B
+    language: Chinese
+    options:
+      dtype: bfloat16
+      max_inference_batch_size: 8
+      max_new_tokens: 256
+    note: Current accuracy-first strict primary based on public Qwen3-ASR evaluations.
+
   sensevoice:
     adapter: funasr
-    role: primary
+    role: anchor
     model: iic/SenseVoiceSmall
     vad_model: fsmn-vad
     punc_model: ct-punc

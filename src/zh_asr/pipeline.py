@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import get_adapter
-from .adapters.funasr import MissingDependencyError, ensure_funasr_available, funasr_kwargs as _funasr_kwargs
+from .adapters.base import MissingDependencyError
+from .adapters.funasr import ensure_funasr_available, funasr_kwargs as _funasr_kwargs
 from .config import ModelConfig, get_engine_spec, load_model_config
 from .proxy_guard import sanitize_current_process_env
 from .result_writer import write_transcript_bundle

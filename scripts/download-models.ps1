@@ -16,6 +16,14 @@ if (-not (Test-Path $Python)) {
 
 $CacheDir = Join-Path $Root 'models\modelscope'
 $env:MODELSCOPE_CACHE = $CacheDir
+
+if ($Engine -eq 'qwen3-asr-1.7b') {
+  $QwenDir = Join-Path $CacheDir 'Qwen\Qwen3-ASR-1.7B'
+  if (-not (Test-Path $QwenDir)) {
+    & $Python -m modelscope download --model 'Qwen/Qwen3-ASR-1.7B' --local_dir $QwenDir
+  }
+}
+
 $Args = @('-m', 'zh_asr', 'warmup', '--device', $Device, '--cache-dir', $CacheDir)
 if (-not [string]::IsNullOrWhiteSpace($Engine)) {
   $Args += @('--engine', $Engine)

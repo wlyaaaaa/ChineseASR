@@ -4,11 +4,12 @@
 
 ## 结论
 
-- 主模型路线：`SenseVoiceSmall + FSMN-VAD + ct-punc + cam++`
-- 对照路线：`Paraformer-zh`
+- strict 最优双模型路线：`Qwen3-ASR-1.7B + SenseVoiceSmall`
+- quick / 低成本路线：`SenseVoiceSmall + FSMN-VAD + ct-punc + cam++`
+- 保守备用路线：`Paraformer-zh`
 - Whisper：只做 fallback / comparison，不作为中文严谨转写主模型
 
-原因：Whisper 在静音、噪声、长停顿里有整句幻觉风险；本项目优先使用 FunASR 生态里更适合中文和 VAD 分段的模型。
+原因：公开评测和官方模型卡更支持 Qwen3-ASR-1.7B 作为准确率优先模型；SenseVoiceSmall 继续作为高速、低幻觉的声学锚点；Paraformer 保留用于普通话生产基线、时间戳、热词和回归对照。Whisper 在静音、噪声、长停顿里有整句幻觉风险，不作为中文严谨转写主轴。
 
 ## 网络与下载约束
 
@@ -41,6 +42,15 @@ cd E:\ChineseASR
 
 `install-torch-cu128-direct.ps1` 默认使用 PyTorch 官方 CUDA 12.8 wheel 源，并显式禁用代理。RTX 5090 D / Blackwell 通常需要 CUDA 12.8 或更新的 PyTorch 构建；如果稳定源不适配，可加 `-Nightly` 切换 PyTorch nightly cu128。
 
+strict 默认使用 `qwen3-asr-1.7b + sensevoice`。首次启用 Qwen 路线时再运行：
+
+```powershell
+.\scripts\setup-qwen.ps1
+.\scripts\download-models.ps1 -Engine qwen3-asr-1.7b
+```
+
+`download-models.ps1 -Engine qwen3-asr-1.7b` 会先通过 ModelScope 下载 `Qwen/Qwen3-ASR-1.7B` 到 `E:\ChineseASR\models\modelscope\Qwen\Qwen3-ASR-1.7B`，再 warmup，避免运行时默认走 Hugging Face 自动下载。
+
 ## 使用
 
 ```powershell
@@ -62,12 +72,12 @@ E:\ChineseASR\configs\models.yaml
 - `*.sensevoice.md`：可读 Markdown 转写
 - `*.sensevoice.raw.json`：原始 JSON，保留时间戳和说话人字段
 
-`strict` 是重要音频模式，会顺序运行 `sensevoice` 和 `paraformer`，输出：
+`strict` 是重要音频模式，默认会顺序运行 `qwen3-asr-1.7b` 和 `sensevoice`，输出：
 
 - `*.strict.md`：最终稿。正文尽量干净，只有严重分歧或听不清时才内联 `[疑似]` / `[听不清]`。
 - `*.strict.audit.md`：审计稿，记录两模型原文、相似度、状态、备选文本和判断依据。
 - `*.strict.audit.json`：机器可读审计数据。
-- `*.sensevoice.raw.json` / `*.paraformer.raw.json`：两模型原始结果。
+- `*.qwen3-asr-1.7b.raw.json` / `*.sensevoice.raw.json`：两模型原始结果。
 
 如需临时使用另一份模型配置，可设置：
 

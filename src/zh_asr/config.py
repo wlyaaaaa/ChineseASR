@@ -29,6 +29,7 @@ class EngineSpec:
     language: str = "auto"
     is_whisper: bool = False
     note: str = ""
+    options: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,7 @@ def _parse_engines(raw: Any, path: Path) -> dict[str, EngineSpec]:
             language=str(item.get("language", "auto")).strip(),
             is_whisper=bool(item.get("is_whisper", False)),
             note=str(item.get("note", "")).strip(),
+            options=dict(_mapping(item.get("options", {}), f"engines.{name}.options", path)),
         )
     return engines
 

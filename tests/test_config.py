@@ -41,9 +41,21 @@ class ConfigTests(unittest.TestCase):
         config = load_model_config()
 
         self.assertEqual(config.default_engine, "sensevoice")
-        self.assertEqual(config.strict_primary_engine, "sensevoice")
-        self.assertEqual(config.strict_secondary_engine, "paraformer")
+        self.assertEqual(config.strict_primary_engine, "qwen3-asr-1.7b")
+        self.assertEqual(config.strict_secondary_engine, "sensevoice")
         self.assertIn("speech_fsmn_vad_zh-cn-16k-common-pytorch", config.model_aliases["fsmn-vad"])
+
+    def test_qwen3_asr_is_registered_as_strict_primary_candidate(self):
+        from zh_asr.config import get_engine_spec
+
+        spec = get_engine_spec("qwen3-asr-1.7b")
+
+        self.assertEqual(spec.adapter, "qwen-asr")
+        self.assertEqual(spec.role, "primary")
+        self.assertEqual(spec.model, "Qwen/Qwen3-ASR-1.7B")
+        self.assertEqual(spec.language, "Chinese")
+        self.assertEqual(spec.options["dtype"], "bfloat16")
+        self.assertEqual(spec.options["max_new_tokens"], 256)
 
     def test_same_adapter_model_can_be_added_without_code_changes(self):
         from zh_asr.config import get_engine_spec, load_model_config
@@ -64,6 +76,8 @@ engines:
     adapter: funasr
     role: primary
     model: iic/CustomSenseVoice
+    options:
+      max_new_tokens: 128
     vad_model: tiny-vad
     punc_model: null
     spk_model: null
@@ -86,6 +100,7 @@ engines:
         self.assertEqual(spec.adapter, "funasr")
         self.assertEqual(spec.model, "iic/CustomSenseVoice")
         self.assertEqual(spec.vad_model, "tiny-vad")
+        self.assertEqual(spec.options["max_new_tokens"], 128)
 
 
 if __name__ == "__main__":

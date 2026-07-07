@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from .base import ModelAdapter
 from .funasr import FunASRAdapter
+from .qwen_asr import QwenASRAdapter
 
 
 ADAPTERS: dict[str, ModelAdapter] = {
     "funasr": FunASRAdapter(),
+    "qwen-asr": QwenASRAdapter(),
 }
 
 
