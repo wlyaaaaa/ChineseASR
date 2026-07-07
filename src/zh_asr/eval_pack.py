@@ -458,6 +458,7 @@ def _write_review(path: Path, summary: EvalSummary) -> None:
                     f"- Truth: `{item.truth_text}`",
                     f"- Final: `{item.final_text}`",
                     f"- Skipped: `{str(item.skipped).lower()}`",
+                    f"- Skip reason: `{item.skip_reason}`",
                     "",
                 ]
             )

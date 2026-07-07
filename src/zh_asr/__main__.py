@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .batch import run_batch
+from .benchmark import run_benchmark
 from .config import list_engine_names, list_transcription_engine_names, load_model_config
 from .eval_pack import generate_builtin_corpus, run_evaluation
 from .pipeline import MissingDependencyError, build_model, default_cache_dir, strict_transcribe_audio, transcribe_audio
@@ -71,6 +72,17 @@ def main(argv: list[str] | None = None) -> int:
     eval_cmd.add_argument("--cache-dir", type=Path, default=default_cache_dir())
     eval_cmd.add_argument("--force", action="store_true")
     eval_cmd.add_argument("--fail-on-findings", action="store_true")
+
+    benchmark = subparsers.add_parser("benchmark", help="Benchmark strict ASR against human truth text files.")
+    benchmark.add_argument("--audio-dir", type=Path, required=True)
+    benchmark.add_argument("--truth-dir", type=Path, required=True)
+    benchmark.add_argument("--out-dir", type=Path, default=Path("outputs") / "benchmark")
+    benchmark.add_argument("--primary-engine", choices=transcription_choices, default=model_config.strict_primary_engine)
+    benchmark.add_argument("--secondary-engine", choices=transcription_choices, default=model_config.strict_secondary_engine)
+    benchmark.add_argument("--device", default="cuda:0")
+    benchmark.add_argument("--cache-dir", type=Path, default=default_cache_dir())
+    benchmark.add_argument("--force", action="store_true")
+    benchmark.add_argument("--fail-on-findings", action="store_true")
 
     args = parser.parse_args(argv)
 
@@ -168,6 +180,28 @@ def main(argv: list[str] | None = None) -> int:
                 f"False confident: {eval_summary.false_confident_count}"
             )
             return 1 if args.fail_on_findings and eval_summary.false_confident_count else 0
+        if args.command == "benchmark":
+            benchmark_summary = run_benchmark(
+                audio_dir=args.audio_dir,
+                truth_dir=args.truth_dir,
+                out_dir=args.out_dir,
+                device=args.device,
+                cache_dir=args.cache_dir,
+                force=args.force,
+                primary_engine=args.primary_engine,
+                secondary_engine=args.secondary_engine,
+                config=model_config,
+            )
+            print(f"Benchmark JSON: {benchmark_summary.out_dir / 'benchmark.json'}")
+            print(f"Benchmark Markdown: {benchmark_summary.out_dir / 'benchmark.md'}")
+            print(f"Review: {benchmark_summary.out_dir / 'review.md'}")
+            print(
+                f"Total: {benchmark_summary.total}; "
+                f"Evaluated: {benchmark_summary.evaluated}; "
+                f"Skipped: {benchmark_summary.skipped}; "
+                f"False confident: {benchmark_summary.false_confident_count}"
+            )
+            return 1 if args.fail_on_findings and benchmark_summary.false_confident_count else 0
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         return 2

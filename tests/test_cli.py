@@ -94,6 +94,23 @@ class CliTests(unittest.TestCase):
         self.assertIn("Corpus manifest:", result.stdout)
         self.assertIn("silence-001", manifest)
 
+    def test_benchmark_missing_audio_dir_fails_clearly_before_model_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            truth_dir = root / "truth"
+            truth_dir.mkdir()
+
+            result = self.run_cli(
+                "benchmark",
+                "--audio-dir",
+                str(root / "missing-audio"),
+                "--truth-dir",
+                str(truth_dir),
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Audio directory not found", result.stderr)
+
     def test_warmup_mentions_dependency_when_funasr_is_not_installed(self):
         result = self.run_cli(
             "warmup",

@@ -42,6 +42,17 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--cache-dir", script)
         self.assertIn("$LASTEXITCODE", script)
 
+    def test_benchmark_script_uses_no_proxy_and_required_dirs(self):
+        script = (PROJECT_ROOT / "scripts" / "benchmark.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("Clear-ProxyEnv", script)
+        self.assertIn("'benchmark'", script)
+        self.assertIn("[Parameter(Mandatory = $true)]", script)
+        self.assertIn("--audio-dir", script)
+        self.assertIn("--truth-dir", script)
+        self.assertIn("--cache-dir", script)
+        self.assertIn("$LASTEXITCODE", script)
+
 
 if __name__ == "__main__":
     unittest.main()
