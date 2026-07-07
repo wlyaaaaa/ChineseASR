@@ -60,6 +60,7 @@ Qwen 会收到“只输出简体中文”的上下文提示；同时输出层会
 .\scripts\doctor.ps1
 .\.venv\Scripts\python.exe -m zh_asr transcribe E:\path\to\audio.wav --engine sensevoice --device cuda:0 --out-dir E:\ChineseASR\outputs
 .\scripts\strict.ps1 -Audio E:\path\to\audio.wav
+.\scripts\transcribe-folder.ps1 -InputDir E:\path\to\audio-folder
 ```
 
 模型注册表在：
@@ -81,6 +82,18 @@ E:\ChineseASR\configs\models.yaml
 - `*.strict.audit.md`：审计稿，记录两模型原文、相似度、状态、备选文本和判断依据。
 - `*.strict.audit.json`：机器可读审计数据。
 - `*.qwen3-asr-1.7b.raw.json` / `*.sensevoice.raw.json`：两模型原始结果。
+
+`transcribe-folder.ps1` 是日常批量入口，默认递归扫描 `wav/mp3/m4a/flac`，按每个音频单独建输出目录，并运行 strict 双模型。已经存在 `*.strict.md` 的文件会自动跳过；加 `-Force` 可重跑。批量输出包括：
+
+- `summary.md`：总数、已处理、已跳过、失败数和每个文件的输出目录。
+- `failed.jsonl`：失败文件、错误类型和错误信息，便于修复后重跑。
+- 每个音频子目录中的 strict / raw JSON / audit 文件。
+
+如果只想快速粗转，可用：
+
+```powershell
+.\scripts\transcribe-folder.ps1 -InputDir E:\path\to\audio-folder -Mode quick -Engine sensevoice
+```
 
 如需临时使用另一份模型配置，可设置：
 

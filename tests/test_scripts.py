@@ -21,6 +21,16 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("Qwen\\Qwen3-ASR-1.7B", script)
         self.assertIn("$LASTEXITCODE", script)
 
+    def test_transcribe_folder_uses_no_proxy_batch_cli_and_force_flag(self):
+        script = (PROJECT_ROOT / "scripts" / "transcribe-folder.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("Clear-ProxyEnv", script)
+        self.assertIn("'batch', $InputDir", script)
+        self.assertIn("--cache-dir", script)
+        self.assertIn("[switch]$Force", script)
+        self.assertIn("'--force'", script)
+        self.assertIn("$LASTEXITCODE", script)
+
 
 if __name__ == "__main__":
     unittest.main()

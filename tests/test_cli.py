@@ -44,6 +44,34 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Audio file not found", result.stderr)
 
+    def test_batch_empty_folder_writes_summary_without_model_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            output_dir = root / "out"
+            input_dir.mkdir()
+
+            result = self.run_cli(
+                "batch",
+                str(input_dir),
+                "--mode",
+                "quick",
+                "--out-dir",
+                str(output_dir),
+            )
+            summary = (output_dir / "summary.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Summary:", result.stdout)
+        self.assertIn("Total: 0", result.stdout)
+        self.assertIn("Total: 0", summary)
+
+    def test_batch_missing_folder_fails_clearly_before_model_load(self):
+        result = self.run_cli("batch", "missing-folder")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Input directory not found", result.stderr)
+
     def test_warmup_mentions_dependency_when_funasr_is_not_installed(self):
         result = self.run_cli(
             "warmup",
