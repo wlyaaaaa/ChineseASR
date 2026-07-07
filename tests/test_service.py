@@ -3,10 +3,19 @@ import tempfile
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
+from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.request import Request, urlopen
 from pathlib import Path
 
-from zh_asr.service import GpuProcess, JobRequest, ProcessResult, TranscriptionService, create_handler
+from zh_asr.service import (
+    GpuProcess,
+    JobRequest,
+    ProcessResult,
+    TranscriptionService,
+    create_handler,
+    detect_gpu_processes,
+)
 
 
 class ServiceTests(unittest.TestCase):
@@ -67,6 +76,21 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(deduped)
             self.assertEqual("queued", job.status)
             self.assertEqual([], job.conflicts)
+
+    def test_detect_gpu_processes_ignores_rows_without_numeric_memory(self):
+        nvidia_smi_output = (
+            "2800, [Insufficient Permissions], [N/A]\n"
+            "1234, C:\\tools\\ollama.exe, 4096\n"
+        )
+        completed = SimpleNamespace(returncode=0, stdout=nvidia_smi_output)
+
+        with patch("zh_asr.service.subprocess.run", return_value=completed):
+            processes = detect_gpu_processes()
+
+        self.assertEqual(1, len(processes))
+        self.assertEqual(1234, processes[0].pid)
+        self.assertEqual("C:\\tools\\ollama.exe", processes[0].process_name)
+        self.assertEqual(4096, processes[0].used_memory_mib)
 
     def test_submit_accepts_long_strict_mode_and_builds_long_command(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -440,15 +440,29 @@ def detect_gpu_processes() -> list[GpuProcess]:
         return []
     if completed.returncode != 0:
         return []
-    return [_parse_gpu_process_line(line) for line in completed.stdout.splitlines() if line.strip()]
+    processes = []
+    for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
+        process = _parse_gpu_process_line(line)
+        if process:
+            processes.append(process)
+    return processes
 
 
-def _parse_gpu_process_line(line: str) -> GpuProcess:
+def _parse_gpu_process_line(line: str) -> GpuProcess | None:
     parts = [part.strip() for part in line.split(",")]
-    pid = int(parts[0])
+    try:
+        pid = int(parts[0])
+    except (IndexError, ValueError):
+        return None
     process_name = parts[1] if len(parts) > 1 else "unknown"
-    memory = parts[2] if len(parts) > 2 else "0"
-    return GpuProcess(pid=pid, process_name=process_name, used_memory_mib=int(memory))
+    memory = (parts[2] if len(parts) > 2 else "0").replace("MiB", "").strip()
+    try:
+        used_memory_mib = int(memory)
+    except ValueError:
+        return None
+    return GpuProcess(pid=pid, process_name=process_name, used_memory_mib=used_memory_mib)
 
 
 def _collect_outputs(out_dir: Path, mode: str, engine: str | None) -> dict[str, str]:
