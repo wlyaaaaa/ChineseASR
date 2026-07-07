@@ -24,6 +24,8 @@ HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, http_proxy, https_proxy, all_proxy
 E:\ChineseASR\models\modelscope
 ```
 
+模型预热后，运行时会优先把 ModelScope 模型 ID 解析为本地缓存路径，尽量避免每次转写都联网检查文件列表。
+
 如果你要完全避免外网下载，请先把 PyTorch / FunASR / ModelScope wheel 放到本地 wheelhouse，再用 `scripts\install-torch-cu128-direct.ps1 -Wheelhouse <目录>`。
 
 ## 安装顺序
@@ -44,18 +46,27 @@ cd E:\ChineseASR
 ```powershell
 .\scripts\doctor.ps1
 .\.venv\Scripts\python.exe -m zh_asr transcribe E:\path\to\audio.wav --engine sensevoice --device cuda:0 --out-dir E:\ChineseASR\outputs
+.\scripts\strict.ps1 -Audio E:\path\to\audio.wav
 ```
 
-输出包含：
+`transcribe` 是 quick 模式，输出包含：
 
 - `*.sensevoice.md`：可读 Markdown 转写
 - `*.sensevoice.raw.json`：原始 JSON，保留时间戳和说话人字段
+
+`strict` 是重要音频模式，会顺序运行 `sensevoice` 和 `paraformer`，输出：
+
+- `*.strict.md`：最终稿。正文尽量干净，只有严重分歧或听不清时才内联 `[疑似]` / `[听不清]`。
+- `*.strict.audit.md`：审计稿，记录两模型原文、相似度、状态、备选文本和判断依据。
+- `*.strict.audit.json`：机器可读审计数据。
+- `*.sensevoice.raw.json` / `*.paraformer.raw.json`：两模型原始结果。
 
 ## 低幻觉原则
 
 - 静音和噪声优先交给 VAD，不让 ASR 自由生成。
 - 原始逐字稿、结构化 JSON、后处理文本分层保存。
 - 对低置信片段、疑似套话、模型不一致片段打标，不静默润色。
+- `transcript.md` 默认保持干净；会改变语义的不确定性才内联 `[疑似]` / `[听不清]`，详细证据放进 `audit.md`。
 - Whisper 只能作为交叉对照，不作为最终单一事实来源。
 
 ## 本地测试
@@ -66,4 +77,3 @@ cd E:\ChineseASR
 $env:PYTHONPATH='E:\ChineseASR\src'
 python -m unittest discover -s E:\ChineseASR\tests -v
 ```
-

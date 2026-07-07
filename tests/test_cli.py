@@ -35,6 +35,12 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Audio file not found", result.stderr)
 
+    def test_strict_missing_audio_fails_clearly_before_model_load(self):
+        result = self.run_cli("strict", "missing.wav")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Audio file not found", result.stderr)
+
     def test_warmup_mentions_dependency_when_funasr_is_not_installed(self):
         result = self.run_cli(
             "warmup",

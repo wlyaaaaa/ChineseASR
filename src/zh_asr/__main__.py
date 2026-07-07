@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from .config import DEFAULT_ENGINE, ENGINES
-from .pipeline import MissingDependencyError, build_model, default_cache_dir, transcribe_audio
+from .pipeline import MissingDependencyError, build_model, default_cache_dir, strict_transcribe_audio, transcribe_audio
 from .proxy_guard import PROXY_ENV_NAMES, sanitize_current_process_env
 
 
@@ -29,6 +29,14 @@ def main(argv: list[str] | None = None) -> int:
     transcribe.add_argument("--out-dir", type=Path, default=Path("outputs"))
     transcribe.add_argument("--cache-dir", type=Path, default=default_cache_dir())
 
+    strict = subparsers.add_parser("strict", help="Transcribe with two engines and write final + audit outputs.")
+    strict.add_argument("audio", type=Path)
+    strict.add_argument("--primary-engine", choices=("sensevoice", "paraformer"), default="sensevoice")
+    strict.add_argument("--secondary-engine", choices=("sensevoice", "paraformer"), default="paraformer")
+    strict.add_argument("--device", default="cuda:0")
+    strict.add_argument("--out-dir", type=Path, default=Path("outputs"))
+    strict.add_argument("--cache-dir", type=Path, default=default_cache_dir())
+
     args = parser.parse_args(argv)
 
     try:
@@ -48,6 +56,21 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"Markdown: {paths['markdown']}")
             print(f"Raw JSON: {paths['json']}")
+            return 0
+        if args.command == "strict":
+            paths = strict_transcribe_audio(
+                args.audio,
+                primary_engine=args.primary_engine,
+                secondary_engine=args.secondary_engine,
+                device=args.device,
+                out_dir=args.out_dir,
+                cache_dir=args.cache_dir,
+            )
+            print(f"Final: {paths['final']}")
+            print(f"Audit: {paths['audit']}")
+            print(f"Audit JSON: {paths['audit_json']}")
+            print(f"Primary raw JSON: {paths['primary_json']}")
+            print(f"Secondary raw JSON: {paths['secondary_json']}")
             return 0
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
@@ -77,4 +100,3 @@ def _doctor() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
