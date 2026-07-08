@@ -46,7 +46,7 @@
 - Modify: `tests/test_cli.py`
 
 **Interfaces:**
-- CLI: `python -m zh_asr serve --host 127.0.0.1 --port 8765 --state-dir outputs\api`
+- CLI: `python -m zh_asr serve --host 127.0.0.1 --port 8766 --state-dir outputs\api`
 - Endpoints: `GET /health`, `GET /jobs`, `GET /jobs/{job_id}`, `POST /jobs/transcribe`, `POST /jobs/{job_id}/cancel`
 
 - [x] **Step 1: Write failing tests for `serve` CLI registration and HTTP handler behavior with an injected service.**
@@ -61,7 +61,7 @@
 - Modify: `tests/test_scripts.py`
 
 **Interfaces:**
-- `scripts\asr-smart.ps1 -Audio <path> [-Mode strict|quick] [-WaitSec 15] [-Port 8765] [-AllowGpuConflicts] [-Json]`
+- `scripts\asr-smart.ps1 -Audio <path> [-Mode strict|quick] [-WaitSec 15] [-Port 8766] [-AllowGpuConflicts] [-Json]`
 
 - [x] **Step 1: Write failing static script tests for no-proxy setup, bounded wait, server start, conflict override, JSON output, and status command.**
 - [x] **Step 2: Run `python -m unittest tests.test_scripts -v` and verify failure.**

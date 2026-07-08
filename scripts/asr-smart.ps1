@@ -10,7 +10,7 @@ param(
   [string]$OutRoot = '',
   [string]$CacheDir = '',
   [string]$HostName = '127.0.0.1',
-  [int]$Port = 8765,
+  [int]$Port = 8766,
   [int]$WaitSec = 15,
   [int]$StartupTimeoutSec = 30,
   [int]$PollIntervalSec = 2,

@@ -68,11 +68,13 @@ scripts\asr-smart.ps1
   -> outputs\api\<job_id>\
 ```
 
-API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 8765` 提供，主要端点是 `/health`、`/jobs`、`/jobs/{job_id}`、`/jobs/transcribe` 和 `/jobs/{job_id}/cancel`。
+API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 8766` 提供，主要端点是 `/health`、`/jobs`、`/jobs/{job_id}`、`/jobs/transcribe` 和 `/jobs/{job_id}/cancel`。
 
 服务层只负责调度，不在 HTTP 请求线程中加载模型。每个任务在独立 Python 子进程里运行现有 CLI，这样 API 可以快速返回、任务可以取消、模型显存也不会长期留在 API 进程里。
 
 为避免和其他本地模型互相抢 GPU，提交任务前会尝试读取 `nvidia-smi --query-compute-apps`。发现外部 CUDA compute 进程时默认返回 `blocked`；只有显式传入 `allow_gpu_conflicts=true` 或 `scripts\asr-smart.ps1 -AllowGpuConflicts` 才会继续入队。服务不会自动终止 Ollama、LocalOCR、LM Studio 或其他 Python 模型进程。
+
+当前机器是 RTX 5090D 32GB，默认排他锁属于保守调度策略，不是硬件能力判断。需要并发本地模型时，用显式 override，而不是改默认安全边界。
 
 固定端到端验收入口是：
 

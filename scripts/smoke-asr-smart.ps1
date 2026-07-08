@@ -1,7 +1,7 @@
 param(
   [string]$Audio = '',
   [string]$HostName = '127.0.0.1',
-  [int]$Port = 8765,
+  [int]$Port = 8766,
   [int]$WaitSec = 300,
   [int]$StartupTimeoutSec = 120,
   [int]$PollIntervalSec = 5,
