@@ -9,11 +9,14 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import urlparse
+
+from .gpu_broker import GpuBrokerConflict, GpuBrokerLease
 
 
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "blocked"}
@@ -169,6 +172,7 @@ class Job:
 ProcessRunner = Callable[[Job], ProcessResult]
 GpuProcessDetector = Callable[[], list[GpuProcess]]
 CurrentProcessIds = Callable[[], set[int]]
+GpuLeaseFactory = Callable[[str], object]
 
 
 class TranscriptionService:
@@ -180,6 +184,7 @@ class TranscriptionService:
         gpu_process_detector: GpuProcessDetector = None,
         current_process_ids: CurrentProcessIds = None,
         process_runner: ProcessRunner = None,
+        gpu_lease_factory: GpuLeaseFactory = None,
         autostart: bool = True,
     ) -> None:
         self.root = root.resolve()
@@ -187,6 +192,12 @@ class TranscriptionService:
         self._gpu_process_detector = gpu_process_detector or detect_gpu_processes
         self._current_process_ids = current_process_ids or self._owned_process_ids
         self._process_runner = process_runner or self._run_subprocess
+        if gpu_lease_factory is not None:
+            self._gpu_lease_factory = gpu_lease_factory
+        elif process_runner is None:
+            self._gpu_lease_factory = lambda owner: GpuBrokerLease(owner)
+        else:
+            self._gpu_lease_factory = lambda _owner: nullcontext()
         self._jobs: dict[str, Job] = {}
         self._fingerprints: dict[str, str] = {}
         self._queue: queue.Queue[str] = queue.Queue()
@@ -304,7 +315,13 @@ class TranscriptionService:
             self._active_job_id = job_id
 
         try:
-            result = self._process_runner(job)
+            use_gpu_broker = (
+                job.request.device.lower().startswith(("cuda", "gpu"))
+                and not job.request.allow_gpu_conflicts
+            )
+            lease = self._gpu_lease_factory("chineseasr") if use_gpu_broker else nullcontext()
+            with lease:
+                result = self._process_runner(job)
             with self._lock:
                 if job.status == "canceled":
                     return
@@ -323,6 +340,14 @@ class TranscriptionService:
                 job.message = "Completed." if result.returncode == 0 else "Transcription command failed."
                 job.finished_at = time.time()
                 job.updated_at = job.finished_at
+        except GpuBrokerConflict as exc:
+            with self._lock:
+                if job.status != "canceled":
+                    job.status = "blocked"
+                    job.stage = "gpu_broker_conflict"
+                    job.message = str(exc)
+                    job.finished_at = time.time()
+                    job.updated_at = job.finished_at
         except Exception as exc:
             with self._lock:
                 if job.status != "canceled":
@@ -418,7 +443,13 @@ class TranscriptionService:
 
     def _foreign_gpu_processes(self) -> list[GpuProcess]:
         owned = self._current_process_ids()
-        return [process for process in self._gpu_process_detector() if process.pid not in owned]
+        managed_names = ("ollama", "llama-server")
+        return [
+            process
+            for process in self._gpu_process_detector()
+            if process.pid not in owned
+            and not any(name in process.process_name.lower() for name in managed_names)
+        ]
 
     def _owned_process_ids(self) -> set[int]:
         with self._lock:

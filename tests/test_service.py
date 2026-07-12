@@ -38,7 +38,7 @@ class ServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             audio = _write_audio(root / "sample.wav")
-            conflict = GpuProcess(pid=9999, process_name="ollama.exe", used_memory_mib=4096)
+            conflict = GpuProcess(pid=9999, process_name="other-cuda.exe", used_memory_mib=4096)
             service = TranscriptionService(
                 root=root,
                 gpu_process_detector=lambda: [conflict],
@@ -53,7 +53,25 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual("blocked", job.status)
             self.assertEqual("gpu_conflict", job.stage)
             self.assertEqual(1, len(job.conflicts))
-            self.assertIn("ollama.exe", job.message)
+            self.assertIn("other-cuda.exe", job.message)
+
+    def test_submit_defers_managed_ollama_conflict_to_broker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            conflict = GpuProcess(pid=9999, process_name="llama-server.exe", used_memory_mib=26000)
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [conflict],
+                current_process_ids=lambda: {1111},
+                autostart=False,
+            )
+            request = JobRequest.from_payload({"audio": str(audio), "mode": "strict"}, root=root)
+
+            job, _ = service.submit(request)
+
+            self.assertEqual("queued", job.status)
+            self.assertEqual([], job.conflicts)
 
     def test_submit_can_override_gpu_conflict(self):
         with tempfile.TemporaryDirectory() as temp_dir:

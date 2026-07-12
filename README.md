@@ -154,6 +154,11 @@ strict 模式会把最终稿和证据拆开：
 
 RTX 5090D 32GB 显存较大时，这个 GPU 排他锁仍然是保守默认值，不代表硬件不能并发。确认当前任务可以和 Ollama、LocalOCR 或其他 CUDA 进程共用显存时，再显式使用 `-AllowGpuConflicts` / `allow_gpu_conflicts=true`。
 
+默认入口还会向 `http://127.0.0.1:32100/_gpu_broker/*` 申请全机 GPU 租约。Broker
+会在 ASR 启动前卸载空闲 Ollama/LocalOCR，并在 ASR 运行期间阻止新的 Ollama 或 OCR
+重型推理。`-AllowGpuConflicts` 同时绕过旧进程检测和统一 Broker，只能在用户明确接受
+多模型并发时使用；Broker 不限制单个 ASR 任务本身的显存或内存占用。
+
 ## 长音频与断点续跑
 
 长音频入口：
