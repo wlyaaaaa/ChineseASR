@@ -10,7 +10,7 @@ param(
   [string]$OutRoot = '',
   [string]$CacheDir = '',
   [string]$HostName = '127.0.0.1',
-  [int]$Port = 8766,
+  [int]$Port = 18666,
   [int]$WaitSec = 15,
   [int]$StartupTimeoutSec = 30,
   [int]$PollIntervalSec = 2,
@@ -61,7 +61,24 @@ function Test-AsrApi {
   }
 }
 
+function Assert-AsrPortBindable {
+  $Listener = $null
+  try {
+    $IpAddress = [System.Net.IPAddress]::Parse($HostName)
+    $Listener = [System.Net.Sockets.TcpListener]::new($IpAddress, $Port)
+    $Listener.Start()
+  } catch {
+    throw "ChineseASR cannot bind ${HostName}:$Port. Check Windows excluded port ranges and current listeners. $($_.Exception.Message)"
+  } finally {
+    if ($null -ne $Listener) {
+      $Listener.Stop()
+    }
+  }
+}
+
 function Start-AsrApi {
+  Assert-AsrPortBindable
+
   $Args = @(
     '-m', 'zh_asr',
     'serve',

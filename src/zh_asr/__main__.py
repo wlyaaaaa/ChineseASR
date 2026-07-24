@@ -100,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
 
     serve = subparsers.add_parser("serve", help="Run the local ASR job API.")
     serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8766)
+    serve.add_argument("--port", type=int, default=18666)
     serve.add_argument("--state-dir", type=Path, default=Path("outputs") / "api")
     serve.add_argument("--check", action="store_true", help="Validate serve configuration without blocking.")
 

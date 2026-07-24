@@ -125,6 +125,9 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("'serve'", script)
         self.assertIn("'--host'", script)
         self.assertIn("'--port'", script)
+        self.assertIn("Assert-AsrPortBindable", script)
+        self.assertIn("TcpListener", script)
+        self.assertIn("excluded port ranges", script)
         self.assertIn("New-Item -ItemType Directory -Force -Path $OutRootPath", script)
         self.assertNotIn("Resolve-Path $OutRoot", script)
 

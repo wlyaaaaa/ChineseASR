@@ -135,7 +135,7 @@ strict 模式会把最终稿和证据拆开：
 本地 API 只绑定 `127.0.0.1`：
 
 ```powershell
-.\.venv\Scripts\python.exe -m zh_asr serve --host 127.0.0.1 --port 8766 --state-dir outputs\api
+.\.venv\Scripts\python.exe -m zh_asr serve --host 127.0.0.1 --port 18666 --state-dir outputs\api
 ```
 
 主要端点：
@@ -150,7 +150,7 @@ strict 模式会把最终稿和证据拆开：
 
 为了避免和 Ollama、LocalOCR、LM Studio 或其他 Python 模型抢 GPU，服务会读取 `nvidia-smi --query-compute-apps`。发现外部 CUDA compute 进程时默认返回 `blocked`；只有显式使用 `-AllowGpuConflicts` 或 API 参数 `allow_gpu_conflicts=true` 才会继续排队。
 
-默认端口是 `8766`，刻意避开 LocalOCR 的 `8765`。
+默认端口是 `18666`，刻意避开 LocalOCR 的 `18665`。
 
 RTX 5090D 32GB 显存较大时，这个 GPU 排他锁仍然是保守默认值，不代表硬件不能并发。确认当前任务可以和 Ollama、LocalOCR 或其他 CUDA 进程共用显存时，再显式使用 `-AllowGpuConflicts` / `allow_gpu_conflicts=true`。
 

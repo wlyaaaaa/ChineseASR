@@ -197,7 +197,7 @@ engines:
             result = self.run_cli("serve", "--check", "--state-dir", tmp)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("http://127.0.0.1:8766", result.stdout)
+        self.assertIn("http://127.0.0.1:18666", result.stdout)
 
 
 if __name__ == "__main__":
