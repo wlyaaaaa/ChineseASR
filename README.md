@@ -143,8 +143,12 @@ strict 模式会把最终稿和证据拆开：
 - `GET /health`
 - `GET /jobs`
 - `GET /jobs/{job_id}`
+- `GET /observer/jobs`
+- `GET /observer/jobs/{job_id}`
 - `POST /jobs/transcribe`
 - `POST /jobs/{job_id}/cancel`
+
+`/observer/*` 是只读安全投影，供本机统一观察台读取。它只返回任务状态、模式、逻辑模型名、时间、可用的长音频 chunk 计数与终态 RTF；ASR 不产生通用 LLM token 指标，因此 token 状态固定为 `not_applicable`。投影不返回音频/输出路径、PID、命令、stdout/stderr、识别正文或 GPU Broker 信息。
 
 `asr-smart.ps1` 会在需要时启动本地 API，提交 job，并在 `WaitSec` 内等待结果。如果任务仍在运行，它会返回 job id 和下一步查询命令，而不是无限等待。
 

@@ -68,7 +68,7 @@ scripts\asr-smart.ps1
   -> outputs\api\<job_id>\
 ```
 
-API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 18666` 提供，主要端点是 `/health`、`/jobs`、`/jobs/{job_id}`、`/jobs/transcribe` 和 `/jobs/{job_id}/cancel`。
+API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 18666` 提供，主要端点是 `/health`、`/jobs`、`/jobs/{job_id}`、`/jobs/transcribe` 和 `/jobs/{job_id}/cancel`。`/observer/jobs` 与 `/observer/jobs/{job_id}` 提供稳定的只读安全投影，只暴露调度元数据、可验证的 chunk 计数和终态 RTF，不暴露输入/输出路径、进程与命令信息、日志、转写正文或 Broker 细节。
 
 服务层只负责调度，不在 HTTP 请求线程中加载模型。每个任务在独立 Python 子进程里运行现有 CLI，这样 API 可以快速返回、任务可以取消、模型显存也不会长期留在 API 进程里。
 

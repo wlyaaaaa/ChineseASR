@@ -2,24 +2,47 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import wave
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Iterable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .gpu_broker import GpuBrokerConflict, GpuBrokerLease
 
 
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "blocked"}
+OBSERVER_LIST_SCHEMA = "local-ai-observer.jobs.v1"
+OBSERVER_JOB_SCHEMA = "local-ai-observer.job.v1"
+OBSERVER_SERVICE = "chinese-asr"
+OBSERVER_JOB_ID_PATTERN = re.compile(r"\A\d{8}-\d{6}-[0-9a-f]{8}\Z")
+OBSERVER_MODEL_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+OBSERVER_MANIFEST_LIMIT_BYTES = 8 * 1024 * 1024
+OBSERVER_DEFAULT_LIMIT = 50
+OBSERVER_MAX_LIMIT = 200
+OBSERVER_STATES = {"queued", "running", "succeeded", "failed", "canceled", "blocked"}
+OBSERVER_STAGES = {
+    "queued",
+    "gpu_conflict",
+    "running_command",
+    "finished",
+    "failed",
+    "gpu_broker_conflict",
+    "canceled",
+}
 
 
 @dataclass(frozen=True)
@@ -250,6 +273,46 @@ class TranscriptionService:
     def list_jobs(self) -> list[Job]:
         with self._lock:
             return sorted(self._jobs.values(), key=lambda job: job.created_at, reverse=True)
+
+    def observer_jobs(self, limit: int | str | None = None) -> dict:
+        observed_at = time.time()
+        bounded_limit = _observer_limit(limit)
+        with self._lock:
+            snapshots = [copy(job) for job in self._jobs.values()]
+        jobs = sorted(snapshots, key=lambda job: job.created_at, reverse=True)[:bounded_limit]
+        model_config = _load_observer_model_config() if jobs else None
+        projected = [
+            _observer_job_payload(job, observed_at, model_config=model_config)
+            for job in jobs
+        ]
+        return {
+            "schema": OBSERVER_LIST_SCHEMA,
+            "service": OBSERVER_SERVICE,
+            "observed_utc": _utc_timestamp(observed_at),
+            "jobs": projected,
+        }
+
+    def observer_job(self, job_id: str) -> dict | None:
+        if not OBSERVER_JOB_ID_PATTERN.fullmatch(job_id):
+            return None
+        observed_at = time.time()
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            snapshot = copy(job)
+        model_config = _load_observer_model_config()
+        projected = _observer_job_payload(
+            snapshot,
+            observed_at,
+            model_config=model_config,
+        )
+        return {
+            "schema": OBSERVER_JOB_SCHEMA,
+            "service": OBSERVER_SERVICE,
+            "observed_utc": _utc_timestamp(observed_at),
+            "job": projected,
+        }
 
     def cancel(self, job_id: str) -> Job:
         with self._lock:
@@ -593,13 +656,187 @@ def _tail(text: str, max_chars: int = 4000) -> str:
     return text[-max_chars:] if len(text) > max_chars else text
 
 
+def _observer_limit(value: int | str | None) -> int:
+    try:
+        requested = OBSERVER_DEFAULT_LIMIT if value is None else int(value)
+    except (TypeError, ValueError):
+        requested = OBSERVER_DEFAULT_LIMIT
+    return max(1, min(requested, OBSERVER_MAX_LIMIT))
+
+
+def _load_observer_model_config():
+    try:
+        from .config import load_model_config
+
+        return load_model_config()
+    except Exception:
+        return None
+
+
+def _observer_job_payload(job: Job, observed_at: float, *, model_config) -> dict:
+    elapsed_ms, timing_status = _observer_elapsed(job, observed_at)
+    progress, manifest_audio_seconds = _observer_progress(job)
+    audio_seconds = manifest_audio_seconds or _wav_audio_seconds(job.request.audio)
+    throughput = {
+        "status": "unavailable",
+        "rtf": None,
+        "audio_seconds": audio_seconds,
+    }
+    if (
+        job.status in TERMINAL_STATUSES
+        and elapsed_ms is not None
+        and audio_seconds is not None
+        and audio_seconds > 0
+    ):
+        throughput = {
+            "status": "measured",
+            "rtf": round((elapsed_ms / 1000) / audio_seconds, 6),
+            "audio_seconds": audio_seconds,
+        }
+
+    return {
+        "job_id": job.job_id,
+        "state": job.status if job.status in OBSERVER_STATES else "unknown",
+        "stage": job.stage if job.stage in OBSERVER_STAGES else "unknown",
+        "mode": job.request.mode,
+        "model": _observer_model(job.request, model_config),
+        "progress": progress,
+        "timing": {
+            "status": timing_status,
+            "started_utc": _utc_timestamp(job.started_at),
+            "updated_utc": _utc_timestamp(job.updated_at),
+            "elapsed_ms": elapsed_ms,
+        },
+        "tokens": {
+            "status": "not_applicable",
+            "input": None,
+            "output": None,
+            "tps": None,
+        },
+        "throughput": throughput,
+    }
+
+
+def _observer_model(request: JobRequest, config) -> str:
+    if config is None:
+        return "unavailable"
+
+    def configured(value: str | None, fallback: str) -> str | None:
+        selected = value or fallback
+        if selected not in config.engines or not OBSERVER_MODEL_PATTERN.fullmatch(selected):
+            return None
+        return selected
+
+    if request.mode == "quick":
+        return configured(request.engine, config.default_engine) or "unknown"
+
+    primary = configured(request.primary_engine, config.strict_primary_engine)
+    secondary = configured(request.secondary_engine, config.strict_secondary_engine)
+    if primary is None or secondary is None:
+        return "unknown"
+    return f"{primary} + {secondary}"
+
+
+def _observer_elapsed(job: Job, observed_at: float) -> tuple[int | None, str]:
+    if job.started_at is None:
+        return None, "not_started"
+    end = job.finished_at if job.finished_at is not None else observed_at
+    elapsed_ms = max(0, round((end - job.started_at) * 1000))
+    if job.finished_at is not None or job.status in TERMINAL_STATUSES:
+        return elapsed_ms, "complete"
+    return elapsed_ms, "running"
+
+
+def _observer_progress(job: Job) -> tuple[dict, float | None]:
+    unavailable = {
+        "status": "unavailable",
+        "completed": None,
+        "total": None,
+        "unit": None,
+    }
+    if job.request.mode != "long-strict":
+        return unavailable, None
+
+    manifest_path = job.out_dir / "manifest.json"
+    try:
+        with manifest_path.open("rb") as handle:
+            raw_manifest = handle.read(OBSERVER_MANIFEST_LIMIT_BYTES + 1)
+        if len(raw_manifest) > OBSERVER_MANIFEST_LIMIT_BYTES:
+            return unavailable, None
+        manifest = json.loads(raw_manifest.decode("utf-8"))
+        chunks = manifest.get("chunks")
+        if not isinstance(chunks, list):
+            return unavailable, None
+        completed = sum(
+            1
+            for chunk in chunks
+            if isinstance(chunk, dict) and chunk.get("status") in {"succeeded", "failed"}
+        )
+        end_points = [
+            float(chunk.get("end_ms"))
+            for chunk in chunks
+            if (
+                isinstance(chunk, dict)
+                and isinstance(chunk.get("end_ms"), (int, float))
+                and not isinstance(chunk.get("end_ms"), bool)
+                and math.isfinite(float(chunk.get("end_ms")))
+                and float(chunk.get("end_ms")) >= 0
+            )
+        ]
+        audio_seconds = round(max(end_points) / 1000, 3) if end_points else None
+        return {
+            "status": "available",
+            "completed": completed,
+            "total": len(chunks),
+            "unit": "chunks",
+        }, audio_seconds
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return unavailable, None
+
+
+def _wav_audio_seconds(path: Path) -> float | None:
+    try:
+        with wave.open(str(path), "rb") as handle:
+            rate = handle.getframerate()
+            if rate <= 0:
+                return None
+            return round(handle.getnframes() / rate, 3)
+    except (OSError, EOFError, wave.Error):
+        return None
+
+
+def _utc_timestamp(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return (
+        datetime.fromtimestamp(value, tz=timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def create_handler(service: TranscriptionService) -> type[BaseHTTPRequestHandler]:
     class AsrRequestHandler(BaseHTTPRequestHandler):
         server_version = "ChineseASR/0.1"
 
         def do_GET(self) -> None:
+            path = "/"
             try:
-                path = urlparse(self.path).path.rstrip("/") or "/"
+                parsed = urlparse(self.path)
+                path = parsed.path.rstrip("/") or "/"
+                if path == "/observer/jobs":
+                    query = parse_qs(parsed.query)
+                    limit = (query.get("limit") or [None])[0]
+                    self._send_json(200, service.observer_jobs(limit=limit))
+                    return
+                if path.startswith("/observer/jobs/"):
+                    job_id = path.removeprefix("/observer/jobs/")
+                    payload = service.observer_job(job_id)
+                    if payload is None:
+                        self._send_json(404, {"error": "job_not_found"})
+                        return
+                    self._send_json(200, payload)
+                    return
                 if path == "/health":
                     self._send_json(200, service.health())
                     return
@@ -616,6 +853,9 @@ def create_handler(service: TranscriptionService) -> type[BaseHTTPRequestHandler
                     return
                 self._send_json(404, {"error": f"Unknown endpoint: {path}"})
             except Exception as exc:
+                if path.startswith("/observer/"):
+                    self._send_json(500, {"error": "observer_unavailable"})
+                    return
                 self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
 
         def do_POST(self) -> None:
