@@ -155,6 +155,7 @@ def run_long_transcription(
     runtime_artifact_identity = _runtime_artifact_identity(
         model_config,
         (resolved_primary_engine, resolved_secondary_engine),
+        resolved_cache_dir,
     )
     recommended_chunk_sec, absolute_max_chunk_sec = _engine_chunk_limits(
         model_config,
@@ -194,6 +195,7 @@ def run_long_transcription(
         "device": device,
         "cache_dir": str(resolved_cache_dir),
         "runtime_artifact_identity": runtime_artifact_identity,
+        "runtime_code_identity": _runtime_code_identity(),
         "recommended_chunk_sec": recommended_chunk_sec,
         "absolute_max_chunk_sec": absolute_max_chunk_sec,
         "prepared_audio_sha256": prepared_audio.derivative_sha256,
@@ -227,7 +229,12 @@ def run_long_transcription(
         assert max_request_inputs is not None
         pending_states: list[ChunkState] = []
         for state in states:
-            if _can_skip(state, force=force):
+            if _can_skip(
+                state,
+                force=force,
+                primary_engine=resolved_primary_engine,
+                secondary_engine=resolved_secondary_engine,
+            ):
                 skipped += 1
                 continue
 
@@ -293,7 +300,12 @@ def run_long_transcription(
             persist_manifest()
     else:
         for state in states:
-            if _can_skip(state, force=force):
+            if _can_skip(
+                state,
+                force=force,
+                primary_engine=resolved_primary_engine,
+                secondary_engine=resolved_secondary_engine,
+            ):
                 skipped += 1
                 continue
 
@@ -432,10 +444,22 @@ def _engine_request_batch_limit(
 def _runtime_artifact_identity(
     model_config,
     engine_names: tuple[str, ...],
+    cache_dir: Path,
 ) -> list[dict[str, str]]:
     identities: list[dict[str, str]] = []
     for engine_name in engine_names:
         spec = model_config.engines.get(engine_name)
+        if getattr(spec, "adapter", "") == "qwen-asr":
+            from .qwen_identity import qwen_runtime_identity
+
+            identities.append(
+                qwen_runtime_identity(
+                    spec,
+                    cache_dir,
+                    dict(getattr(model_config, "model_aliases", {}) or {}),
+                )
+            )
+            continue
         options = getattr(spec, "options", None) or {}
         model_dir_value = options.get("model_dir")
         receipt_path = (
@@ -466,6 +490,35 @@ def _runtime_artifact_identity(
             }
         )
     return identities
+
+
+def _runtime_code_identity(root: Path | None = None) -> dict[str, Any]:
+    project = (root or Path(__file__).resolve().parents[2]).resolve()
+    candidates = [
+        *sorted((project / "src" / "zh_asr").rglob("*.py")),
+        *sorted((project / "runtime").rglob("*.py")),
+    ]
+    records: list[dict[str, str]] = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        records.append(
+            {
+                "path": path.relative_to(project).as_posix(),
+                "sha256": sha256_file(path),
+            }
+        )
+    payload = json.dumps(
+        records,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "schema": "zh_asr.runtime_code_identity.v1",
+        "file_count": len(records),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
 
 
 def _resolve_runtime_artifact_path(config_path: Path, value: Any) -> Path:
@@ -647,20 +700,28 @@ def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _can_skip(state: ChunkState, force: bool) -> bool:
+def _can_skip(
+    state: ChunkState,
+    force: bool,
+    primary_engine: str,
+    secondary_engine: str,
+) -> bool:
     if force or state.status != "succeeded":
         return False
-    final = state.outputs.get("final")
-    audit = state.outputs.get("audit")
-    audit_json = state.outputs.get("audit_json")
-    return bool(
-        state.evidence_status in {"verified", "provisional"}
-        and final
-        and audit
-        and audit_json
-        and Path(final).exists()
-        and Path(audit).exists()
-        and Path(audit_json).exists()
+    evidence_status, evidence_failures = _strict_outputs_evidence(
+        state.outputs,
+        primary_engine,
+        secondary_engine,
+    )
+    state.evidence_status = evidence_status
+    state.evidence_failures = evidence_failures
+    if evidence_status not in {"verified", "provisional"}:
+        state.status = "stale"
+        state.error = "Persisted strict evidence failed fresh bundle verification"
+        return False
+    return not any(
+        failure.get("kind") == "artifact_failure"
+        for failure in evidence_failures
     )
 
 

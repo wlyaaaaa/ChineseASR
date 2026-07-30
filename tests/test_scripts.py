@@ -145,6 +145,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("/jobs/$($Submit.job.job_id)", script)
         self.assertIn("allow_gpu_conflicts", script)
         self.assertIn("[switch]$AllowGpuConflicts", script)
+        self.assertIn("does not bypass LocalGpuBroker", script)
         self.assertIn("'long-strict'", script)
         self.assertIn("[int]$ChunkSec = 300", script)
         self.assertIn("[int]$OverlapSec = 1", script)
@@ -175,6 +176,31 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("final", script)
         self.assertIn("audit", script)
         self.assertIn("secondary_raw_json", script)
+
+    def test_evidence_smoke_uses_canonical_pair_and_verifies_every_chunk(self):
+        script = (PROJECT_ROOT / "scripts" / "smoke-evidence-asr.ps1").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("[Parameter(Mandatory = $true)]", script)
+        self.assertIn("-Mode long-strict", script)
+        self.assertIn("-PrimaryEngine fireredasr2-llm", script)
+        self.assertIn("-SecondaryEngine qwen3-asr-1.7b", script)
+        self.assertIn("evidence_status -ne 'verified'", script)
+        self.assertIn("'receipt'", script)
+        self.assertIn("engine_failure", script)
+        self.assertIn("llm_initial_load_dtype", script)
+        self.assertIn("portable bundle receipt reference", script)
+        self.assertIn("IsPathRooted", script)
+        self.assertIn("-Force", script)
+
+    def test_strict_wrapper_routes_through_smart_service_and_gpu_broker(self):
+        script = (PROJECT_ROOT / "scripts" / "strict.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("asr-smart.ps1", script)
+        self.assertIn("-Mode", script)
+        self.assertIn("'strict'", script)
+        self.assertNotIn("'-m', 'zh_asr'", script)
 
     def test_public_wrappers_use_project_relative_default_output_paths(self):
         for name in ("strict.ps1", "eval.ps1", "benchmark.ps1", "transcribe-folder.ps1"):

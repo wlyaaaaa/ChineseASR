@@ -3,6 +3,8 @@ param(
 
   [string]$Device = 'cuda:0',
 
+  [switch]$ReceiptOnly,
+
   [string]$FireRedRevision = '2c5e0f415b9afb8f67cb8b00ea4c54959f70e824'
 )
 
@@ -49,6 +51,11 @@ if (-not (Test-Path $Python)) {
 
 $CacheDir = Join-Path $Root 'models\modelscope'
 $env:MODELSCOPE_CACHE = $CacheDir
+$QwenRevision = 'a04930dbe5419bfee073f7cade734f572689a3a8'
+
+if ($ReceiptOnly -and $Engine -ne 'qwen3-asr-1.7b') {
+  throw '-ReceiptOnly currently requires -Engine qwen3-asr-1.7b.'
+}
 
 if ($Engine -eq 'fireredasr2-llm') {
   $FireRedDir = Join-Path $Root 'models\firered\FireRedASR2-LLM'
@@ -124,11 +131,33 @@ if ($Engine -eq 'fireredasr2-llm') {
 
 if ($Engine -eq 'qwen3-asr-1.7b') {
   $QwenDir = Join-Path $CacheDir 'Qwen\Qwen3-ASR-1.7B'
-  if (-not (Test-Path $QwenDir)) {
-    & $Python -c "from modelscope import snapshot_download; snapshot_download('Qwen/Qwen3-ASR-1.7B', local_dir=r'$QwenDir')"
-    if ($LASTEXITCODE -ne 0) {
-      throw "ModelScope prefetch failed for Qwen/Qwen3-ASR-1.7B."
+  $env:ZH_ASR_QWEN_DIR = $QwenDir
+  $env:ZH_ASR_QWEN_REVISION = $QwenRevision
+  if (-not (Test-Path -LiteralPath $QwenDir -PathType Container)) {
+    if ($ReceiptOnly) {
+      throw "Existing Qwen cache not found for receipt-only migration: $QwenDir"
     }
+    & $Python -c "import os; from modelscope import snapshot_download; snapshot_download('Qwen/Qwen3-ASR-1.7B', revision=os.environ['ZH_ASR_QWEN_REVISION'], local_dir=os.environ['ZH_ASR_QWEN_DIR'], max_workers=8)"
+    if ($LASTEXITCODE -ne 0) {
+      throw "ModelScope prefetch failed for Qwen/Qwen3-ASR-1.7B@$QwenRevision."
+    }
+  }
+
+  $ReceiptArgs = @(
+    '-m', 'zh_asr.qwen_identity',
+    'write-receipt',
+    '--model-dir', $QwenDir,
+    '--repository', 'Qwen/Qwen3-ASR-1.7B',
+    '--revision', $QwenRevision
+  )
+  & $Python @ReceiptArgs
+  if ($LASTEXITCODE -ne 0) {
+    throw "Qwen pinned model receipt verification failed for $QwenDir."
+  }
+  Write-Host "Qwen3-ASR-1.7B weights verified at pinned revision $QwenRevision`: $QwenDir"
+  Write-Host "SHA-256 receipt: $(Join-Path $QwenDir 'MODEL_RECEIPT.json')"
+  if ($ReceiptOnly) {
+    exit 0
   }
 }
 

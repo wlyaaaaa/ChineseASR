@@ -1,8 +1,10 @@
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -10,8 +12,192 @@ PYTHONPATH = str(PROJECT_ROOT / "src")
 
 
 class CliTests(unittest.TestCase):
+    def test_gpu_operation_refuses_unauthenticated_in_process_execution(self):
+        from zh_asr.__main__ import _run_with_gpu_lease
+        from zh_asr.gpu_broker import GpuBrokerError
+
+        with self.assertRaises(GpuBrokerError):
+            _run_with_gpu_lease("cuda:0", lambda: "must not run")
+
+    def test_legacy_plain_marker_cannot_bypass_gpu_broker(self):
+        from zh_asr.__main__ import _run_with_gpu_lease
+        from zh_asr.gpu_broker import GpuBrokerError
+
+        with patch.dict(
+            os.environ,
+            {"ZH_ASR_GPU_BROKER_LEASE_HELD": "1"},
+            clear=False,
+        ), self.assertRaises(GpuBrokerError):
+            _run_with_gpu_lease("cuda:0", lambda: "must not run")
+
+    def test_gpu_cli_supervisor_passes_live_token_to_worker(self):
+        from zh_asr.__main__ import _supervise_gpu_cli
+        from zh_asr.gpu_broker import GPU_BROKER_CHILD_TOKEN_ENV
+
+        captured = {}
+
+        class Lease:
+            token = "live-asr-token"
+
+            def __init__(self, owner):
+                captured["owner"] = owner
+
+            def set_on_lost(self, callback):
+                captured["callback"] = callback
+
+            def __enter__(self):
+                return self
+
+            def raise_if_lost(self):
+                return None
+
+            def __exit__(self, *_args):
+                return None
+
+        class Process:
+            pid = 1234
+            returncode = 0
+
+            def wait(self):
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+        def popen(command, **kwargs):
+            captured["command"] = command
+            captured["env"] = kwargs["env"]
+            return Process()
+
+        with patch("zh_asr.__main__.GpuBrokerLease", Lease), patch(
+            "zh_asr.__main__.subprocess.Popen",
+            side_effect=popen,
+        ):
+            returncode = _supervise_gpu_cli(["transcribe", "note.wav"])
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(captured["owner"], "chineseasr-cli")
+        self.assertEqual(
+            captured["env"][GPU_BROKER_CHILD_TOKEN_ENV],
+            "live-asr-token",
+        )
+        self.assertNotIn("ZH_ASR_GPU_BROKER_LEASE_HELD", captured["env"])
+        self.assertEqual(
+            captured["command"][:3],
+            [sys.executable, "-m", "zh_asr"],
+        )
+
+    def test_gpu_cli_supervisor_terminates_worker_immediately_on_lease_loss(self):
+        from zh_asr.__main__ import _supervise_gpu_cli
+        from zh_asr.gpu_broker import GpuBrokerLeaseLost
+
+        state = {}
+
+        class Lease:
+            token = "live-asr-token"
+
+            def __init__(self, _owner):
+                self.error = None
+                state["lease"] = self
+
+            def set_on_lost(self, callback):
+                self.callback = callback
+
+            def __enter__(self):
+                return self
+
+            def raise_if_lost(self):
+                if self.error is not None:
+                    raise self.error
+
+            def __exit__(self, *_args):
+                return None
+
+        class Process:
+            pid = 1234
+            returncode = None
+
+            def wait(self):
+                lease = state["lease"]
+                lease.error = GpuBrokerLeaseLost("lease expired")
+                lease.callback(lease.error)
+                self.returncode = -1
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+        terminated = []
+        with patch("zh_asr.__main__.GpuBrokerLease", Lease), patch(
+            "zh_asr.__main__.subprocess.Popen",
+            return_value=Process(),
+        ), patch(
+            "zh_asr.__main__.terminate_process_tree",
+            side_effect=lambda process: terminated.append(process.pid),
+        ):
+            with self.assertRaises(GpuBrokerLeaseLost):
+                _supervise_gpu_cli(["transcribe", "note.wav"])
+
+        self.assertEqual(terminated, [1234])
+
+    def test_gpu_cli_supervisor_terminates_worker_before_releasing_on_interrupt(self):
+        from zh_asr.__main__ import _supervise_gpu_cli
+
+        events = []
+
+        class Lease:
+            token = "live-asr-token"
+
+            def __init__(self, _owner):
+                pass
+
+            def set_on_lost(self, _callback):
+                pass
+
+            def __enter__(self):
+                events.append("lease_enter")
+                return self
+
+            def raise_if_lost(self):
+                return None
+
+            def __exit__(self, *_args):
+                events.append("lease_release")
+                return None
+
+        class Process:
+            pid = 1234
+
+            def wait(self):
+                events.append("wait")
+                raise KeyboardInterrupt()
+
+            def poll(self):
+                return None
+
+        with patch("zh_asr.__main__.GpuBrokerLease", Lease), patch(
+            "zh_asr.__main__.subprocess.Popen",
+            return_value=Process(),
+        ), patch(
+            "zh_asr.__main__.terminate_process_tree",
+            side_effect=lambda _process: events.append("terminate"),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                _supervise_gpu_cli(["transcribe", "note.wav"])
+
+        self.assertEqual(
+            events,
+            ["lease_enter", "wait", "terminate", "lease_release"],
+        )
+
     def run_cli(self, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        env = {"PYTHONPATH": PYTHONPATH}
+        env = os.environ.copy()
+        env.update(
+            {
+                "PYTHONPATH": PYTHONPATH,
+                "PYTHONUTF8": "1",
+            }
+        )
         if extra_env:
             env.update(extra_env)
         return subprocess.run(
@@ -33,19 +219,19 @@ class CliTests(unittest.TestCase):
         self.assertIn("Qwen ASR installed:", result.stdout)
 
     def test_transcribe_missing_audio_fails_clearly_before_model_load(self):
-        result = self.run_cli("transcribe", "missing.wav")
+        result = self.run_cli("transcribe", "missing.wav", "--device", "cpu")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Audio file not found", result.stderr)
 
     def test_strict_missing_audio_fails_clearly_before_model_load(self):
-        result = self.run_cli("strict", "missing.wav")
+        result = self.run_cli("strict", "missing.wav", "--device", "cpu")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Audio file not found", result.stderr)
 
     def test_long_missing_audio_fails_clearly_before_model_load(self):
-        result = self.run_cli("long", "missing.wav")
+        result = self.run_cli("long", "missing.wav", "--device", "cpu")
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("Audio file not found", result.stderr)
@@ -62,6 +248,8 @@ class CliTests(unittest.TestCase):
                 str(input_dir),
                 "--mode",
                 "quick",
+                "--device",
+                "cpu",
                 "--out-dir",
                 str(output_dir),
             )
@@ -73,7 +261,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("Total: 0", summary)
 
     def test_batch_missing_folder_fails_clearly_before_model_load(self):
-        result = self.run_cli("batch", "missing-folder")
+        result = self.run_cli("batch", "missing-folder", "--device", "cpu")
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("Input directory not found", result.stderr)
@@ -112,6 +300,8 @@ class CliTests(unittest.TestCase):
                 str(root / "missing-audio"),
                 "--truth-dir",
                 str(truth_dir),
+                "--device",
+                "cpu",
             )
 
         self.assertEqual(result.returncode, 2)
@@ -122,6 +312,8 @@ class CliTests(unittest.TestCase):
             "warmup",
             "--engine",
             "sensevoice",
+            "--device",
+            "cpu",
             extra_env={"ZH_ASR_TEST_FORCE_MISSING_FUNASR": "1"},
         )
 
@@ -133,6 +325,8 @@ class CliTests(unittest.TestCase):
             "warmup",
             "--engine",
             "qwen3-asr-1.7b",
+            "--device",
+            "cpu",
             extra_env={"ZH_ASR_TEST_FORCE_MISSING_QWEN_ASR": "1"},
         )
 
@@ -174,6 +368,8 @@ engines:
                 "custom-primary",
                 "--secondary-engine",
                 "custom-secondary",
+                "--device",
+                "cpu",
                 extra_env={"ZH_ASR_MODEL_CONFIG": str(config)},
             )
 

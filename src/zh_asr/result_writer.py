@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -16,6 +17,31 @@ class TranscriptSegment:
     end_ms: int | float | None = None
     speaker: Any = None
     raw_path: str = "$"
+
+
+def file_sha256(path: Path) -> str:
+    """Return the SHA-256 of the exact bytes persisted at *path*."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def text_sha256(text: str) -> str:
+    """Hash UTF-8 text using the bundle's canonical text encoding."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def canonical_json_sha256(value: Any) -> str:
+    """Hash a JSON-compatible value with deterministic key/order formatting."""
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def extract_text(result: Any) -> str:

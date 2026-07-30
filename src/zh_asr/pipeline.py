@@ -220,6 +220,10 @@ def _generate_many_for_strict(
         model = None
         try:
             model = build_model(engine, device=device, cache_dir=cache_dir, config=config)
+            runtime_identity = _model_runtime_identity(model)
+            if runtime_identity:
+                for index in valid_indices:
+                    provenance[index]["runtime_identity"] = runtime_identity
             generate_many = getattr(model, "generate_many", None)
             if callable(generate_many):
                 generated = generate_many([str(prepared[index]) for index in valid_indices])
@@ -280,12 +284,16 @@ def _generate_for_strict(
             derived_dir,
             config,
         )
-        return (
-            _generate_once(engine_audio, engine, device, cache_dir, config),
-            None,
-            time.perf_counter() - started,
-            provenance,
+        result, runtime_identity = _generate_once_with_identity(
+            engine_audio,
+            engine,
+            device,
+            cache_dir,
+            config,
         )
+        if runtime_identity:
+            provenance["runtime_identity"] = runtime_identity
+        return result, None, time.perf_counter() - started, provenance
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         return _engine_failure_result(engine, exc), error, time.perf_counter() - started, provenance
@@ -303,13 +311,38 @@ def _engine_failure_result(engine: str, exc: Exception) -> dict[str, Any]:
 
 
 def _generate_once(audio_path: Path, engine: str, device: str, cache_dir: Path | None, config: ModelConfig) -> Any:
+    result, _ = _generate_once_with_identity(
+        audio_path,
+        engine,
+        device,
+        cache_dir,
+        config,
+    )
+    return result
+
+
+def _generate_once_with_identity(
+    audio_path: Path,
+    engine: str,
+    device: str,
+    cache_dir: Path | None,
+    config: ModelConfig,
+) -> tuple[Any, dict[str, Any]]:
     model = build_model(engine, device=device, cache_dir=cache_dir, config=config)
     try:
-        return model.generate(input=str(audio_path), batch_size_s=300)
+        return (
+            model.generate(input=str(audio_path), batch_size_s=300),
+            _model_runtime_identity(model),
+        )
     finally:
         del model
         gc.collect()
         _empty_cuda_cache()
+
+
+def _model_runtime_identity(model: Any) -> dict[str, Any]:
+    identity = getattr(model, "runtime_identity", None)
+    return dict(identity) if isinstance(identity, dict) else {}
 
 
 def _prepare_engine_input(

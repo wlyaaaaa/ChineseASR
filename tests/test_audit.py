@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -251,6 +252,7 @@ class AuditTests(unittest.TestCase):
             audit = json.loads(audit_path.read_text(encoding="utf-8"))
             audit["engine_evidence"][0]["engine"] = "wrong-engine"
             audit_path.write_text(json.dumps(audit), encoding="utf-8")
+            _refresh_receipt(outputs, "audit_json")
             status, failures = validate_strict_artifact_bundle(
                 outputs,
                 expected_primary_engine="fireredasr2-llm",
@@ -260,55 +262,393 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(status, "unavailable")
         self.assertIn("identity", failures[0]["error"])
 
+    def test_verifier_detects_replaced_critical_artifact_by_sha256(self):
+        from zh_asr.audit import validate_strict_artifact_bundle
+        from zh_asr.strict_writer import STRICT_BUNDLE_ARTIFACT_KEYS
+
+        for artifact_key in STRICT_BUNDLE_ARTIFACT_KEYS:
+            with self.subTest(artifact_key=artifact_key):
+                with tempfile.TemporaryDirectory() as tmp:
+                    outputs = _write_strict_artifact_fixture(Path(tmp))
+                    artifact = Path(outputs[artifact_key])
+                    artifact.write_bytes(artifact.read_bytes() + b"\n")
+
+                    status, failures = validate_strict_artifact_bundle(
+                        outputs,
+                        expected_primary_engine="fireredasr2-llm",
+                        expected_secondary_engine="qwen3-asr-1.7b",
+                    )
+
+                self.assertEqual(status, "unavailable")
+                self.assertTrue(
+                    any(
+                        artifact_key in failure["error"]
+                        and "SHA-256" in failure["error"]
+                        for failure in failures
+                    ),
+                    failures,
+                )
+
+    def test_verifier_rejects_windows_rooted_or_drive_relative_receipt_paths(self):
+        from zh_asr.audit import validate_strict_artifact_bundle
+        from zh_asr.result_writer import canonical_json_sha256
+
+        for hostile_path in (
+            r"C:\outside\primary.raw.json",
+            r"\Users\outside\primary.raw.json",
+            r"C:outside\primary.raw.json",
+        ):
+            with self.subTest(hostile_path=hostile_path), tempfile.TemporaryDirectory() as tmp:
+                outputs = _write_strict_artifact_fixture(Path(tmp))
+                receipt_path = Path(outputs["receipt"])
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                receipt["artifacts"]["primary_json"]["path"] = hostile_path
+                receipt["bundle_sha256"] = canonical_json_sha256(
+                    {
+                        "schema_version": receipt["schema_version"],
+                        "artifacts": receipt["artifacts"],
+                        "claims": receipt["claims"],
+                    }
+                )
+                receipt_path.write_text(
+                    json.dumps(receipt, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+                status, failures = validate_strict_artifact_bundle(
+                    outputs,
+                    expected_primary_engine="fireredasr2-llm",
+                    expected_secondary_engine="qwen3-asr-1.7b",
+                )
+
+            self.assertEqual(status, "unavailable")
+            self.assertTrue(
+                any(
+                    "primary_json receipt path is not bundle-relative"
+                    in failure["error"]
+                    for failure in failures
+                ),
+                failures,
+            )
+
+    def test_verifier_rejects_bundle_symlink_escape(self):
+        from zh_asr.audit import validate_strict_artifact_bundle
+        from zh_asr.result_writer import canonical_json_sha256
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "bundle"
+            root.mkdir()
+            outputs = _write_strict_artifact_fixture(root)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            link = root / "escape"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"directory symlink unavailable: {exc}")
+
+            primary_path = Path(outputs["primary_json"])
+            outside_primary = outside / primary_path.name
+            primary_path.replace(outside_primary)
+            outputs["primary_json"] = str(outside_primary)
+
+            receipt_path = Path(outputs["receipt"])
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["artifacts"]["primary_json"]["path"] = (
+                f"escape/{outside_primary.name}"
+            )
+            receipt["bundle_sha256"] = canonical_json_sha256(
+                {
+                    "schema_version": receipt["schema_version"],
+                    "artifacts": receipt["artifacts"],
+                    "claims": receipt["claims"],
+                }
+            )
+            receipt_path.write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            status, failures = validate_strict_artifact_bundle(
+                outputs,
+                expected_primary_engine="fireredasr2-llm",
+                expected_secondary_engine="qwen3-asr-1.7b",
+            )
+
+        self.assertEqual(status, "unavailable")
+        self.assertTrue(
+            any(
+                "primary_json receipt path is not bundle-relative"
+                in failure["error"]
+                for failure in failures
+            ),
+            failures,
+        )
+
+    def test_verifier_accepts_service_aliases_and_discovers_sidecar_paths(self):
+        from zh_asr.audit import validate_strict_artifact_bundle
+
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = _write_strict_artifact_fixture(Path(tmp))
+            service_outputs = {
+                "final": outputs["final"],
+                "audit": outputs["audit"],
+                "audit_json": outputs["audit_json"],
+                "primary_raw_json": outputs["primary_json"],
+                "secondary_raw_json": outputs["secondary_json"],
+            }
+
+            status, failures = validate_strict_artifact_bundle(
+                service_outputs,
+                expected_primary_engine="fireredasr2-llm",
+                expected_secondary_engine="qwen3-asr-1.7b",
+            )
+
+        self.assertEqual(status, "verified")
+        self.assertEqual(failures, [])
+
+    def test_verifier_keeps_legacy_absolute_references_valid_at_original_location(self):
+        from zh_asr.audit import validate_strict_artifact_bundle
+
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = _write_strict_artifact_fixture(Path(tmp))
+            receipt_path = Path(outputs["receipt"]).resolve()
+            primary_path = Path(outputs["primary_json"]).resolve()
+            secondary_path = Path(outputs["secondary_json"]).resolve()
+
+            audit_json_path = Path(outputs["audit_json"])
+            audit = json.loads(audit_json_path.read_text(encoding="utf-8"))
+            audit["bundle_receipt_reference"] = str(receipt_path)
+            audit["engine_evidence"][0]["raw_result_reference"] = str(primary_path)
+            audit["engine_evidence"][1]["raw_result_reference"] = str(secondary_path)
+            audit_json_path.write_text(
+                json.dumps(audit, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            review_json_path = Path(outputs["review_json"])
+            review = json.loads(review_json_path.read_text(encoding="utf-8"))
+            review["bundle_receipt_reference"] = str(receipt_path)
+            review["engine_evidence"][0]["raw_result_reference"] = str(primary_path)
+            review["engine_evidence"][1]["raw_result_reference"] = str(secondary_path)
+            review_json_path.write_text(
+                json.dumps(review, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            final_path = Path(outputs["final"])
+            final_path.write_text(
+                final_path.read_text(encoding="utf-8").replace(
+                    Path(outputs["receipt"]).name,
+                    str(receipt_path),
+                ),
+                encoding="utf-8",
+            )
+            audit_path = Path(outputs["audit"])
+            audit_markdown = audit_path.read_text(encoding="utf-8")
+            for old, new in (
+                (Path(outputs["receipt"]).name, str(receipt_path)),
+                (Path(outputs["primary_json"]).name, str(primary_path)),
+                (Path(outputs["secondary_json"]).name, str(secondary_path)),
+            ):
+                audit_markdown = audit_markdown.replace(old, new)
+            audit_path.write_text(audit_markdown, encoding="utf-8")
+
+            for artifact_key in (
+                "final",
+                "audit",
+                "audit_json",
+                "review_json",
+            ):
+                _refresh_receipt(outputs, artifact_key)
+
+            status, failures = validate_strict_artifact_bundle(
+                outputs,
+                expected_primary_engine="fireredasr2-llm",
+                expected_secondary_engine="qwen3-asr-1.7b",
+            )
+
+        self.assertEqual(status, "verified")
+        self.assertEqual(failures, [])
+
+    def test_verifier_detects_raw_text_disagreeing_with_audit_engine_evidence(self):
+        from zh_asr.audit import validate_strict_artifact_bundle
+
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = _write_strict_artifact_fixture(Path(tmp))
+            primary_path = Path(outputs["primary_json"])
+            primary = json.loads(primary_path.read_text(encoding="utf-8"))
+            primary["text"] = "已经替换的原始文本。"
+            primary_path.write_text(
+                json.dumps(primary, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            _refresh_receipt(outputs, "primary_json", refresh_raw_claim=True)
+
+            status, failures = validate_strict_artifact_bundle(
+                outputs,
+                expected_primary_engine="fireredasr2-llm",
+                expected_secondary_engine="qwen3-asr-1.7b",
+            )
+
+        self.assertEqual(status, "unavailable")
+        self.assertTrue(
+            any(
+                "lexical_primary raw text does not match strict audit engine_evidence text"
+                in failure["error"]
+                for failure in failures
+            ),
+            failures,
+        )
+
+    def test_verifier_detects_final_text_and_status_disagreeing_with_audit(self):
+        from zh_asr.audit import validate_strict_artifact_bundle
+
+        for field, old, new, expected_error in (
+            (
+                "text",
+                "可以去一楼换票。",
+                "已经替换的最终文本。",
+                "final transcript text does not match strict audit final_text",
+            ),
+            (
+                "status",
+                "Status: `consistent`",
+                "Status: `conflict`",
+                "final transcript status does not match strict audit status",
+            ),
+        ):
+            with self.subTest(field=field):
+                with tempfile.TemporaryDirectory() as tmp:
+                    outputs = _write_strict_artifact_fixture(Path(tmp))
+                    final_path = Path(outputs["final"])
+                    final_path.write_text(
+                        final_path.read_text(encoding="utf-8").replace(old, new, 1),
+                        encoding="utf-8",
+                    )
+                    _refresh_receipt(
+                        outputs,
+                        "final",
+                        final_text=new if field == "text" else None,
+                    )
+
+                    status, failures = validate_strict_artifact_bundle(
+                        outputs,
+                        expected_primary_engine="fireredasr2-llm",
+                        expected_secondary_engine="qwen3-asr-1.7b",
+                    )
+
+                self.assertEqual(status, "unavailable")
+                self.assertTrue(
+                    any(expected_error in failure["error"] for failure in failures),
+                    failures,
+                )
+
+    def test_verifier_detects_audit_markdown_and_review_disagreeing_with_audit_json(self):
+        from zh_asr.audit import validate_strict_artifact_bundle
+
+        for artifact_key, old, new, expected_error in (
+            (
+                "audit",
+                "Status: `consistent`",
+                "Status: `conflict`",
+                "audit Markdown status does not match strict audit JSON status",
+            ),
+            (
+                "review_json",
+                '"status": "consistent"',
+                '"status": "conflict"',
+                "review JSON status does not match strict audit JSON status",
+            ),
+        ):
+            with self.subTest(artifact_key=artifact_key):
+                with tempfile.TemporaryDirectory() as tmp:
+                    outputs = _write_strict_artifact_fixture(Path(tmp))
+                    path = Path(outputs[artifact_key])
+                    path.write_text(
+                        path.read_text(encoding="utf-8").replace(old, new, 1),
+                        encoding="utf-8",
+                    )
+                    _refresh_receipt(outputs, artifact_key)
+
+                    status, failures = validate_strict_artifact_bundle(
+                        outputs,
+                        expected_primary_engine="fireredasr2-llm",
+                        expected_secondary_engine="qwen3-asr-1.7b",
+                    )
+
+                self.assertEqual(status, "unavailable")
+                self.assertTrue(
+                    any(expected_error in failure["error"] for failure in failures),
+                    failures,
+                )
+
 
 def _write_strict_artifact_fixture(root: Path) -> dict[str, str]:
-    final = root / "call.strict.md"
-    audit_md = root / "call.strict.audit.md"
-    audit_json = root / "call.strict.audit.json"
-    primary_json = root / "call.fireredasr2-llm.raw.json"
-    secondary_json = root / "call.qwen3-asr-1.7b.raw.json"
-    final.write_text("# Final", encoding="utf-8")
-    audit_md.write_text("# Audit", encoding="utf-8")
-    primary_json.write_text(
-        json.dumps({"engine": "fireredasr2-llm", "text": "可以去一楼换票。", "error": None}),
-        encoding="utf-8",
+    from zh_asr.strict_writer import write_strict_bundle
+
+    audio = root / "call.wav"
+    audio.write_bytes(b"fake wav")
+    paths = write_strict_bundle(
+        audio_path=audio,
+        primary_engine="fireredasr2-llm",
+        primary_result={
+            "engine": "fireredasr2-llm",
+            "text": "可以去一楼换票。",
+            "error": None,
+        },
+        secondary_engine="qwen3-asr-1.7b",
+        secondary_result={
+            "engine": "qwen3-asr-1.7b",
+            "text": "可以去一楼换票。",
+            "error": None,
+        },
+        out_dir=root,
     )
-    secondary_json.write_text(
-        json.dumps({"engine": "qwen3-asr-1.7b", "text": "可以去一楼换票。", "error": None}),
-        encoding="utf-8",
-    )
-    audit_json.write_text(
-        json.dumps(
-            {
-                "status": "consistent",
-                "evidence_status": "verified",
-                "engine_evidence": [
-                    {
-                        "engine": "fireredasr2-llm",
-                        "role": "lexical_primary",
-                        "execution_status": "succeeded",
-                        "error": None,
-                        "raw_result_reference": str(primary_json),
-                    },
-                    {
-                        "engine": "qwen3-asr-1.7b",
-                        "role": "lexical_verifier",
-                        "execution_status": "succeeded",
-                        "error": None,
-                        "raw_result_reference": str(secondary_json),
-                    },
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    return {
-        "final": str(final),
-        "audit": str(audit_md),
-        "audit_json": str(audit_json),
-        "primary_json": str(primary_json),
-        "secondary_json": str(secondary_json),
+    return {key: str(value) for key, value in paths.items()}
+
+
+def _refresh_receipt(
+    outputs: dict[str, str],
+    artifact_key: str,
+    *,
+    refresh_raw_claim: bool = False,
+    final_text: str | None = None,
+) -> None:
+    receipt_value = outputs.get("receipt")
+    if not receipt_value:
+        return
+    receipt_path = Path(receipt_value)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    artifact_path = Path(outputs[artifact_key])
+    digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    receipt["artifacts"][artifact_key]["sha256"] = digest
+    receipt["artifacts"][artifact_key]["size_bytes"] = artifact_path.stat().st_size
+    if refresh_raw_claim:
+        for claim in receipt["claims"]["engine_evidence"]:
+            if claim["raw_artifact"] == artifact_key:
+                claim["raw_sha256"] = digest
+    if final_text is not None:
+        receipt["claims"]["final_text_sha256"] = hashlib.sha256(
+            final_text.encode("utf-8")
+        ).hexdigest()
+    bundle_payload = {
+        "schema_version": receipt["schema_version"],
+        "artifacts": receipt["artifacts"],
+        "claims": receipt["claims"],
     }
+    receipt["bundle_sha256"] = hashlib.sha256(
+        json.dumps(
+            bundle_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt_path.write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

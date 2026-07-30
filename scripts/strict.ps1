@@ -22,17 +22,19 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
 }
 
 $Args = @(
-  '-m', 'zh_asr',
-  'strict', $Audio,
-  '--device', $Device,
-  '--out-dir', $OutDir,
-  '--cache-dir', (Join-Path $Root 'models\modelscope')
+  '-Audio', $Audio,
+  '-Mode', 'strict',
+  '-Device', $Device,
+  '-OutRoot', $OutDir,
+  '-CacheDir', (Join-Path $Root 'models\modelscope'),
+  '-WaitSec', '21600',
+  '-StartupTimeoutSec', '120'
 )
 if (-not [string]::IsNullOrWhiteSpace($PrimaryEngine)) {
-  $Args += @('--primary-engine', $PrimaryEngine)
+  $Args += @('-PrimaryEngine', $PrimaryEngine)
 }
 if (-not [string]::IsNullOrWhiteSpace($SecondaryEngine)) {
-  $Args += @('--secondary-engine', $SecondaryEngine)
+  $Args += @('-SecondaryEngine', $SecondaryEngine)
 }
 
-& $Python @Args
+& (Join-Path $PSScriptRoot 'asr-smart.ps1') @Args

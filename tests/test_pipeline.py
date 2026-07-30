@@ -110,20 +110,54 @@ class PipelineTests(unittest.TestCase):
     def test_qwen_adapter_uses_local_modelscope_cache_path_when_available(self):
         from zh_asr.adapters.qwen_asr import qwen_from_pretrained_kwargs
         from zh_asr.config import EngineSpec
+        from zh_asr.qwen_identity import (
+            QWEN_MODEL_REVISION,
+            RequiredModelFile,
+            write_model_receipt,
+        )
+        import hashlib
 
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp)
-            (cache / "Qwen/Qwen3-ASR-1.7B").mkdir(parents=True)
+            model_dir = cache / "Qwen/Qwen3-ASR-1.7B"
+            model_dir.mkdir(parents=True)
+            payload = b"small qwen test artifact"
+            (model_dir / "model.bin").write_bytes(payload)
+            required_files = (
+                RequiredModelFile(
+                    path="model.bin",
+                    bytes=len(payload),
+                    sha256=hashlib.sha256(payload).hexdigest(),
+                ),
+            )
+            write_model_receipt(
+                model_dir,
+                repository="Qwen/Qwen3-ASR-1.7B",
+                revision=QWEN_MODEL_REVISION,
+                required_files=required_files,
+            )
             spec = EngineSpec(
                 name="qwen3-asr-1.7b",
                 adapter="qwen-asr",
                 role="primary",
                 model="Qwen/Qwen3-ASR-1.7B",
                 language="Chinese",
-                options={"dtype": "bfloat16", "max_new_tokens": 256, "max_inference_batch_size": 8},
+                options={
+                    "model_revision": QWEN_MODEL_REVISION,
+                    "runtime_distribution": "qwen-asr",
+                    "runtime_version": "0.0.6",
+                    "dtype": "bfloat16",
+                    "max_new_tokens": 256,
+                    "max_inference_batch_size": 8,
+                },
             )
 
-            kwargs = qwen_from_pretrained_kwargs(spec, "cuda:0", cache, {})
+            with patch(
+                "zh_asr.qwen_identity.QWEN_MODEL_FILES", required_files
+            ):
+                kwargs = qwen_from_pretrained_kwargs(
+                    spec, "cuda:0", cache, {}
+                )
 
         self.assertEqual(kwargs["model"], str(cache / "Qwen/Qwen3-ASR-1.7B"))
         self.assertEqual(kwargs["device_map"], "cuda:0")
@@ -133,6 +167,7 @@ class PipelineTests(unittest.TestCase):
     def test_qwen_adapter_requires_prefetched_local_cache(self):
         from zh_asr.adapters.qwen_asr import qwen_from_pretrained_kwargs
         from zh_asr.config import EngineSpec
+        from zh_asr.qwen_identity import QWEN_MODEL_REVISION
 
         with tempfile.TemporaryDirectory() as tmp:
             spec = EngineSpec(
@@ -141,10 +176,51 @@ class PipelineTests(unittest.TestCase):
                 role="primary",
                 model="Qwen/Qwen3-ASR-1.7B",
                 language="Chinese",
+                options={
+                    "model_revision": QWEN_MODEL_REVISION,
+                    "runtime_distribution": "qwen-asr",
+                    "runtime_version": "0.0.6",
+                },
             )
 
             with self.assertRaisesRegex(FileNotFoundError, "Qwen ASR model cache not found"):
                 qwen_from_pretrained_kwargs(spec, "cuda:0", Path(tmp), {})
+
+    def test_qwen_adapter_rejects_missing_receipt_before_model_load(self):
+        from zh_asr.adapters.qwen_asr import QwenASRAdapter
+        from zh_asr.config import get_engine_spec
+
+        class DummyQwenModel:
+            called = False
+
+            @classmethod
+            def from_pretrained(cls, *_args, **_kwargs):
+                cls.called = True
+                return cls()
+
+        fake_qwen = types.ModuleType("qwen_asr")
+        fake_qwen.Qwen3ASRModel = DummyQwenModel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            (cache / "Qwen/Qwen3-ASR-1.7B").mkdir(parents=True)
+            with (
+                patch.dict(sys.modules, {"qwen_asr": fake_qwen}),
+                patch(
+                    "zh_asr.adapters.qwen_asr.ensure_qwen_asr_available"
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "receipt is missing"
+                ):
+                    QwenASRAdapter().build_model(
+                        get_engine_spec("qwen3-asr-1.7b"),
+                        "cuda:0",
+                        cache,
+                        {},
+                    )
+
+        self.assertFalse(DummyQwenModel.called)
 
     def test_strict_transcribe_writes_audit_when_secondary_engine_fails(self):
         import json
@@ -158,9 +234,12 @@ class PipelineTests(unittest.TestCase):
             def fake_generate(audio_path, engine, device, cache_dir, config):
                 if engine == "sensevoice":
                     raise TypeError("'>' not supported between instances of 'float' and 'NoneType'")
-                return [{"text": "开放时间早上九点至下午五点。"}]
+                return [{"text": "开放时间早上九点至下午五点。"}], {}
 
-            with patch("zh_asr.pipeline._generate_once", side_effect=fake_generate):
+            with patch(
+                "zh_asr.pipeline._generate_once_with_identity",
+                side_effect=fake_generate,
+            ):
                 paths = strict_transcribe_audio(
                     audio,
                     primary_engine="qwen3-asr-1.7b",
@@ -249,8 +328,11 @@ class PipelineTests(unittest.TestCase):
             with (
                 patch("zh_asr.pipeline.prepare_pcm16_mono", return_value=prepared),
                 patch(
-                    "zh_asr.pipeline._generate_once",
-                    side_effect=lambda audio, engine, *_: [{"text": f"{engine}:{audio.name}"}],
+                    "zh_asr.pipeline._generate_once_with_identity",
+                    side_effect=lambda audio, engine, *_: (
+                        [{"text": f"{engine}:{audio.name}"}],
+                        {},
+                    ),
                 ),
                 patch("zh_asr.pipeline.write_strict_bundle") as writer,
             ):
@@ -274,6 +356,10 @@ class PipelineTests(unittest.TestCase):
         class PrimaryModel:
             def __init__(self):
                 self.calls = []
+                self.runtime_identity = {
+                    "model_revision": "pinned-revision",
+                    "model_receipt_status": "verified",
+                }
 
             def generate_many(self, inputs):
                 self.calls.append(list(inputs))
@@ -331,6 +417,12 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(primary.calls[0]), 2)
         self.assertEqual(len(secondary.calls), 2)
         self.assertEqual(writer.call_count, 2)
+        self.assertEqual(
+            "verified",
+            writer.call_args_list[0].kwargs["primary_provenance"][
+                "runtime_identity"
+            ]["model_receipt_status"],
+        )
         self.assertEqual(len(results), 2)
 
 

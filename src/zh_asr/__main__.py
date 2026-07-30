@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import importlib.util
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,10 +13,23 @@ from .benchmark import run_benchmark
 from .config import list_engine_names, list_transcription_engine_names, load_model_config
 from .eval_pack import generate_builtin_corpus, run_evaluation
 from .arbitration import load_arbitration_config, make_arbiter
+from .gpu_broker import (
+    GPU_BROKER_CHILD_TOKEN_ENV,
+    GpuBrokerError,
+    GpuBrokerLease,
+    verify_inherited_gpu_lease,
+)
 from .long_audio import run_long_transcription
 from .pipeline import MissingDependencyError, build_model, default_cache_dir, project_root, strict_transcribe_audio, transcribe_audio
+from .process_control import managed_popen_kwargs, terminate_process_tree
 from .proxy_guard import PROXY_ENV_NAMES, sanitize_current_process_env
 from .service import serve_api
+
+
+_GPU_LEASE_AUTHENTICATED = contextvars.ContextVar(
+    "zh_asr_gpu_lease_authenticated",
+    default=False,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -106,34 +121,65 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
+    if _command_requires_gpu_supervision(args):
+        try:
+            inherited_token = os.environ.pop(
+                GPU_BROKER_CHILD_TOKEN_ENV,
+                "",
+            )
+            if inherited_token:
+                verify_inherited_gpu_lease(inherited_token)
+                _GPU_LEASE_AUTHENTICATED.set(True)
+            else:
+                return _supervise_gpu_cli(
+                    list(sys.argv[1:] if argv is None else argv)
+                )
+        except Exception as exc:
+            print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+
     try:
         if args.command == "doctor":
             return _doctor(model_config)
         if args.command == "warmup":
-            build_model(args.engine, device=args.device, cache_dir=args.cache_dir, config=model_config)
+            _run_with_gpu_lease(
+                args.device,
+                lambda: build_model(
+                    args.engine,
+                    device=args.device,
+                    cache_dir=args.cache_dir,
+                    config=model_config,
+                ),
+            )
             print(f"Loaded engine: {args.engine}")
             return 0
         if args.command == "transcribe":
-            paths = transcribe_audio(
-                args.audio,
-                engine=args.engine,
-                device=args.device,
-                out_dir=args.out_dir,
-                cache_dir=args.cache_dir,
-                config=model_config,
+            paths = _run_with_gpu_lease(
+                args.device,
+                lambda: transcribe_audio(
+                    args.audio,
+                    engine=args.engine,
+                    device=args.device,
+                    out_dir=args.out_dir,
+                    cache_dir=args.cache_dir,
+                    config=model_config,
+                ),
             )
             print(f"Markdown: {paths['markdown']}")
             print(f"Raw JSON: {paths['json']}")
             return 0
         if args.command == "strict":
-            paths = strict_transcribe_audio(
-                args.audio,
-                primary_engine=args.primary_engine,
-                secondary_engine=args.secondary_engine,
-                device=args.device,
-                out_dir=args.out_dir,
-                cache_dir=args.cache_dir,
-                config=model_config,
+            paths = _run_with_gpu_lease(
+                args.device,
+                lambda: strict_transcribe_audio(
+                    args.audio,
+                    primary_engine=args.primary_engine,
+                    secondary_engine=args.secondary_engine,
+                    device=args.device,
+                    out_dir=args.out_dir,
+                    cache_dir=args.cache_dir,
+                    config=model_config,
+                ),
             )
             print(f"Final: {paths['final']}")
             print(f"Audit: {paths['audit']}")
@@ -143,17 +189,20 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "long":
             arbiter = make_arbiter(load_arbitration_config(model_config.path))
-            summary = run_long_transcription(
-                args.audio,
-                args.out_dir,
-                chunk_sec=args.chunk_sec,
-                overlap_sec=args.overlap_sec,
-                primary_engine=args.primary_engine,
-                secondary_engine=args.secondary_engine,
-                device=args.device,
-                cache_dir=args.cache_dir,
-                force=args.force,
-                arbiter=arbiter,
+            summary = _run_with_gpu_lease(
+                args.device,
+                lambda: run_long_transcription(
+                    args.audio,
+                    args.out_dir,
+                    chunk_sec=args.chunk_sec,
+                    overlap_sec=args.overlap_sec,
+                    primary_engine=args.primary_engine,
+                    secondary_engine=args.secondary_engine,
+                    device=args.device,
+                    cache_dir=args.cache_dir,
+                    force=args.force,
+                    arbiter=arbiter,
+                ),
             )
             print(f"Transcript: {summary.transcript_path}")
             print(f"Audit: {summary.audit_path}")
@@ -167,17 +216,20 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1 if summary.failed else 0
         if args.command == "batch":
-            summary = run_batch(
-                input_dir=args.input_dir,
-                out_dir=args.out_dir,
-                mode=args.mode,
-                engine=args.engine,
-                primary_engine=args.primary_engine,
-                secondary_engine=args.secondary_engine,
-                device=args.device,
-                cache_dir=args.cache_dir,
-                config=model_config,
-                force=args.force,
+            summary = _run_with_gpu_lease(
+                args.device,
+                lambda: run_batch(
+                    input_dir=args.input_dir,
+                    out_dir=args.out_dir,
+                    mode=args.mode,
+                    engine=args.engine,
+                    primary_engine=args.primary_engine,
+                    secondary_engine=args.secondary_engine,
+                    device=args.device,
+                    cache_dir=args.cache_dir,
+                    config=model_config,
+                    force=args.force,
+                ),
             )
             print(f"Summary: {summary.out_dir / 'summary.md'}")
             print(
@@ -204,15 +256,18 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if not manifest_path.exists():
                 raise FileNotFoundError(f"Evaluation manifest not found: {manifest_path}")
-            eval_summary = run_evaluation(
-                corpus_dir=args.corpus_dir,
-                out_dir=args.out_dir,
-                device=args.device,
-                cache_dir=args.cache_dir,
-                force=args.force,
-                primary_engine=args.primary_engine,
-                secondary_engine=args.secondary_engine,
-                config=model_config,
+            eval_summary = _run_with_gpu_lease(
+                args.device,
+                lambda: run_evaluation(
+                    corpus_dir=args.corpus_dir,
+                    out_dir=args.out_dir,
+                    device=args.device,
+                    cache_dir=args.cache_dir,
+                    force=args.force,
+                    primary_engine=args.primary_engine,
+                    secondary_engine=args.secondary_engine,
+                    config=model_config,
+                ),
             )
             print(f"Metrics: {eval_summary.out_dir / 'metrics.json'}")
             print(f"Benchmark: {eval_summary.out_dir / 'benchmark.md'}")
@@ -226,16 +281,19 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1 if args.fail_on_findings and eval_summary.false_confident_count else 0
         if args.command == "benchmark":
-            benchmark_summary = run_benchmark(
-                audio_dir=args.audio_dir,
-                truth_dir=args.truth_dir,
-                out_dir=args.out_dir,
-                device=args.device,
-                cache_dir=args.cache_dir,
-                force=args.force,
-                primary_engine=args.primary_engine,
-                secondary_engine=args.secondary_engine,
-                config=model_config,
+            benchmark_summary = _run_with_gpu_lease(
+                args.device,
+                lambda: run_benchmark(
+                    audio_dir=args.audio_dir,
+                    truth_dir=args.truth_dir,
+                    out_dir=args.out_dir,
+                    device=args.device,
+                    cache_dir=args.cache_dir,
+                    force=args.force,
+                    primary_engine=args.primary_engine,
+                    secondary_engine=args.secondary_engine,
+                    config=model_config,
+                ),
             )
             print(f"Benchmark JSON: {benchmark_summary.out_dir / 'benchmark.json'}")
             print(f"Benchmark Markdown: {benchmark_summary.out_dir / 'benchmark.md'}")
@@ -265,6 +323,65 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     return 1
+
+
+def _run_with_gpu_lease(device: str, operation):
+    if not str(device).lower().startswith(("cuda", "gpu")):
+        return operation()
+    if not _GPU_LEASE_AUTHENTICATED.get():
+        raise GpuBrokerError(
+            "GPU operation is not running under an authenticated "
+            "LocalGpuBroker supervisor."
+        )
+    return operation()
+
+
+def _command_requires_gpu_supervision(args: argparse.Namespace) -> bool:
+    if args.command not in {
+        "warmup",
+        "transcribe",
+        "strict",
+        "long",
+        "batch",
+        "eval",
+        "benchmark",
+    }:
+        return False
+    if args.command == "eval" and args.generate_only:
+        return False
+    return str(getattr(args, "device", "")).lower().startswith(("cuda", "gpu"))
+
+
+def _supervise_gpu_cli(argv: list[str]) -> int:
+    """Run one public GPU CLI invocation in a killable supervised worker."""
+    process_holder: dict[str, subprocess.Popen] = {}
+
+    def terminate_on_loss(_error) -> None:
+        process = process_holder.get("process")
+        if process is not None:
+            terminate_process_tree(process)
+
+    lease = GpuBrokerLease("chineseasr-cli")
+    lease.set_on_lost(terminate_on_loss)
+    with lease:
+        env = os.environ.copy()
+        env.pop("ZH_ASR_GPU_BROKER_LEASE_HELD", None)
+        env[GPU_BROKER_CHILD_TOKEN_ENV] = lease.token
+        process = subprocess.Popen(
+            [sys.executable, "-m", "zh_asr", *argv],
+            cwd=project_root(),
+            env=env,
+            **managed_popen_kwargs(),
+        )
+        process_holder["process"] = process
+        try:
+            lease.raise_if_lost()
+            returncode = process.wait()
+            lease.raise_if_lost()
+            return int(returncode)
+        finally:
+            if process.poll() is None:
+                terminate_process_tree(process)
 
 
 def _doctor(model_config) -> int:

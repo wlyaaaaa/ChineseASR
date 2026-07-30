@@ -16,8 +16,9 @@
 
 1. `scripts\doctor.ps1` 能确认无代理、CUDA、模型配置和依赖状态。
 2. 单元测试全通过。
-3. `scripts\smoke-asr-smart.ps1 -Json` 能完成 strict smart job。
-4. 公开仓库只包含源码、脚本、配置、测试和文档，不包含模型权重、用户音频、生成转写或 wheelhouse 大文件。
+3. `scripts\smoke-asr-smart.ps1 -Json` 能完成默认 strict smart job；重要录音另用
+   `scripts\smoke-evidence-asr.ps1 -Audio <path> -Json` 验收 FireRed + Qwen 完整证据链。
+4. 公开仓库只包含源码、脚本、配置、测试和文档，不包含模型权重、用户音频、生成转写、模型收据或 wheelhouse 大文件。
 
 后续真实录音 benchmark、模型组合微调、Ollama 仲裁启用、VAD 边界切片优化都属于使用阶段校准，不是当前版本的关闭阻塞项。
 
@@ -71,8 +72,8 @@ cd <repo-root>
 # 长音频，自适应引擎上限切片 + 断点续跑
 .\scripts\asr-smart.ps1 -Audio C:\path\to\long.wav -Mode long-strict -WaitSec 15 -Json
 
-# 显式用 FireRedASR2-LLM 作为词汇主引擎；不会改变默认配置
-.\scripts\asr-smart.ps1 -Audio C:\path\to\long.mp3 -Mode long-strict -PrimaryEngine fireredasr2-llm -SecondaryEngine sensevoice -WaitSec 15 -Json
+# 重要录音的证据级组合；不会改变默认配置
+.\scripts\asr-smart.ps1 -Audio C:\path\to\long.mp3 -Mode long-strict -PrimaryEngine fireredasr2-llm -SecondaryEngine qwen3-asr-1.7b -WaitSec 15 -Json
 
 # 快速单模型，只在明确接受较少审计时使用
 .\scripts\asr-smart.ps1 -Audio C:\path\to\audio.wav -Mode quick -WaitSec 15 -Json
@@ -85,6 +86,12 @@ cd <repo-root>
 
 ```powershell
 .\scripts\smoke-asr-smart.ps1 -Json
+```
+
+重要录音的完整证据链验收：
+
+```powershell
+.\scripts\smoke-evidence-asr.ps1 -Audio C:\path\to\important.mp3 -Json
 ```
 
 ## 安装与模型下载
@@ -108,6 +115,12 @@ strict 主线需要 Qwen ASR runtime 和权重：
 .\scripts\setup-qwen.ps1
 .\scripts\download-models.ps1 -Engine qwen3-asr-1.7b
 ```
+
+Qwen runtime 固定为 `qwen-asr==0.0.6`，模型固定为 revision
+`a04930dbe5419bfee073f7cade734f572689a3a8`。下载脚本会生成并验证
+`MODEL_RECEIPT.json`，逐项绑定 13 个必要文件的规范路径、大小和 SHA-256；已有固定
+缓存可用 `-ReceiptOnly` 只生成/核验收据，不下载也不加载模型。runtime 版本、revision、
+收据或任一权重文件漂移时，adapter 会在模型 loader 运行前 fail-closed。
 
 可选的 FireRedASR2-LLM 使用独立 WSL runtime，安装顺序如下：
 
@@ -150,6 +163,8 @@ strict 模式会把最终稿和证据拆开：
 | `*.strict.md` | 给人看的最终转写正文，尽量保持干净 |
 | `*.strict.audit.md` | 模型文本、相似度、分歧、flags、候选文本和判断依据 |
 | `*.strict.audit.json` | 机器可读审计报告 |
+| `*.strict.review.json` | 面向机器和人工复核的结构化投影 |
+| `*.strict.receipt.json` | 绑定本次全部严格产物的路径、大小、SHA-256、语义声明与 bundle SHA |
 | `*.qwen3-asr-1.7b.raw.json` | 主模型原始输出 |
 | `*.sensevoice.raw.json` | 对照模型原始输出 |
 | `*.fireredasr2-llm.raw.json` | 显式选择 FireRed 主引擎时的原始输出 |
@@ -167,13 +182,13 @@ strict 模式会把最终稿和证据拆开：
 
 顶层 job 的 `succeeded` 只表示流程产出了结果；机器消费者必须同时读取 `evidence_status`：
 
-- `verified`：要求的双引擎链完整执行，但不表示转写逐字准确，仍需看 `status`、分歧和人工复核项；
+- `verified`：要求的双引擎链完整执行，且 final、audit、review、两路 raw 已通过收据哈希和语义交叉校验；不表示转写逐字准确，仍需看 `status`、分歧和人工复核项；
 - `provisional`：至少一路引擎失败，现有文本只是带失败证据的回退结果；
 - `unavailable`：证据链或必要产物不完整；
 - `pending`：仍在处理；
 - `not_applicable`：quick 单引擎任务不适用证据级双引擎状态。
 
-显式使用 FireRed 时，若 FireRed 失败而对照引擎成功，流程仍会生成带 `[疑似]` 的回退文本，但 job、长音频 manifest 和对应 chunk 都会标为 `provisional`，并列出 `evidence_failures`。状态判定会交叉验证 final、audit、audit JSON 和两路 raw JSON 均存在且可解析，并核对 audit 中的引擎身份、执行状态、错误与 raw 结果一致；声称 `verified` 但缺少或损坏必要产物时会降为 `unavailable`。证据级验收还必须确认每个 FireRed raw JSON 文本非空、`error=null`、运行时 dtype 正确，并且逐段审计不含 `engine_failure`；`verified` 不能替代对原始录音的人工核听。
+显式使用 FireRed 时，若 FireRed 失败而对照引擎成功，流程仍会生成带 `[疑似]` 的回退文本，但 job、长音频 manifest 和对应 chunk 都会标为 `provisional`，并列出 `evidence_failures`。状态判定会重新验证收据覆盖的六项内容产物，核对路径、字节数、SHA-256、两路 raw 独立性、引擎身份、文本、执行状态、错误以及 final/audit/review 对 audit JSON 的投影；未同步重建收据的替换、损坏、缺失或语义错配会使 `verified` 降为 `unavailable`。该收据是自包含的一致性清单，不是数字签名或可信时间戳，不能单独证明外部真实性。证据级验收还必须确认每个 FireRed raw JSON 文本非空、`error=null`、运行时 dtype 正确，并且逐段审计不含 `engine_failure`；原始录音始终是权威来源，`verified` 不能替代人工核听。
 
 ## 本地 API 与 Smart Wrapper
 
@@ -197,16 +212,24 @@ strict 模式会把最终稿和证据拆开：
 
 `asr-smart.ps1` 会在需要时启动本地 API，提交 job，并在 `WaitSec` 内等待结果。如果任务仍在运行，它会返回 job id 和下一步查询命令，而不是无限等待。
 
-为了避免和 Ollama、LocalOCR、LM Studio 或其他 Python 模型抢 GPU，服务会读取 `nvidia-smi --query-compute-apps`。发现外部 CUDA compute 进程时默认返回 `blocked`；只有显式使用 `-AllowGpuConflicts` 或 API 参数 `allow_gpu_conflicts=true` 才会继续排队。
+为了避免和受管 Ollama、LocalOCR 或其他 ChineseASR 任务抢 GPU，所有公开 CLI 和
+smart/API 路径都必须先取得 LocalGpuBroker 租约；Broker 不可用时任务失败关闭，不会
+退回到仅凭 `nvidia-smi` 判断后继续重型推理。
 
 默认端口是 `18666`，刻意避开 LocalOCR 的 `18665`。
 
-RTX 5090D 32GB 显存较大时，这个 GPU 排他锁仍然是保守默认值，不代表硬件不能并发。确认当前任务可以和 Ollama、LocalOCR 或其他 CUDA 进程共用显存时，再显式使用 `-AllowGpuConflicts` / `allow_gpu_conflicts=true`。
+RTX 5090D 32GB 显存较大时，这个 GPU 排他锁仍然是保守调度边界，不代表硬件不能并发。
+旧客户端的 `-AllowGpuConflicts` / `allow_gpu_conflicts=true` 仍可被解析，但只影响没有
+机器级 Broker 的嵌入式外部 CUDA 进程检测，不能绕过本机 LocalGpuBroker。正式 Broker
+只协调已接入它的 Ollama、LocalOCR 与 ChineseASR，不声称管理 LM Studio 等未接入进程。
 
-默认入口还会向 `http://127.0.0.1:32100/_gpu_broker/*` 申请全机 GPU 租约。Broker
+默认入口会向 `http://127.0.0.1:32100/_gpu_broker/*` 申请全机 GPU 租约。Broker
 会在 ASR 启动前卸载空闲 Ollama/LocalOCR，并在 ASR 运行期间阻止新的 Ollama 或 OCR
-重型推理。`-AllowGpuConflicts` 同时绕过旧进程检测和统一 Broker，只能在用户明确接受
-多模型并发时使用；Broker 不限制单个 ASR 任务本身的显存或内存占用。
+重型推理。服务子进程启动时必须携带 opaque lease token 并向 Broker 验证当前 live
+owner，父进程随后持续续租；裸环境标记不能证明已持有租约。直接 CLI 同样采用“持租约
+监督进程 → 可终止工作子进程”结构。
+租约续期一旦失败，运行中的完整子进程树会被立即终止；服务任务以
+`gpu_broker_lost` 失败，不能在失去排他性的情况下继续生成貌似成功的证据。
 
 ## 长音频与断点续跑
 
@@ -218,11 +241,13 @@ RTX 5090D 32GB 显存较大时，这个 GPU 排他锁仍然是保守默认值，
 
 `ChunkSec` 是请求值，不是无条件采用的固定值。实际 `effective_chunk_sec` 会取请求值与两路引擎能力上限中的最小值；选择 FireRed 时为 35 秒，并始终低于其 40 秒单输入硬上限。每个 chunk 都跑 strict 双引擎。
 
-MP3 等非标准输入先统一为 16 kHz、16-bit、mono PCM WAV。schema 2 的 `manifest.json` 记录源文件与派生文件 SHA-256、转换 provenance、模型配置 hash、请求/有效切片参数、已解析引擎和 chunk 状态。内容与运行参数共同形成 fingerprint：一致时可跳过已有成功输出，残留 `running` 会转为 `stale` 后重跑；内容或配置变化时不会误用旧结果。
+MP3 等非标准输入先统一为 16 kHz、16-bit、mono PCM WAV。schema 2 的 `manifest.json` 记录源文件与派生文件 SHA-256、转换 provenance、模型配置 hash、固定模型/runtime 收据、运行代码身份、请求/有效切片参数、已解析引擎和 chunk 状态。内容与运行身份共同形成 fingerprint。续跑时不会只相信 manifest 的缓存状态，而会重新验证每个 chunk 的收据和全部内容；一致时才跳过，残留 `running`、内容篡改或身份变化都会转为重跑。
 
 待处理 chunk 按两路引擎最小 `max_request_inputs` 分成有界批。FireRed 配置为每批最多 16 个输入；每个批次中，每个引擎只加载一次，再处理该批所有 chunk，避免逐片重复加载模型。
 
 strict audit v2 保留两路引擎的原始文本、raw JSON 引用、provenance、分歧和人工复核项。选择策略固定为保留主引擎证据：不做多数投票，也不做语义改写。
+新生成的 strict bundle 使用包内相对引用，并由 receipt 绑定六项内容产物；完整目录复制
+到归档盘后仍可复验。旧版绝对引用在原位置继续兼容，但不会伪装成可搬迁包。
 
 ## LLM 仲裁
 
@@ -368,7 +393,8 @@ strict 会跑两路模型并写审计文件，目标是低幻觉和可复核；q
 
 **为什么 smart 返回 `blocked`？**
 
-本机已有其他 CUDA compute 进程。默认行为是保护 GPU，不和 Ollama、LocalOCR、LM Studio 等抢资源。确认可以抢占时再加 `-AllowGpuConflicts`。
+LocalGpuBroker 不可用、已有其他受管重型任务，或无法取得全机租约。等待现有任务结束并
+检查 Broker 状态；`-AllowGpuConflicts` 不会绕过机器级 Broker。
 
 **为什么正文里有 `[疑似]` 或 `[听不清]`？**
 

@@ -18,9 +18,49 @@ from zh_asr.service import (
     create_handler,
     detect_gpu_processes,
 )
+from zh_asr.strict_writer import write_strict_bundle
 
 
 class ServiceTests(unittest.TestCase):
+    def test_stop_cancels_queued_and_running_jobs_and_terminates_active_process(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_audio = _write_audio(root / "first.wav")
+            second_audio = _write_audio(root / "second.wav")
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                autostart=False,
+            )
+            running, _ = service.submit(
+                JobRequest.from_payload(
+                    {"audio": str(first_audio), "mode": "quick"},
+                    root=root,
+                )
+            )
+            queued, _ = service.submit(
+                JobRequest.from_payload(
+                    {"audio": str(second_audio), "mode": "quick"},
+                    root=root,
+                )
+            )
+            running.status = "running"
+            process = SimpleNamespace()
+            service._processes[running.job_id] = process
+
+            terminated = []
+            with patch(
+                "zh_asr.service._terminate_job_process",
+                side_effect=lambda job, value: terminated.append(
+                    (job.job_id, value)
+                ),
+            ):
+                service.stop()
+
+        self.assertEqual(running.status, "canceled")
+        self.assertEqual(queued.status, "canceled")
+        self.assertEqual(terminated, [(running.job_id, process)])
+
     def test_submit_deduplicates_identical_queued_jobs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -36,7 +76,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(first.job_id, second.job_id)
             self.assertEqual("queued", first.status)
 
-    def test_submit_blocks_when_foreign_gpu_process_is_present(self):
+    def test_submit_defers_foreign_gpu_process_to_broker(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             audio = _write_audio(root / "sample.wav")
@@ -52,10 +92,8 @@ class ServiceTests(unittest.TestCase):
             job, deduped = service.submit(request)
 
             self.assertFalse(deduped)
-            self.assertEqual("blocked", job.status)
-            self.assertEqual("gpu_conflict", job.stage)
-            self.assertEqual(1, len(job.conflicts))
-            self.assertIn("other-cuda.exe", job.message)
+            self.assertEqual("queued", job.status)
+            self.assertEqual([], job.conflicts)
 
     def test_submit_defers_managed_ollama_conflict_to_broker(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -96,6 +134,43 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(deduped)
             self.assertEqual("queued", job.status)
             self.assertEqual([], job.conflicts)
+
+    def test_allow_gpu_conflicts_policy_is_part_of_request_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                process_runner=lambda _job: ProcessResult(returncode=0),
+                autostart=False,
+            )
+            strict_request = JobRequest.from_payload(
+                {
+                    "audio": str(audio),
+                    "mode": "strict",
+                    "allow_gpu_conflicts": False,
+                },
+                root=root,
+            )
+            permissive_request = JobRequest.from_payload(
+                {
+                    "audio": str(audio),
+                    "mode": "strict",
+                    "allow_gpu_conflicts": True,
+                },
+                root=root,
+            )
+
+            first, _ = service.submit(permissive_request)
+            second, deduped = service.submit(strict_request)
+
+        self.assertNotEqual(
+            permissive_request.fingerprint(),
+            strict_request.fingerprint(),
+        )
+        self.assertFalse(deduped)
+        self.assertNotEqual(first.job_id, second.job_id)
 
     def test_detect_gpu_processes_ignores_rows_without_numeric_memory(self):
         nvidia_smi_output = (
@@ -436,9 +511,15 @@ class ServiceTests(unittest.TestCase):
 
             def fake_runner(job):
                 job.out_dir.mkdir(parents=True, exist_ok=True)
+                outputs = _write_service_strict_artifacts(
+                    job,
+                    fail_primary=True,
+                )
                 (job.out_dir / "manifest.json").write_text(
                     json.dumps(
                         {
+                            "resolved_primary_engine": "fireredasr2-llm",
+                            "resolved_secondary_engine": "qwen3-asr-1.7b",
                             "evidence_status": "provisional",
                             "evidence_failures": [
                                 {
@@ -453,6 +534,11 @@ class ServiceTests(unittest.TestCase):
                                     "chunk_id": "chunk-000001",
                                     "status": "succeeded",
                                     "evidence_status": "provisional",
+                                    "outputs": {
+                                        key: str(value)
+                                        for key, value in outputs.items()
+                                        if isinstance(value, Path)
+                                    },
                                 }
                             ],
                         }
@@ -690,60 +776,31 @@ def _write_audio(path: Path) -> Path:
     return path
 
 
-def _write_service_strict_artifacts(job, *, fail_primary: bool = False) -> None:
+def _write_service_strict_artifacts(
+    job,
+    *,
+    fail_primary: bool = False,
+) -> dict[str, object]:
     primary = job.request.resolved_primary_engine or job.request.primary_engine
     secondary = job.request.resolved_secondary_engine or job.request.secondary_engine
-    job.out_dir.mkdir(parents=True, exist_ok=True)
-    final = job.out_dir / "sample.strict.md"
-    audit_md = job.out_dir / "sample.strict.audit.md"
-    audit_json = job.out_dir / "sample.strict.audit.json"
-    primary_raw = job.out_dir / f"sample.{primary}.raw.json"
-    secondary_raw = job.out_dir / f"sample.{secondary}.raw.json"
-    final.write_text("正文", encoding="utf-8")
-    audit_md.write_text("审计", encoding="utf-8")
     primary_error = "RuntimeError: worker exited 9" if fail_primary else None
-    primary_raw.write_text(
-        json.dumps(
-            {
-                "engine": primary,
-                "text": "" if fail_primary else "正文",
-                "error": (
-                    {"type": "RuntimeError", "message": "worker exited 9"}
-                    if fail_primary
-                    else None
-                ),
-            }
+    primary_result = {
+        "engine": primary,
+        "text": "" if fail_primary else "正文",
+        "error": (
+            {"type": "RuntimeError", "message": "worker exited 9"}
+            if fail_primary
+            else None
         ),
-        encoding="utf-8",
-    )
-    secondary_raw.write_text(
-        json.dumps({"engine": secondary, "text": "正文", "error": None}),
-        encoding="utf-8",
-    )
-    audit_json.write_text(
-        json.dumps(
-            {
-                "status": "engine_failure" if fail_primary else "consistent",
-                "evidence_status": "provisional" if fail_primary else "verified",
-                "engine_evidence": [
-                    {
-                        "engine": primary,
-                        "role": "lexical_primary",
-                        "execution_status": "failed" if fail_primary else "succeeded",
-                        "error": primary_error,
-                        "raw_result_reference": str(primary_raw),
-                    },
-                    {
-                        "engine": secondary,
-                        "role": "lexical_verifier",
-                        "execution_status": "succeeded",
-                        "error": None,
-                        "raw_result_reference": str(secondary_raw),
-                    },
-                ],
-            }
-        ),
-        encoding="utf-8",
+    }
+    return write_strict_bundle(
+        audio_path=job.request.audio,
+        primary_engine=primary,
+        primary_result=primary_result,
+        secondary_engine=secondary,
+        secondary_result={"engine": secondary, "text": "正文", "error": None},
+        out_dir=job.out_dir,
+        primary_error=primary_error,
     )
 
 

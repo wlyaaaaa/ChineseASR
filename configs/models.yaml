@@ -54,6 +54,9 @@ engines:
     model: Qwen/Qwen3-ASR-1.7B
     language: Chinese
     options:
+      model_revision: a04930dbe5419bfee073f7cade734f572689a3a8
+      runtime_distribution: qwen-asr
+      runtime_version: 0.0.6
       dtype: bfloat16
       max_inference_batch_size: 8
       max_new_tokens: 256

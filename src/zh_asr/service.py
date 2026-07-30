@@ -22,7 +22,12 @@ from typing import Callable, Iterable
 from urllib.parse import parse_qs, urlparse
 
 from .audit import validate_strict_artifact_bundle
-from .gpu_broker import GpuBrokerConflict, GpuBrokerLease
+from .gpu_broker import (
+    GPU_BROKER_CHILD_TOKEN_ENV,
+    GpuBrokerConflict,
+    GpuBrokerLease,
+    GpuBrokerLeaseLost,
+)
 from .process_control import (
     managed_popen_kwargs,
     tagged_process_env,
@@ -50,6 +55,7 @@ OBSERVER_STAGES = {
     "finished",
     "failed",
     "gpu_broker_conflict",
+    "gpu_broker_lost",
     "canceled",
 }
 
@@ -177,6 +183,7 @@ class JobRequest:
             "out_root": str(self.out_root),
             "chunk_sec": self.chunk_sec,
             "overlap_sec": self.overlap_sec,
+            "allow_gpu_conflicts": self.allow_gpu_conflicts,
         }
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
@@ -226,6 +233,8 @@ class Job:
     evidence_status: str = "pending"
     evidence_failures: list[dict[str, str]] = field(default_factory=list)
     conflicts: list[GpuProcess] = field(default_factory=list)
+    gpu_broker_token: str = field(default="", repr=False)
+    gpu_broker_loss_error: str = field(default="", repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -276,10 +285,13 @@ class TranscriptionService:
         self._process_runner = process_runner or self._run_subprocess
         if gpu_lease_factory is not None:
             self._gpu_lease_factory = gpu_lease_factory
+            self._gpu_broker_managed = True
         elif process_runner is None:
             self._gpu_lease_factory = lambda owner: GpuBrokerLease(owner)
+            self._gpu_broker_managed = True
         else:
             self._gpu_lease_factory = lambda _owner: nullcontext()
+            self._gpu_broker_managed = False
         self._jobs: dict[str, Job] = {}
         self._fingerprints: dict[str, str] = {}
         self._queue: queue.Queue[str] = queue.Queue()
@@ -299,6 +311,14 @@ class TranscriptionService:
 
     def stop(self) -> None:
         self._stop_event.set()
+        with self._lock:
+            unfinished_job_ids = [
+                job_id
+                for job_id, job in self._jobs.items()
+                if job.status not in TERMINAL_STATUSES
+            ]
+        for job_id in unfinished_job_ids:
+            self.cancel(job_id)
         if self._worker:
             self._worker.join(timeout=2)
 
@@ -314,7 +334,17 @@ class TranscriptionService:
                 if existing and existing.status in {"queued", "running", "succeeded"}:
                     return existing, True
 
-            conflicts = [] if request.allow_gpu_conflicts else self._foreign_gpu_processes()
+            broker_will_serialize = (
+                self._gpu_broker_managed
+                and request.device.lower().startswith(("cuda", "gpu"))
+            )
+            conflicts = (
+                []
+                if request.allow_gpu_conflicts
+                or broker_will_serialize
+                or not request.device.lower().startswith(("cuda", "gpu"))
+                else self._foreign_gpu_processes()
+            )
             job = self._new_job(request, conflicts=conflicts, fingerprint=fingerprint)
             self._jobs[job.job_id] = job
             self._fingerprints[fingerprint] = job.job_id
@@ -446,12 +476,25 @@ class TranscriptionService:
 
         try:
             use_gpu_broker = (
-                job.request.device.lower().startswith(("cuda", "gpu"))
-                and not job.request.allow_gpu_conflicts
+                self._gpu_broker_managed
+                and job.request.device.lower().startswith(("cuda", "gpu"))
             )
             lease = self._gpu_lease_factory("chineseasr") if use_gpu_broker else nullcontext()
+            job.gpu_broker_loss_error = ""
+            set_on_lost = getattr(lease, "set_on_lost", None)
+            if callable(set_on_lost):
+                set_on_lost(
+                    lambda error: self._terminate_job_after_lease_loss(job_id, error)
+                )
             with lease:
-                result = self._process_runner(job)
+                job.gpu_broker_token = str(getattr(lease, "token", "") or "")
+                try:
+                    result = self._process_runner(job)
+                    raise_if_lost = getattr(lease, "raise_if_lost", None)
+                    if callable(raise_if_lost):
+                        raise_if_lost()
+                finally:
+                    job.gpu_broker_token = ""
             with self._lock:
                 if job.status == "canceled":
                     return
@@ -489,6 +532,15 @@ class TranscriptionService:
                     job.message = str(exc)
                     job.finished_at = time.time()
                     job.updated_at = job.finished_at
+        except GpuBrokerLeaseLost as exc:
+            with self._lock:
+                if job.status != "canceled":
+                    job.status = "failed"
+                    _mark_job_evidence_unavailable(job, str(exc))
+                    job.stage = "gpu_broker_lost"
+                    job.message = str(exc)
+                    job.finished_at = time.time()
+                    job.updated_at = job.finished_at
         except Exception as exc:
             with self._lock:
                 if job.status != "canceled":
@@ -506,6 +558,22 @@ class TranscriptionService:
                 self._processes.pop(job_id, None)
                 if self._active_job_id == job_id:
                     self._active_job_id = None
+
+    def _terminate_job_after_lease_loss(
+        self,
+        job_id: str,
+        error: GpuBrokerLeaseLost,
+    ) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            process = self._processes.get(job_id)
+            if job is None or job.status == "canceled":
+                return
+            job.gpu_broker_loss_error = str(error)
+            job.message = str(error)
+            job.updated_at = time.time()
+        if process is not None:
+            _terminate_job_process(job, process)
 
     def _new_job(
         self,
@@ -597,6 +665,14 @@ class TranscriptionService:
     def _run_subprocess(self, job: Job) -> ProcessResult:
         job.out_dir.mkdir(parents=True, exist_ok=True)
         process_token = _process_token(job)
+        process_env = tagged_process_env(process_token)
+        if job.request.device.lower().startswith(("cuda", "gpu")):
+            if not job.gpu_broker_token:
+                raise RuntimeError(
+                    "GPU worker cannot start without an authenticated "
+                    "LocalGpuBroker lease token."
+                )
+            process_env[GPU_BROKER_CHILD_TOKEN_ENV] = job.gpu_broker_token
         process = subprocess.Popen(
             job.command,
             cwd=self.root,
@@ -605,7 +681,7 @@ class TranscriptionService:
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=tagged_process_env(process_token),
+            env=process_env,
             **managed_popen_kwargs(),
         )
         with self._lock:
@@ -613,6 +689,7 @@ class TranscriptionService:
             self._processes[job.job_id] = process
             job.updated_at = time.time()
             canceled = job.status == "canceled"
+            broker_loss_error = job.gpu_broker_loss_error
         if canceled:
             _terminate_job_process(job, process)
             stdout, stderr = _bounded_communicate_after_stop(process)
@@ -621,6 +698,10 @@ class TranscriptionService:
                 stdout=stdout,
                 stderr=stderr,
             )
+        if broker_loss_error:
+            _terminate_job_process(job, process)
+            _bounded_communicate_after_stop(process)
+            raise GpuBrokerLeaseLost(broker_loss_error)
 
         try:
             stdout, stderr = process.communicate(timeout=job.request.timeout_sec)
@@ -718,6 +799,8 @@ def _collect_outputs(
             "final": "*.strict.md",
             "audit": "*.strict.audit.md",
             "audit_json": "*.strict.audit.json",
+            "review_json": "*.strict.review.json",
+            "receipt": "*.strict.receipt.json",
         }
         for key, pattern in mapping.items():
             matches = sorted(out_dir.glob(pattern))
@@ -792,48 +875,81 @@ def _long_manifest_evidence(
                 }
             ],
         )
-    failures = _coerce_failure_list(manifest.get("evidence_failures"))
-    chunk_statuses = [
-        str(chunk.get("evidence_status") or "")
-        for chunk in chunks
-        if isinstance(chunk, dict)
-    ]
-    execution_statuses = [
-        str(chunk.get("status") or "")
-        for chunk in chunks
-        if isinstance(chunk, dict)
-    ]
-    if len(chunk_statuses) != len(chunks):
-        return "unavailable", failures or [
+    if not all(isinstance(chunk, dict) for chunk in chunks):
+        return "unavailable", [
             {
                 "kind": "artifact_failure",
                 "error": "long manifest contains a non-object chunk",
             }
         ]
-    if any(
-        evidence == "pending" or execution in {"pending", "running", "stale"}
-        for evidence, execution in zip(chunk_statuses, execution_statuses)
-    ):
+
+    primary_engine = str(manifest.get("resolved_primary_engine") or "")
+    secondary_engine = str(manifest.get("resolved_secondary_engine") or "")
+    fresh_statuses: list[str] = []
+    failures: list[dict[str, str]] = []
+    pending = False
+    for chunk in chunks:
+        execution = str(chunk.get("status") or "")
+        chunk_id = str(chunk.get("chunk_id") or "unknown")
+        if execution in {"pending", "running", "stale"}:
+            pending = True
+            fresh_statuses.append("pending")
+            continue
+        if execution != "succeeded":
+            fresh_statuses.append("unavailable")
+            failures.append(
+                {
+                    "kind": "chunk_failure",
+                    "chunk_id": chunk_id,
+                    "error": str(chunk.get("error") or "chunk did not succeed"),
+                }
+            )
+            continue
+
+        status, chunk_failures = validate_strict_artifact_bundle(
+            dict(chunk.get("outputs") or {}),
+            expected_primary_engine=primary_engine or None,
+            expected_secondary_engine=secondary_engine or None,
+        )
+        fresh_statuses.append(status)
+        for failure in chunk_failures:
+            failures.append({"chunk_id": chunk_id, **failure})
+        declared = str(chunk.get("evidence_status") or "")
+        if declared != status:
+            failures.append(
+                {
+                    "kind": "artifact_failure",
+                    "chunk_id": chunk_id,
+                    "error": (
+                        "long manifest chunk evidence_status does not match "
+                        f"fresh bundle verification: declared={declared!r}, fresh={status!r}"
+                    ),
+                }
+            )
+
+    if pending:
         return "pending", failures
-    if any(
-        evidence == "unavailable" or execution != "succeeded"
-        for evidence, execution in zip(chunk_statuses, execution_statuses)
-    ):
+    if any(status == "unavailable" for status in fresh_statuses):
         return "unavailable", failures
-    if any(evidence == "provisional" for evidence in chunk_statuses):
-        return "provisional", failures
-    if all(evidence == "verified" for evidence in chunk_statuses):
-        return "verified", failures
-    return (
-        "unavailable",
-        failures
-        or [
+    fresh_aggregate = (
+        "provisional"
+        if any(status == "provisional" for status in fresh_statuses)
+        else "verified"
+    )
+    declared_aggregate = str(manifest.get("evidence_status") or "")
+    if declared_aggregate != fresh_aggregate:
+        failures.append(
             {
                 "kind": "artifact_failure",
-                "error": "long manifest has unrecognized chunk evidence_status",
+                "error": (
+                    "long manifest aggregate evidence_status does not match "
+                    f"fresh bundle verification: declared={declared_aggregate!r}, "
+                    f"fresh={fresh_aggregate!r}"
+                ),
             }
-        ],
-    )
+        )
+        return "unavailable", failures
+    return fresh_aggregate, failures
 
 
 def _load_evidence_json(

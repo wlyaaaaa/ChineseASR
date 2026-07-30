@@ -1,1 +1,1 @@
-qwen-asr>=0.0.6
+qwen-asr==0.0.6

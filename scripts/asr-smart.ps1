@@ -102,6 +102,10 @@ if (-not (Test-AsrApi)) {
   Start-AsrApi
 }
 
+if ($AllowGpuConflicts) {
+  Write-Warning 'AllowGpuConflicts is a legacy compatibility option and does not bypass LocalGpuBroker.'
+}
+
 $Payload = [ordered]@{
   audio = $AudioPath
   mode = $Mode

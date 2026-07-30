@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -87,6 +88,18 @@ class ResultWriterTests(unittest.TestCase):
         result = [{"text": "顶层原始转写。", "sentence_info": []}]
 
         self.assertEqual(extract_text(result), "顶层原始转写。")
+
+    def test_file_sha256_hashes_exact_persisted_bytes(self):
+        from zh_asr.result_writer import file_sha256
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "artifact.json"
+            payload = '{"text":"原始证据"}\r\n'.encode("utf-8")
+            path.write_bytes(payload)
+
+            digest = file_sha256(path)
+
+        self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
 
 
 if __name__ == "__main__":

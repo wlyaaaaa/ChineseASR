@@ -8,9 +8,65 @@ from unittest.mock import patch
 
 from zh_asr.audio_frontend import PreparedAudio
 from zh_asr.long_audio import plan_chunks, run_long_transcription
+from zh_asr.strict_writer import write_strict_bundle
 
 
 class LongAudioTests(unittest.TestCase):
+    def test_runtime_code_identity_changes_with_operational_source_bytes(self):
+        from zh_asr.long_audio import _runtime_code_identity
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src" / "zh_asr" / "worker.py"
+            runtime = root / "runtime" / "bridge.py"
+            source.parent.mkdir(parents=True)
+            runtime.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            runtime.write_text("RUNTIME = 1\n", encoding="utf-8")
+
+            first = _runtime_code_identity(root)
+            source.write_text("VALUE = 2\n", encoding="utf-8")
+            second = _runtime_code_identity(root)
+
+        self.assertEqual("zh_asr.runtime_code_identity.v1", first["schema"])
+        self.assertEqual(2, first["file_count"])
+        self.assertNotEqual(first["sha256"], second["sha256"])
+
+    def test_runtime_artifact_identity_uses_qwen_fail_closed_verifier(self):
+        from zh_asr.long_audio import _runtime_artifact_identity
+
+        spec = SimpleNamespace(
+            name="qwen3-asr-1.7b",
+            adapter="qwen-asr",
+            model="Qwen/Qwen3-ASR-1.7B",
+            options={},
+        )
+        config = SimpleNamespace(
+            path=Path("models.yaml"),
+            engines={"qwen3-asr-1.7b": spec},
+            model_aliases={},
+        )
+        expected = {
+            "engine": "qwen3-asr-1.7b",
+            "model_receipt_status": "verified",
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "zh_asr.qwen_identity.qwen_runtime_identity",
+                return_value=expected,
+            ) as verifier,
+        ):
+            cache = Path(tmp)
+            identities = _runtime_artifact_identity(
+                config,
+                ("qwen3-asr-1.7b",),
+                cache,
+            )
+
+        self.assertEqual([expected], identities)
+        verifier.assert_called_once_with(spec, cache, {})
+
     def test_plan_chunks_uses_duration_and_overlap(self):
         with tempfile.TemporaryDirectory() as tmp:
             audio = Path(tmp) / "long.wav"
@@ -117,7 +173,7 @@ class LongAudioTests(unittest.TestCase):
             all(chunk["evidence_status"] == "verified" for chunk in manifest["chunks"])
         )
         self.assertIn("文本 chunk-000001", transcript)
-        self.assertIn("证据 chunk-000002", audit)
+        self.assertIn("chunk-000002 Strict Audit", audit)
         self.assertTrue(metrics_exists)
 
     def test_run_long_transcription_default_batches_pending_chunks_and_preserves_resume_force(self):
@@ -391,6 +447,51 @@ class LongAudioTests(unittest.TestCase):
         self.assertEqual((1, 1, 0), (resumed.processed, resumed.skipped, resumed.failed))
         self.assertEqual("verified", resumed.evidence_status)
 
+    def test_long_resume_reprocesses_chunk_when_receipt_bound_text_is_tampered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "meeting.wav"
+            out_dir = root / "out"
+            _write_wav(audio, seconds=4)
+            calls: list[str] = []
+
+            def fake_strict(audio_path, **kwargs):
+                calls.append(audio_path.stem)
+                return _write_fake_outputs(
+                    audio_path,
+                    kwargs["out_dir"],
+                    f"文本 {audio_path.stem}",
+                    primary_engine=kwargs["primary_engine"],
+                    secondary_engine=kwargs["secondary_engine"],
+                )
+
+            run_long_transcription(
+                audio,
+                out_dir,
+                chunk_sec=2,
+                overlap_sec=0,
+                strict_fn=fake_strict,
+            )
+            manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+            final_path = Path(manifest["chunks"][0]["outputs"]["final"])
+            final_path.write_text(
+                final_path.read_text(encoding="utf-8") + "\n篡改文本\n",
+                encoding="utf-8",
+            )
+            calls.clear()
+
+            resumed = run_long_transcription(
+                audio,
+                out_dir,
+                chunk_sec=2,
+                overlap_sec=0,
+                strict_fn=fake_strict,
+            )
+
+        self.assertEqual(["chunk-000001"], calls)
+        self.assertEqual((1, 1, 0), (resumed.processed, resumed.skipped, resumed.failed))
+        self.assertEqual("verified", resumed.evidence_status)
+
     def test_run_long_transcription_arbitrates_only_flagged_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -399,32 +500,24 @@ class LongAudioTests(unittest.TestCase):
             _write_wav(audio, seconds=4)
 
             def fake_strict(audio_path, **kwargs):
-                flags = ["model_conflict"] if audio_path.stem == "chunk-000002" else []
-                similarity = 0.5 if flags else 1.0
-                outputs = _write_fake_outputs(
+                conflict = audio_path.stem == "chunk-000002"
+                return _write_fake_outputs(
                     audio_path,
                     kwargs["out_dir"],
                     f"文本 {audio_path.stem}",
                     primary_engine=kwargs["primary_engine"],
                     secondary_engine=kwargs["secondary_engine"],
+                    primary_text=(
+                        f"甲方明确表示不同意 {audio_path.stem}"
+                        if conflict
+                        else None
+                    ),
+                    secondary_text=(
+                        f"乙方完全没有相关表态 {audio_path.stem}"
+                        if conflict
+                        else None
+                    ),
                 )
-                audit_json_path = outputs["audit_json"]
-                audit_payload = json.loads(audit_json_path.read_text(encoding="utf-8"))
-                audit_payload.update(
-                    {
-                        "status": "conflict" if flags else "consistent",
-                        "primary_text": f"甲 {audio_path.stem}",
-                        "secondary_text": f"乙 {audio_path.stem}",
-                        "similarity": similarity,
-                        "flags": flags,
-                        "rule_hits": [],
-                    }
-                )
-                audit_json_path.write_text(
-                    json.dumps(audit_payload, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                return outputs
 
             arbiter = _FakeArbiter()
 
@@ -834,15 +927,9 @@ def _write_fake_outputs(
     primary_engine: str = "primary",
     secondary_engine: str = "secondary",
     engine_evidence: list[dict] | None = None,
+    primary_text: str | None = None,
+    secondary_text: str | None = None,
 ) -> dict[str, Path]:
-    chunk_dir.mkdir(parents=True, exist_ok=True)
-    final_path = chunk_dir / f"{audio_path.stem}.strict.md"
-    audit_path = chunk_dir / f"{audio_path.stem}.strict.audit.md"
-    audit_json_path = chunk_dir / f"{audio_path.stem}.strict.audit.json"
-    primary_json_path = chunk_dir / f"{audio_path.stem}.{primary_engine}.raw.json"
-    secondary_json_path = chunk_dir / f"{audio_path.stem}.{secondary_engine}.raw.json"
-    final_path.write_text(f"## Transcript\n\n{text}\n", encoding="utf-8")
-    audit_path.write_text(f"证据 {audio_path.stem}\n", encoding="utf-8")
     evidence = engine_evidence or [
         {
             "engine": primary_engine,
@@ -857,52 +944,38 @@ def _write_fake_outputs(
             "error": None,
         },
     ]
-    raw_paths = {
-        "lexical_primary": primary_json_path,
-        "lexical_verifier": secondary_json_path,
-    }
-    for item in evidence:
-        raw_path = raw_paths[item["role"]]
-        item["raw_result_reference"] = str(raw_path)
-        if item["execution_status"] == "failed":
-            error_type, _, message = str(item["error"]).partition(":")
-            raw = {
-                "engine": item["engine"],
-                "text": "",
-                "error": {
-                    "type": error_type.strip(),
-                    "message": message.strip(),
-                },
-            }
-        else:
-            raw = {"engine": item["engine"], "text": text, "error": None}
-        raw_path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
-    audit_json_path.write_text(
-        json.dumps(
-            {
-                "status": (
-                    "engine_failure"
-                    if any(item["execution_status"] == "failed" for item in evidence)
-                    else "consistent"
-                ),
-                "evidence_status": evidence_status,
-                "final_text": text,
-                "flags": [],
-                "rule_hits": [],
-                "similarity": 1.0,
-                "engine_evidence": evidence,
+    by_role = {item["role"]: item for item in evidence}
+    primary_item = by_role["lexical_primary"]
+    secondary_item = by_role["lexical_verifier"]
+
+    def result_for(item: dict, value: str) -> dict:
+        if item["execution_status"] != "failed":
+            return {"engine": item["engine"], "text": value, "error": None}
+        error_type, _, message = str(item["error"]).partition(":")
+        return {
+            "engine": item["engine"],
+            "text": "",
+            "error": {
+                "type": error_type.strip(),
+                "message": message.strip(),
             },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+        }
+
+    outputs = write_strict_bundle(
+        audio_path=audio_path,
+        primary_engine=primary_engine,
+        primary_result=result_for(primary_item, primary_text or text),
+        secondary_engine=secondary_engine,
+        secondary_result=result_for(secondary_item, secondary_text or text),
+        out_dir=chunk_dir,
+        primary_error=primary_item.get("error"),
+        secondary_error=secondary_item.get("error"),
     )
-    return {
-        "final": final_path,
-        "audit": audit_path,
-        "audit_json": audit_json_path,
-        "primary_json": primary_json_path,
-        "secondary_json": secondary_json_path,
-    }
+    if outputs["evidence_status"] != evidence_status:
+        raise AssertionError(
+            f"fixture expected {evidence_status}, got {outputs['evidence_status']}"
+        )
+    return outputs
 
 
 def _model_config(
