@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -130,18 +132,206 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("--overlap-sec", job.command)
             self.assertIn("2", job.command)
 
+    def test_long_retry_after_failure_or_cancel_reuses_stable_output_directory(self):
+        for terminal_status in ("failed", "canceled"):
+            with self.subTest(terminal_status=terminal_status), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                audio = _write_audio(root / "sample.wav")
+                service = TranscriptionService(
+                    root=root,
+                    gpu_process_detector=lambda: [],
+                    process_runner=lambda _job: ProcessResult(returncode=1, stderr="failed"),
+                    autostart=False,
+                )
+                request = JobRequest.from_payload(
+                    {"audio": str(audio), "mode": "long-strict"},
+                    root=root,
+                )
+
+                first, first_deduped = service.submit(request)
+                if terminal_status == "failed":
+                    service.run_next_job()
+                else:
+                    service.cancel(first.job_id)
+                retry, retry_deduped = service.submit(request)
+
+                self.assertFalse(first_deduped)
+                self.assertFalse(retry_deduped)
+                self.assertEqual(terminal_status, first.status)
+                self.assertNotEqual(first.job_id, retry.job_id)
+                self.assertEqual(first.out_dir, retry.out_dir)
+                self.assertIn(str(first.out_dir), first.command)
+                self.assertIn(str(retry.out_dir), retry.command)
+
+    def test_long_active_force_duplicate_is_deduplicated_to_avoid_output_collision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            service = TranscriptionService(root=root, gpu_process_detector=lambda: [], autostart=False)
+            request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "long-strict", "force": True},
+                root=root,
+            )
+
+            first, first_deduped = service.submit(request)
+            duplicate, duplicate_deduped = service.submit(request)
+
+        self.assertFalse(first_deduped)
+        self.assertTrue(duplicate_deduped)
+        self.assertEqual(first.job_id, duplicate.job_id)
+        self.assertEqual(first.out_dir, duplicate.out_dir)
+        self.assertIn("--force", first.command)
+
+    def test_long_request_freezes_resolved_default_engines_and_config_hash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            config_path = root / "models.yaml"
+            config_path.write_text("version one", encoding="utf-8")
+            config = _model_config(config_path, primary="primary-a", secondary="anchor")
+
+            with patch("zh_asr.config.load_model_config", return_value=config):
+                request = JobRequest.from_payload(
+                    {"audio": str(audio), "mode": "long-strict"},
+                    root=root,
+                )
+
+            service = TranscriptionService(root=root, gpu_process_detector=lambda: [], autostart=False)
+            job, _ = service.submit(request)
+
+        self.assertEqual("primary-a", request.resolved_primary_engine)
+        self.assertEqual("anchor", request.resolved_secondary_engine)
+        self.assertTrue(request.model_config_sha256)
+        self.assertIn("--primary-engine", job.command)
+        self.assertIn("primary-a", job.command)
+        self.assertIn("--secondary-engine", job.command)
+        self.assertIn("anchor", job.command)
+
+    def test_submit_does_not_deduplicate_when_resolved_default_engine_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            config_path = root / "models.yaml"
+            config_path.write_text("unchanged bytes", encoding="utf-8")
+            first_config = _model_config(config_path, primary="primary-a", secondary="anchor")
+            second_config = _model_config(config_path, primary="primary-b", secondary="anchor")
+
+            with patch(
+                "zh_asr.config.load_model_config",
+                side_effect=[first_config, second_config],
+            ):
+                first_request = JobRequest.from_payload(
+                    {"audio": str(audio), "mode": "long-strict"},
+                    root=root,
+                )
+                second_request = JobRequest.from_payload(
+                    {"audio": str(audio), "mode": "long-strict"},
+                    root=root,
+                )
+
+            service = TranscriptionService(root=root, gpu_process_detector=lambda: [], autostart=False)
+            first, first_deduped = service.submit(first_request)
+            second, second_deduped = service.submit(second_request)
+            fingerprints = (first_request.fingerprint(), second_request.fingerprint())
+
+        self.assertFalse(first_deduped)
+        self.assertFalse(second_deduped)
+        self.assertNotEqual(first.job_id, second.job_id)
+        self.assertNotEqual(*fingerprints)
+
+    def test_submit_does_not_deduplicate_when_model_config_bytes_change(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            config_path = root / "models.yaml"
+            config = _model_config(config_path, primary="primary-a", secondary="anchor")
+
+            config_path.write_text("version one", encoding="utf-8")
+            with patch("zh_asr.config.load_model_config", return_value=config):
+                first_request = JobRequest.from_payload(
+                    {"audio": str(audio), "mode": "long-strict"},
+                    root=root,
+                )
+
+            config_path.write_text("version two", encoding="utf-8")
+            with patch("zh_asr.config.load_model_config", return_value=config):
+                second_request = JobRequest.from_payload(
+                    {"audio": str(audio), "mode": "long-strict"},
+                    root=root,
+                )
+
+            service = TranscriptionService(root=root, gpu_process_detector=lambda: [], autostart=False)
+            first, first_deduped = service.submit(first_request)
+            second, second_deduped = service.submit(second_request)
+
+        self.assertFalse(first_deduped)
+        self.assertFalse(second_deduped)
+        self.assertNotEqual(first.job_id, second.job_id)
+        self.assertNotEqual(first_request.model_config_sha256, second_request.model_config_sha256)
+
+    def test_request_fingerprint_uses_audio_content_not_only_size_and_mtime(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            original_stat = audio.stat()
+            first_request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "long-strict"},
+                root=root,
+            )
+
+            audio.write_bytes(b"RIFX")
+            os.utime(audio, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            second_request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "long-strict"},
+                root=root,
+            )
+            fingerprints = (first_request.fingerprint(), second_request.fingerprint())
+
+        self.assertNotEqual(first_request.audio_sha256, second_request.audio_sha256)
+        self.assertNotEqual(*fingerprints)
+
+    def test_long_request_fingerprint_is_stable_when_only_audio_mtime_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            first_request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "long-strict"},
+                root=root,
+            )
+            original_stat = audio.stat()
+            os.utime(
+                audio,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000_000),
+            )
+            second_request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "long-strict"},
+                root=root,
+            )
+
+            first_service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                autostart=False,
+            )
+            second_service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                autostart=False,
+            )
+            first_job, _ = first_service.submit(first_request)
+            second_job, _ = second_service.submit(second_request)
+
+        self.assertEqual(first_request.audio_sha256, second_request.audio_sha256)
+        self.assertEqual(first_request.fingerprint(), second_request.fingerprint())
+        self.assertEqual(first_job.out_dir, second_job.out_dir)
+
     def test_run_next_job_marks_success_and_collects_outputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             audio = _write_audio(root / "sample.wav")
 
             def fake_runner(job):
-                job.out_dir.mkdir(parents=True, exist_ok=True)
-                (job.out_dir / "sample.strict.md").write_text("正文", encoding="utf-8")
-                (job.out_dir / "sample.strict.audit.md").write_text("审计", encoding="utf-8")
-                (job.out_dir / "sample.strict.audit.json").write_text("{}", encoding="utf-8")
-                (job.out_dir / "sample.qwen3-asr-1.7b.raw.json").write_text("{}", encoding="utf-8")
-                (job.out_dir / "sample.sensevoice.raw.json").write_text("{}", encoding="utf-8")
+                _write_service_strict_artifacts(job)
                 return ProcessResult(returncode=0, stdout="Final: sample.strict.md", stderr="")
 
             service = TranscriptionService(
@@ -158,6 +348,7 @@ class ServiceTests(unittest.TestCase):
 
             self.assertIsNotNone(refreshed)
             self.assertEqual("succeeded", refreshed.status)
+            self.assertEqual("verified", refreshed.evidence_status)
             self.assertIn("final", refreshed.outputs)
             self.assertIn("audit", refreshed.outputs)
             self.assertIn("audit_json", refreshed.outputs)
@@ -166,6 +357,281 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(refreshed.outputs["final"].endswith("sample.strict.md"))
             self.assertTrue(refreshed.outputs["primary_raw_json"].endswith("sample.qwen3-asr-1.7b.raw.json"))
             self.assertTrue(refreshed.outputs["secondary_raw_json"].endswith("sample.sensevoice.raw.json"))
+
+    def test_api_job_exposes_successful_firered_fallback_as_provisional(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+
+            def fake_runner(job):
+                _write_service_strict_artifacts(job, fail_primary=True)
+                return ProcessResult(returncode=0)
+
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                process_runner=fake_runner,
+                autostart=False,
+            )
+            request = JobRequest.from_payload(
+                {
+                    "audio": str(audio),
+                    "mode": "strict",
+                    "primary_engine": "fireredasr2-llm",
+                    "secondary_engine": "qwen3-asr-1.7b",
+                },
+                root=root,
+            )
+            job, _ = service.submit(request)
+            service.run_next_job()
+            payload = job.to_dict()
+
+        self.assertEqual(payload["status"], "succeeded")
+        self.assertEqual(payload["evidence_status"], "provisional")
+        self.assertEqual(
+            payload["evidence_failures"],
+            [
+                {
+                    "engine": "fireredasr2-llm",
+                    "role": "lexical_primary",
+                    "error": "RuntimeError: worker exited 9",
+                }
+            ],
+        )
+
+    def test_successful_strict_job_is_evidence_unavailable_when_raw_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+
+            def fake_runner(job):
+                _write_service_strict_artifacts(job)
+                primary = (
+                    job.request.resolved_primary_engine or job.request.primary_engine
+                )
+                (job.out_dir / f"sample.{primary}.raw.json").unlink()
+                return ProcessResult(returncode=0)
+
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                process_runner=fake_runner,
+                autostart=False,
+            )
+            request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "strict"},
+                root=root,
+            )
+            job, _ = service.submit(request)
+            service.run_next_job()
+
+        self.assertEqual(job.status, "succeeded")
+        self.assertEqual(job.evidence_status, "unavailable")
+        self.assertIn("primary raw JSON", job.evidence_failures[0]["error"])
+
+    def test_long_api_job_propagates_manifest_evidence_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+
+            def fake_runner(job):
+                job.out_dir.mkdir(parents=True, exist_ok=True)
+                (job.out_dir / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "evidence_status": "provisional",
+                            "evidence_failures": [
+                                {
+                                    "chunk_id": "chunk-000001",
+                                    "engine": "fireredasr2-llm",
+                                    "role": "lexical_primary",
+                                    "error": "RuntimeError: worker exited 9",
+                                }
+                            ],
+                            "chunks": [
+                                {
+                                    "chunk_id": "chunk-000001",
+                                    "status": "succeeded",
+                                    "evidence_status": "provisional",
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return ProcessResult(returncode=0)
+
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                process_runner=fake_runner,
+                autostart=False,
+            )
+            request = JobRequest.from_payload(
+                {
+                    "audio": str(audio),
+                    "mode": "long-strict",
+                    "primary_engine": "fireredasr2-llm",
+                    "secondary_engine": "qwen3-asr-1.7b",
+                },
+                root=root,
+            )
+            job, _ = service.submit(request)
+            service.run_next_job()
+
+        self.assertEqual(job.status, "succeeded")
+        self.assertEqual(job.evidence_status, "provisional")
+        self.assertEqual(job.evidence_failures[0]["engine"], "fireredasr2-llm")
+
+    def test_run_subprocess_uses_finite_deadline_and_tagged_environment(self):
+        from zh_asr.service import ProcessExecutionTimeout
+
+        class HangingProcess:
+            pid = 4242
+            returncode = None
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd=["python"], timeout=timeout)
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            request = JobRequest(
+                audio=audio,
+                mode="strict",
+                engine=None,
+                primary_engine="qwen3-asr-1.7b",
+                secondary_engine="sensevoice",
+                device="cpu",
+                out_root=root / "outputs",
+                timeout_sec=0.1,
+            )
+            service = TranscriptionService(root=root, gpu_process_detector=lambda: [], autostart=False)
+            job = service._new_job(request, conflicts=[])
+            process = HangingProcess()
+
+            with (
+                patch("zh_asr.service.subprocess.Popen", return_value=process) as popen,
+                patch("zh_asr.service.terminate_process_tree") as terminate_tree,
+                patch("zh_asr.service.terminate_wsl_processes") as terminate_wsl,
+            ):
+                with self.assertRaisesRegex(ProcessExecutionTimeout, "0.1"):
+                    service._run_subprocess(job)
+
+            env = popen.call_args.kwargs["env"]
+            self.assertEqual(env["ZH_ASR_PROCESS_TOKEN"], f"chineseasr-{job.job_id}")
+            self.assertIn("ZH_ASR_PROCESS_TOKEN", env["WSLENV"].split(":"))
+            terminate_tree.assert_called_once_with(process)
+            terminate_wsl.assert_called_once_with((), f"chineseasr-{job.job_id}")
+
+    def test_cancel_running_job_terminates_tree_and_only_matching_wsl_token(self):
+        process = SimpleNamespace(pid=4343, poll=lambda: None)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            request = JobRequest.from_payload(
+                {
+                    "audio": str(audio),
+                    "mode": "strict",
+                    "primary_engine": "fireredasr2-llm",
+                    "secondary_engine": "sensevoice",
+                },
+                root=root,
+            )
+            service = TranscriptionService(root=root, gpu_process_detector=lambda: [], autostart=False)
+            job = service._new_job(request, conflicts=[])
+            job.status = "running"
+            service._jobs[job.job_id] = job
+            service._processes[job.job_id] = process
+            self.assertEqual(("Ubuntu",), request.wsl_distributions)
+
+            with (
+                patch("zh_asr.service.terminate_process_tree") as terminate_tree,
+                patch(
+                    "zh_asr.service._request_wsl_distributions",
+                    return_value=("Ubuntu",),
+                ),
+                patch("zh_asr.service.terminate_wsl_processes") as terminate_wsl,
+            ):
+                canceled = service.cancel(job.job_id)
+
+        self.assertEqual("canceled", canceled.status)
+        terminate_tree.assert_called_once_with(process)
+        terminate_wsl.assert_called_once_with(
+            ("Ubuntu",),
+            f"chineseasr-{job.job_id}",
+        )
+
+    def test_gpu_lease_is_released_when_process_runner_times_out(self):
+        events = []
+
+        class Lease:
+            def __enter__(self):
+                events.append("lease_enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append(("lease_exit", exc_type))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "strict"},
+                root=root,
+            )
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                process_runner=lambda _job: (_ for _ in ()).throw(TimeoutError("deadline")),
+                gpu_lease_factory=lambda _owner: Lease(),
+                autostart=False,
+            )
+            job, _ = service.submit(request)
+            service.run_next_job()
+
+        self.assertEqual("failed", job.status)
+        self.assertEqual(
+            ["lease_enter", ("lease_exit", TimeoutError)],
+            events,
+        )
+
+    def test_request_timeout_must_be_positive_and_finite(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            for invalid in (0, -1, float("inf"), "not-a-number"):
+                with self.subTest(invalid=invalid):
+                    with self.assertRaisesRegex(ValueError, "timeout_sec"):
+                        JobRequest.from_payload(
+                            {
+                                "audio": str(audio),
+                                "mode": "strict",
+                                "timeout_sec": invalid,
+                            },
+                            root=root,
+                        )
+
+            short = JobRequest.from_payload(
+                {
+                    "audio": str(audio),
+                    "mode": "long-strict",
+                    "timeout_sec": 30,
+                },
+                root=root,
+            )
+            extended = JobRequest.from_payload(
+                {
+                    "audio": str(audio),
+                    "mode": "long-strict",
+                    "timeout_sec": 300,
+                },
+                root=root,
+            )
+
+        self.assertEqual(short.fingerprint(), extended.fingerprint())
 
     def test_http_api_serves_health_submit_status_and_cancel(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -188,9 +654,11 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual("ok", health["status"])
             self.assertEqual("queued", submitted["job"]["status"])
+            self.assertEqual("pending", submitted["job"]["evidence_status"])
             self.assertFalse(submitted["deduplicated"])
             self.assertEqual(submitted["job"]["job_id"], status["job"]["job_id"])
             self.assertEqual("canceled", canceled["job"]["status"])
+            self.assertEqual("unavailable", canceled["job"]["evidence_status"])
 
     def test_http_api_uses_service_default_output_root_when_payload_omits_out_root(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -220,6 +688,73 @@ class ServiceTests(unittest.TestCase):
 def _write_audio(path: Path) -> Path:
     path.write_bytes(b"RIFF")
     return path
+
+
+def _write_service_strict_artifacts(job, *, fail_primary: bool = False) -> None:
+    primary = job.request.resolved_primary_engine or job.request.primary_engine
+    secondary = job.request.resolved_secondary_engine or job.request.secondary_engine
+    job.out_dir.mkdir(parents=True, exist_ok=True)
+    final = job.out_dir / "sample.strict.md"
+    audit_md = job.out_dir / "sample.strict.audit.md"
+    audit_json = job.out_dir / "sample.strict.audit.json"
+    primary_raw = job.out_dir / f"sample.{primary}.raw.json"
+    secondary_raw = job.out_dir / f"sample.{secondary}.raw.json"
+    final.write_text("正文", encoding="utf-8")
+    audit_md.write_text("审计", encoding="utf-8")
+    primary_error = "RuntimeError: worker exited 9" if fail_primary else None
+    primary_raw.write_text(
+        json.dumps(
+            {
+                "engine": primary,
+                "text": "" if fail_primary else "正文",
+                "error": (
+                    {"type": "RuntimeError", "message": "worker exited 9"}
+                    if fail_primary
+                    else None
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    secondary_raw.write_text(
+        json.dumps({"engine": secondary, "text": "正文", "error": None}),
+        encoding="utf-8",
+    )
+    audit_json.write_text(
+        json.dumps(
+            {
+                "status": "engine_failure" if fail_primary else "consistent",
+                "evidence_status": "provisional" if fail_primary else "verified",
+                "engine_evidence": [
+                    {
+                        "engine": primary,
+                        "role": "lexical_primary",
+                        "execution_status": "failed" if fail_primary else "succeeded",
+                        "error": primary_error,
+                        "raw_result_reference": str(primary_raw),
+                    },
+                    {
+                        "engine": secondary,
+                        "role": "lexical_verifier",
+                        "execution_status": "succeeded",
+                        "error": None,
+                        "raw_result_reference": str(secondary_raw),
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _model_config(path: Path, *, primary: str, secondary: str):
+    return SimpleNamespace(
+        path=path,
+        default_engine="sensevoice",
+        strict_primary_engine=primary,
+        strict_secondary_engine=secondary,
+        engines={},
+    )
 
 
 def _json_get(url: str) -> dict:

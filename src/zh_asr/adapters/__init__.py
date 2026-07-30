@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from .base import ModelAdapter
+from .firered_worker import FireRedWorkerAdapter
 from .funasr import FunASRAdapter
 from .qwen_asr import QwenASRAdapter
 
 
 ADAPTERS: dict[str, ModelAdapter] = {
+    "firered-worker": FireRedWorkerAdapter(),
     "funasr": FunASRAdapter(),
     "qwen-asr": QwenASRAdapter(),
 }

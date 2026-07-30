@@ -70,6 +70,20 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(spec.options["dtype"], "bfloat16")
         self.assertEqual(spec.options["max_new_tokens"], 256)
 
+    def test_firered_is_registered_as_optional_forensic_primary(self):
+        from zh_asr.config import get_engine_spec, load_model_config
+
+        config = load_model_config()
+        spec = get_engine_spec("fireredasr2-llm", config=config)
+
+        self.assertEqual(config.strict_primary_engine, "qwen3-asr-1.7b")
+        self.assertEqual(spec.adapter, "firered-worker")
+        self.assertEqual(spec.role, "lexical_primary")
+        self.assertEqual(spec.model, "FireRedTeam/FireRedASR2-LLM")
+        self.assertEqual(spec.options["max_audio_sec"], 40)
+        self.assertEqual(spec.options["recommended_chunk_sec"], 35)
+        self.assertEqual(spec.options["batch_size"], 1)
+
     def test_same_adapter_model_can_be_added_without_code_changes(self):
         from zh_asr.config import get_engine_spec, load_model_config
 

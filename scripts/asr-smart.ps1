@@ -150,6 +150,8 @@ while ((Get-Date) -lt $Deadline) {
 $FinalJob = $Status.job
 $Result = [ordered]@{
   status = $FinalJob.status
+  evidence_status = $FinalJob.evidence_status
+  evidence_failures = $FinalJob.evidence_failures
   job_id = $FinalJob.job_id
   out_dir = $FinalJob.out_dir
   outputs = $FinalJob.outputs
@@ -162,6 +164,7 @@ if ($Json) {
   $Result | ConvertTo-Json -Depth 8
 } else {
   Write-Host "Status: $($Result.status)"
+  Write-Host "Evidence: $($Result.evidence_status)"
   Write-Host "Job: $($Result.job_id)"
   Write-Host "Output: $($Result.out_dir)"
   if ($Result.outputs) {

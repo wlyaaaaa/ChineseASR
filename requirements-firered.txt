@@ -1,0 +1,17 @@
+# FireRedASR2S runtime dependencies for source commit
+# 4e7d9aaf4482a47cec1724807026b9b151926eb5.
+#
+# torch/torchaudio are intentionally installed separately by
+# scripts/setup-firered.ps1 from the CUDA 12.8 index so RTX 50-series GPUs use
+# the tested CUDA build. kaldi_native_fbank is an upstream runtime import that
+# is not declared in that commit's pyproject.toml; 1.22.3 is the first pinned
+# wheel in this environment that supports Python 3.12.
+transformers==5.1.0
+numpy==2.4.2
+cn2an==0.5.23
+kaldiio==2.18.1
+kaldi_native_fbank==1.22.3
+sentencepiece==0.2.1
+soundfile==0.13.1
+textgrid==1.6.1
+peft==0.18.0

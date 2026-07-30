@@ -22,6 +22,32 @@ aliases:
   cam++: iic/speech_campplus_sv_zh-cn_16k-common
 
 engines:
+  fireredasr2-llm:
+    adapter: firered-worker
+    role: lexical_primary
+    model: FireRedTeam/FireRedASR2-LLM
+    language: Chinese
+    options:
+      runtime: wsl
+      wsl_distribution: Ubuntu
+      python_path: /opt/chineseasr/firered/.venv/bin/python
+      source_dir: models/firered/FireRedASR2S
+      source_revision: 4e7d9aaf4482a47cec1724807026b9b151926eb5
+      model_dir: models/firered/FireRedASR2-LLM
+      model_revision: 2c5e0f415b9afb8f67cb8b00ea4c54959f70e824
+      use_half: true
+      batch_size: 1
+      max_request_inputs: 16
+      beam_size: 3
+      repetition_penalty: 3.0
+      llm_length_penalty: 1.0
+      temperature: 1.0
+      timeout_sec: 900
+      requires_pcm16_mono: true
+      max_audio_sec: 40
+      recommended_chunk_sec: 35
+    note: Optional evidence-grade lexical primary; promote only after local holdout validation.
+
   qwen3-asr-1.7b:
     adapter: qwen-asr
     role: primary

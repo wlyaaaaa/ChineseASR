@@ -21,6 +21,36 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("Qwen\\Qwen3-ASR-1.7B", script)
         self.assertIn("$LASTEXITCODE", script)
 
+    def test_download_models_prefetches_firered_without_windows_warmup(self):
+        script = (PROJECT_ROOT / "scripts" / "download-models.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("FireRedTeam/FireRedASR2-LLM", script)
+        self.assertIn("FireRedRevision", script)
+        self.assertIn("revision=os.environ['ZH_ASR_FIRERED_REVISION']", script)
+        self.assertIn("models\\firered\\FireRedASR2-LLM", script)
+        self.assertIn("MODEL_RECEIPT.json", script)
+        self.assertIn("Get-Sha256Hex", script)
+        self.assertIn("[System.Security.Cryptography.SHA256]::Create()", script)
+        self.assertIn("[System.IO.FileOptions]::SequentialScan", script)
+        self.assertIn("'Qwen2-7B-Instruct/model-00001-of-00004.safetensors'", script)
+        self.assertIn("Select-Object -Unique", script)
+        self.assertIn("ConvertTo-Json -Depth 5 -Compress", script)
+        self.assertIn("Move-Item -LiteralPath $ReceiptTempPath", script)
+        self.assertIn("if ($Engine -eq 'fireredasr2-llm')", script)
+        self.assertIn("exit 0", script)
+
+    def test_setup_firered_matches_registry_layout_and_pins_runtime(self):
+        script = (PROJECT_ROOT / "scripts" / "setup-firered.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("/opt/chineseasr/firered", script)
+        self.assertIn("models\\firered\\FireRedASR2S", script)
+        self.assertIn("4e7d9aaf4482a47cec1724807026b9b151926eb5", script)
+        self.assertIn("2.10.0+cu128", script)
+        self.assertIn('VENV_DIR="`$INSTALL_ROOT/.venv"', script)
+        self.assertIn("checkout --detach FETCH_HEAD", script)
+        self.assertIn('PYTHONPATH="`$SOURCE_DIR"', script)
+        self.assertNotIn("pip install --no-deps -e", script)
+
     def test_transcribe_folder_uses_no_proxy_batch_cli_and_force_flag(self):
         script = (PROJECT_ROOT / "scripts" / "transcribe-folder.ps1").read_text(encoding="utf-8")
 
@@ -120,6 +150,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("[int]$OverlapSec = 1", script)
         self.assertIn("chunk_sec", script)
         self.assertIn("overlap_sec", script)
+        self.assertIn("evidence_status = $FinalJob.evidence_status", script)
+        self.assertIn("evidence_failures = $FinalJob.evidence_failures", script)
         self.assertIn("next_status_command", script)
         self.assertIn("ConvertTo-Json", script)
         self.assertIn("'serve'", script)

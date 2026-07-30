@@ -2,18 +2,49 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 
+@dataclass(frozen=True)
+class TranscriptSegment:
+    index: int
+    text: str
+    start_ms: int | float | None = None
+    end_ms: int | float | None = None
+    speaker: Any = None
+    raw_path: str = "$"
+
+
 def extract_text(result: Any) -> str:
-    if isinstance(result, list):
-        return "\n".join(part for item in result for part in _extract_parts(item)).strip()
-    return "\n".join(_extract_parts(result)).strip()
+    return "\n".join(segment.text for segment in extract_segments(result)).strip()
 
 
-def write_transcript_bundle(audio_path: Path, result: object, out_dir: Path, engine: str) -> dict[str, Path]:
+def extract_segments(result: Any) -> tuple[TranscriptSegment, ...]:
+    """Extract verbatim transcript segments while retaining raw-result pointers."""
+    collected: list[TranscriptSegment] = []
+    _collect_segments(result, "$", collected)
+    return tuple(
+        TranscriptSegment(
+            index=index,
+            text=segment.text,
+            start_ms=segment.start_ms,
+            end_ms=segment.end_ms,
+            speaker=segment.speaker,
+            raw_path=segment.raw_path,
+        )
+        for index, segment in enumerate(collected)
+    )
+
+
+def write_transcript_bundle(
+    audio_path: Path,
+    result: object,
+    out_dir: Path,
+    engine: str,
+) -> dict[str, Path | str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = audio_path.stem
     json_path = out_dir / f"{stem}.{engine}.raw.json"
@@ -31,6 +62,7 @@ def write_transcript_bundle(audio_path: Path, result: object, out_dir: Path, eng
             "",
             f"- Audio: `{audio_path}`",
             f"- Engine: `{engine}`",
+            "- Evidence status: `not_applicable`",
             f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`",
             "",
             "## Transcript",
@@ -40,26 +72,111 @@ def write_transcript_bundle(audio_path: Path, result: object, out_dir: Path, eng
         ]
     )
     markdown_path.write_text(markdown, encoding="utf-8")
-    return {"json": json_path, "markdown": markdown_path}
+    return {
+        "json": json_path,
+        "markdown": markdown_path,
+        "evidence_status": "not_applicable",
+    }
 
 
-def _extract_parts(value: Any) -> list[str]:
+def _collect_segments(value: Any, raw_path: str, collected: list[TranscriptSegment]) -> None:
     if isinstance(value, str):
-        return [value]
+        text = _clean_text(value)
+        if text:
+            collected.append(TranscriptSegment(len(collected), text, raw_path=raw_path))
+        return
+
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _collect_segments(item, f"{raw_path}[{index}]", collected)
+        return
+
     if isinstance(value, dict):
         if isinstance(value.get("sentence_info"), list):
-            parts: list[str] = []
-            for segment in value["sentence_info"]:
-                if isinstance(segment, dict):
-                    text = segment.get("text") or segment.get("sentence")
-                    if text:
-                        parts.append(_clean_text(str(text)))
-            if parts:
-                return parts
+            count_before = len(collected)
+            _collect_segment_list(
+                value["sentence_info"],
+                f"{raw_path}.sentence_info",
+                collected,
+            )
+            if len(collected) > count_before:
+                return
+
+        if isinstance(value.get("segments"), list):
+            count_before = len(collected)
+            _collect_segment_list(value["segments"], f"{raw_path}.segments", collected)
+            if len(collected) > count_before:
+                return
+
         text = value.get("text") or value.get("sentence")
         if text:
-            return [_clean_text(str(text))]
-    return []
+            cleaned = _clean_text(str(text))
+            if cleaned:
+                start_ms, end_ms = _extract_times(value)
+                collected.append(
+                    TranscriptSegment(
+                        index=len(collected),
+                        text=cleaned,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                        speaker=_first_present(value, "spk", "speaker", "speaker_id"),
+                        raw_path=raw_path,
+                    )
+                )
+
+
+def _collect_segment_list(
+    segments: list[Any],
+    raw_path: str,
+    collected: list[TranscriptSegment],
+) -> None:
+    for index, segment in enumerate(segments):
+        segment_path = f"{raw_path}[{index}]"
+        if not isinstance(segment, dict):
+            _collect_segments(segment, segment_path, collected)
+            continue
+        text = segment.get("text") or segment.get("sentence")
+        if not text:
+            continue
+        cleaned = _clean_text(str(text))
+        if not cleaned:
+            continue
+        start_ms, end_ms = _extract_times(segment)
+        collected.append(
+            TranscriptSegment(
+                index=len(collected),
+                text=cleaned,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                speaker=_first_present(segment, "spk", "speaker", "speaker_id"),
+                raw_path=segment_path,
+            )
+        )
+
+
+def _extract_times(value: dict[str, Any]) -> tuple[int | float | None, int | float | None]:
+    start = _first_present(value, "start_ms", "start", "begin_ms", "begin")
+    end = _first_present(value, "end_ms", "end", "finish_ms", "finish")
+    timestamp = value.get("timestamp")
+    if isinstance(timestamp, (list, tuple)) and len(timestamp) >= 2:
+        start = start if start is not None else timestamp[0]
+        end = end if end is not None else timestamp[1]
+    return _number_or_none(start), _number_or_none(end)
+
+
+def _first_present(value: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in value and value[key] is not None:
+            return value[key]
+    return None
+
+
+def _number_or_none(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    return None
 
 
 def _clean_text(text: str) -> str:

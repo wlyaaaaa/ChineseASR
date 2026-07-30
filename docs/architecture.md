@@ -11,14 +11,26 @@
 1. `defaults.engine` 决定 quick 模式默认模型。
 2. `strict.primary_engine` / `strict.secondary_engine` 决定严格模式双模型组合。
 3. `aliases` 记录 VAD、标点、说话人等可复用模型别名。
-4. `engines.*.adapter` 决定运行时适配器；当前已实现 `funasr` 和 `qwen-asr`。
+4. `engines.*.adapter` 决定运行时适配器；当前已实现 `funasr`、`qwen-asr` 和 `firered-worker`。
 
 当前默认策略仍然是：
 
 1. `qwen3-asr-1.7b`：strict 准确率优先主线。基于 Qwen3-ASR 官方开源权重和 `qwen-asr` runtime。
 2. `sensevoice`：quick 默认和 strict 低幻觉锚点。组合 `iic/SenseVoiceSmall`、`fsmn-vad`、`ct-punc`、`cam++`。
-3. `paraformer`：中文保守备用线。适合普通话生产基线、时间戳、热词和回归对照。
-4. `whisper-large-v3`：只记录为 fallback/comparison，不自动作为主输出。
+3. `fireredasr2-llm`：可选的证据级词汇主引擎，仅在显式选择时进入 strict；安装或下载不会改变默认组合。
+4. `paraformer`：中文保守备用线。适合普通话生产基线、时间戳、热词和回归对照。
+5. `whisper-large-v3`：只记录为 fallback/comparison，不自动作为主输出。
+
+FireRed 通过 Windows adapter 调用隔离的 WSL worker。默认 WSL Python 为 `/opt/chineseasr/firered/.venv/bin/python`；源码和权重位于 Git 忽略的 `models/firered/FireRedASR2S` 与 `models/firered/FireRedASR2-LLM`。固定来源是：
+
+- FireRedASR2S commit：`4e7d9aaf4482a47cec1724807026b9b151926eb5`
+- FireRedASR2-LLM revision：`2c5e0f415b9afb8f67cb8b00ea4c54959f70e824`
+
+`scripts/setup-firered.ps1` 创建隔离环境并检出固定源码；`scripts/download-models.ps1 -Engine fireredasr2-llm` 下载固定模型 revision，并生成带 14 项必要文件大小及 SHA-256 的规范 `MODEL_RECEIPT.json`。运行时校验 receipt schema、仓库、revision、精确文件清单、路径边界、大小、SHA-256，以及源码 HEAD 和 tracked/untracked 干净工作树；任一不一致均 fail-closed。
+
+官方 checkpoint 内的 `args.use_fp16=0` 会使 Qwen2-7B 先按 FP32 装载，而运行参数 `use_half` 原本要等整个模型构造完成后才转 BF16。隔离 worker 在 `use_half=true` + CUDA 时，仅在官方 `from_pretrained` 调用窗口内将首次 LLM 装载 dtype 约束为 BF16（不支持时 FP16），并在成功或异常后恢复官方绑定。这不修改固定源码或模型 checkpoint，raw 结果记录实际 `llm_initial_load_dtype`。
+
+FireRed worker 在校验大权重及装载前读取 WSL `/proc/meminfo`，同时检查配置总量和启动当下可用量；Linux CUDA 环境无法读取完整内存信息时 fail-closed。半精度装载要求至少 28 GiB RAM、34 GiB RAM+swap，并要求 `MemAvailable` 至少 18 GiB、`MemAvailable+SwapFree` 至少 22 GiB；FP32 对应门槛为 40/48 GiB 与 36/44 GiB。错误会区分配置不足和当前占用过高，并给出 `.wslconfig`、关闭占用进程与 `wsl --shutdown` 提示，避免模型装载后才被内核 OOM 直接 SIGKILL。本机 64GB Windows 工作站已用 WSL 32GB RAM + 8GB swap 完成真实 CUDA 验收；这是一项本机运行事实，而不是跨硬件统一阈值承诺。
 
 ## 数据流
 
@@ -36,22 +48,34 @@ audio
   -> strict.md + strict.audit.md + strict.audit.json
 ```
 
-`strict.md` 是给人读的最终稿，正文尽量干净；当两个模型严重冲突、都为空、或出现常见幻觉套话时才写入 `[疑似]` / `[听不清]`。`strict.audit.md` 保存两模型原文、相似度、备选文本和判断依据。后续接入顶级 LLM 仲裁时，应只读取这个审计输入，不覆盖原始 ASR 证据。
+`strict.md` 是给人读的最终稿，正文尽量干净；当两个模型严重冲突、都为空、或出现常见幻觉套话时才写入 `[疑似]` / `[听不清]`。audit v2 保存两路 raw JSON 引用、逐引擎原文与 provenance、分歧、风险规则和人工复核项。选择策略是 `primary_preserving_no_majority_vote_no_semantic_rewrite`：不做多数投票，不把语义改写冒充声学证据。
 
 如果 strict 中某个引擎抛错，流程不会直接丢弃整次任务。成功的一路会继续进入最终猜测，正文标记 `[疑似]`，审计报告状态为 `engine_failure`，并在 raw JSON 中保留失败引擎、异常类型和错误摘要。如果两路都失败，则输出 `[听不清]` 并要求人工复核。
+
+任务执行状态和证据完整性状态相互独立。顶层 `succeeded` 只说明命令成功产出；`evidence_status` 在 strict audit、长音频 manifest/chunk 和 API job 上统一使用 `pending / verified / provisional / unavailable / not_applicable`。其中 `verified` 只表示要求的双引擎链完整执行，不保证文本逐字正确；有引擎失败但仍产出回退文本时必须是 `provisional`，必要产物缺失或任务失败时必须是 `unavailable`，quick 单引擎任务为 `not_applicable`。
+
+因此，显式选择 FireRed 的证据级验收不能只检查顶层 job 为 `succeeded`。还必须逐段确认 `evidence_status=verified`、FireRed raw 文本非空、`error=null`、初始装载 dtype 符合配置，且 strict audit 不含 `engine_failure`；否则只算有审计记录的对照引擎回退。即使状态为 `verified`，精确引用前仍要回听原始录音。
 
 长音频模式：
 
 ```text
 long audio
-  -> deterministic chunks + manifest.json
-  -> each chunk runs strict
+  -> MP3/other input -> 16 kHz, 16-bit, mono PCM WAV
+  -> capability-bounded chunks + schema 2 manifest.json
+  -> bounded batches; each engine loads once per batch
+  -> each chunk writes strict audit v2
   -> skip completed chunks on resume
   -> optional uncertain-only Ollama arbitration
   -> transcript.md + audit.md + metrics.json
 ```
 
-第一版长音频切片采用固定时长和 overlap，默认 `chunk_sec=300`、`overlap_sec=1`。`manifest.json` 记录音频 hash、模型配置 hash、chunk 参数和每个 chunk 的状态；同一输入重跑时，已成功且输出存在的 chunk 会跳过，残留 `running` 会视为 stale 并重跑。后续可以把 planner 替换成 VAD 静音边界切片，但 manifest/schema 不变。
+`chunk_sec` 是请求值。planner 使用两路引擎能力计算 `effective_chunk_sec`；选择 FireRed 时，单输入硬上限为 40 秒，推荐有效切片为 35 秒，因此不会沿用请求中的 300 秒作为实际切片。overlap 必须小于有效切片。
+
+前端通过 ffmpeg 把 MP3 等输入转换为 16 kHz、16-bit、mono PCM WAV，并保留源文件与派生文件 SHA-256、ffmpeg 版本和转换命令 provenance。schema 2 manifest 还记录模型配置 hash、请求/有效切片、已解析引擎、chunk 状态和 run fingerprint。只有内容 hash 与运行身份一致且输出仍存在时才 resume；残留 `running` 会标记为 `stale` 后重跑。
+
+待处理 chunk 按两路引擎中较小的 `max_request_inputs` 分批。FireRed 的上限是 16；每个批次先加载主引擎一次并处理整批，再加载对照引擎一次并处理整批。该边界控制内存与 IPC 规模，也避免逐 chunk 重复加载模型。
+
+请求 fingerprint 包含音频内容 hash、设备、规范化缓存目录、模型配置、固定源码/模型 revision 和 receipt SHA-256。相同长音频请求在失败或取消后复用稳定输出目录；schema 1 或身份变化均安全重跑。Windows 子进程树、带 job token 的 WSL worker、ffmpeg 和 LocalGpuBroker lease 都有明确的超时、取消和终态释放路径。
 
 LLM 仲裁默认关闭，配置在 `configs/models.yaml` 的 `llm_arbitration`。当前 provider 是本地 Ollama，默认模型 `qwen-main-v1:latest`，`keep_alive=0`。仲裁只读取 chunk audit 证据，不读取音频；只在 `flags`、`needs_review` 或低相似度 chunk 上触发。仲裁结果写入 merged audit / metrics，不覆盖原始 strict raw JSON。
 
@@ -68,7 +92,7 @@ scripts\asr-smart.ps1
   -> outputs\api\<job_id>\
 ```
 
-API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 18666` 提供，主要端点是 `/health`、`/jobs`、`/jobs/{job_id}`、`/jobs/transcribe` 和 `/jobs/{job_id}/cancel`。`/observer/jobs` 与 `/observer/jobs/{job_id}` 提供稳定的只读安全投影，只暴露调度元数据、可验证的 chunk 计数和终态 RTF，不暴露输入/输出路径、进程与命令信息、日志、转写正文或 Broker 细节。
+API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 18666` 提供，主要端点是 `/health`、`/jobs`、`/jobs/{job_id}`、`/jobs/transcribe` 和 `/jobs/{job_id}/cancel`。`/observer/jobs` 与 `/observer/jobs/{job_id}` 提供稳定的只读安全投影，只暴露调度元数据、可验证的 chunk 计数和终态 RTF，不暴露输入/输出路径、进程与命令信息、日志、转写正文、证据完整性状态或 Broker 细节；证据消费者必须改读 `/jobs*` 的 `evidence_status/evidence_failures`。
 
 服务层只负责调度，不在 HTTP 请求线程中加载模型。每个任务在独立 Python 子进程里运行现有 CLI，这样 API 可以快速返回、任务可以取消、模型显存也不会长期留在 API 进程里。
 
@@ -93,14 +117,14 @@ API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 18666` 提供，�
 .\scripts\strict.ps1 -Audio C:\path\to\audio.wav
 ```
 
-新增不同运行时，例如 Whisper 本地实现、其他 LLM 音频模型或云 API 时，应新增 adapter，并保持 pipeline 只依赖统一的 `build_model(...)` / `generate(...)` 形状。当前已有 `funasr` 和 `qwen-asr` 两个 adapter。
+新增不同运行时，例如 Whisper 本地实现、其他 LLM 音频模型或云 API 时，应新增 adapter，并保持 pipeline 只依赖统一的 `build_model(...)` / `generate(...)` 形状。当前已有 `funasr`、`qwen-asr` 和隔离 WSL 的 `firered-worker`。
 
 ## 已实现的审计闭环
 
 当前个人使用版已经闭合以下能力，作为已交付范围记录：
 
 - 输入与运行可追踪：`manifest.json` / `metrics.json` 记录音频 hash、truth hash、模型配置 hash、选中模型、命令、运行时和耗时。
-- 双模型审计：strict 输出 `strict.md`、`strict.audit.md`、`strict.audit.json` 和两路 raw JSON，最终稿与证据分离。
+- 双模型审计：strict audit v2 输出 `strict.md`、`strict.audit.md`、`strict.audit.json` 和两路 raw JSON，保留 provenance、分歧和人工复核项；不做多数投票或语义改写。
 - 幻觉规则库：静音出字、常见模板废话、异常重复、双模型大分歧、繁体残留、超长无标点都会进入 audit / metrics / review。
 - 评测与 benchmark：内置隐私友好的合成/对抗评测集；用户私有音频可通过同名 audio/truth 目录跑 `benchmark.md`、`benchmark.json`、`review.md`。
 - 人工复核队列：`review.md` 按 P0/P1/P2 排序，给出复核原因、建议动作、截断证据和源文件路径。
@@ -108,7 +132,7 @@ API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 18666` 提供，�
 
 LLM 仲裁刻意默认关闭。这是资源和可信度边界：默认转写链路必须在没有 Ollama、没有额外 GPU 驻留、没有顶级模型猜测的情况下稳定工作；需要最终猜测时再显式打开。
 
-固定时长长音频切片也不是当前关闭阻塞项。现有 manifest/schema 已支持断点续跑和未来替换 planner；后续如果真实长录音暴露边界切断问题，可以把 planner 升级为 VAD 静音边界切片，而不改变输出契约。
+长音频 planner 已按引擎能力限制实际切片，并以 schema 2 manifest 支持内容寻址的断点续跑。后续如升级为 VAD 静音边界切片，应继续保留请求值、有效值、provenance、内容 hash 和 resume 判定，不得退回无来源的固定 300 秒描述。
 
 个人使用版关闭标准：
 
@@ -117,12 +141,21 @@ LLM 仲裁刻意默认关闭。这是资源和可信度边界：默认转写链�
 3. `smoke-asr-smart.ps1 -Json` 能完成 strict smart job，并产出 final、audit、audit JSON 和两路 raw JSON。
 4. 公开仓库只包含源码、脚本、配置、测试和文档，不包含模型权重、用户音频、输出转写或 wheelhouse 大文件。
 
-真实私人录音 benchmark 属于后续校准，不是公开项目或本地工具链的关闭阻塞项。
+本机已用一段超过 40 秒的真实中文电话录音完成 FireRed + Qwen 四切片验收：API、manifest 和四个 chunk 均为 `evidence_status=verified`，四个 FireRed raw 均为非空、无错误、初始装载为 BF16，逐段审计无 `engine_failure`；同一请求随后断点复用为 0 个处理、4 个跳过。默认 Qwen + SenseVoice strict smoke 另行通过，说明可选 FireRed 安装未改变默认组合。私人音频、转写正文和收据保留在 Git 忽略的本地归档，不进入公开仓库。
 
 ## 下载策略
 
-脚本层和 Python 层都会清空代理变量。模型默认走 ModelScope ID，并缓存到项目根目录下的 `models\modelscope`。
+常规模型下载会清空代理变量，模型默认走 ModelScope ID，并缓存到项目根目录下的 `models\modelscope`。FireRed runtime setup 同样清理代理环境，但 Hugging Face 权重下载保留调用进程当前代理设置。
 
 运行时会优先检查缓存目录：如果 YAML 中的模型 ID 已在本地缓存中，就把它们作为本地路径传给 FunASR，减少日常转写时的网络探测。
 
 Qwen3-ASR 权重必须先用 `scripts\download-models.ps1 -Engine qwen3-asr-1.7b` 预取。该脚本使用 ModelScope 的 `Qwen/Qwen3-ASR-1.7B`，本地目录是 `models\modelscope\Qwen\Qwen3-ASR-1.7B`。
+
+FireRed 采用独立流程：
+
+```powershell
+.\scripts\setup-firered.ps1
+.\scripts\download-models.ps1 -Engine fireredasr2-llm
+```
+
+源码、权重和 `MODEL_RECEIPT.json` 都位于 ignored `models/firered` 树，不进入仓库。receipt 记录必要文件的 SHA-256，供后续核对；不要把 receipt 当作模型文件本身，也不要绕过固定 revision。

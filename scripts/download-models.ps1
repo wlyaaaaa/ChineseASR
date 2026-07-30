@@ -1,12 +1,45 @@
 param(
   [string]$Engine = '',
 
-  [string]$Device = 'cuda:0'
+  [string]$Device = 'cuda:0',
+
+  [string]$FireRedRevision = '2c5e0f415b9afb8f67cb8b00ea4c54959f70e824'
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1')
-Clear-ProxyEnv
+if ($Engine -ne 'fireredasr2-llm') {
+  Clear-ProxyEnv
+}
+
+function Get-Sha256Hex {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$LiteralPath
+  )
+
+  $Stream = [System.IO.FileStream]::new(
+    $LiteralPath,
+    [System.IO.FileMode]::Open,
+    [System.IO.FileAccess]::Read,
+    [System.IO.FileShare]::Read,
+    8MB,
+    [System.IO.FileOptions]::SequentialScan
+  )
+  try {
+    $Hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      $Digest = $Hasher.ComputeHash([System.IO.Stream]$Stream)
+      return [Convert]::ToHexString($Digest).ToLowerInvariant()
+    }
+    finally {
+      $Hasher.Dispose()
+    }
+  }
+  finally {
+    $Stream.Dispose()
+  }
+}
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
@@ -16,6 +49,78 @@ if (-not (Test-Path $Python)) {
 
 $CacheDir = Join-Path $Root 'models\modelscope'
 $env:MODELSCOPE_CACHE = $CacheDir
+
+if ($Engine -eq 'fireredasr2-llm') {
+  $FireRedDir = Join-Path $Root 'models\firered\FireRedASR2-LLM'
+  $env:ZH_ASR_FIRERED_DIR = $FireRedDir
+  $env:ZH_ASR_FIRERED_REVISION = $FireRedRevision
+  & $Python -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id='FireRedTeam/FireRedASR2-LLM', revision=os.environ['ZH_ASR_FIRERED_REVISION'], local_dir=os.environ['ZH_ASR_FIRERED_DIR'], max_workers=8)"
+  if ($LASTEXITCODE -ne 0) {
+    throw "Hugging Face prefetch failed for FireRedTeam/FireRedASR2-LLM@$FireRedRevision."
+  }
+
+  $RequiredFiles = @(
+    'asr_encoder.pth.tar',
+    'cmvn.ark',
+    'model.pth.tar',
+    'Qwen2-7B-Instruct/config.json',
+    'Qwen2-7B-Instruct/generation_config.json',
+    'Qwen2-7B-Instruct/merges.txt',
+    'Qwen2-7B-Instruct/model.safetensors.index.json',
+    'Qwen2-7B-Instruct/model-00001-of-00004.safetensors',
+    'Qwen2-7B-Instruct/model-00002-of-00004.safetensors',
+    'Qwen2-7B-Instruct/model-00003-of-00004.safetensors',
+    'Qwen2-7B-Instruct/model-00004-of-00004.safetensors',
+    'Qwen2-7B-Instruct/tokenizer_config.json',
+    'Qwen2-7B-Instruct/tokenizer.json',
+    'Qwen2-7B-Instruct/vocab.json'
+  )
+  if (@($RequiredFiles | Select-Object -Unique).Count -ne $RequiredFiles.Count) {
+    throw 'Internal error: FireRed canonical required-file list contains duplicate paths.'
+  }
+  $Missing = @($RequiredFiles | Where-Object {
+      -not (Test-Path -LiteralPath (Join-Path $FireRedDir $_) -PathType Leaf)
+    })
+  if ($Missing.Count -gt 0) {
+    throw "FireRed download is incomplete. Missing: $($Missing -join ', ')"
+  }
+
+  $HashRecords = foreach ($RelativePath in $RequiredFiles) {
+    $FullPath = Join-Path $FireRedDir $RelativePath
+    $Item = Get-Item -LiteralPath $FullPath
+    [ordered]@{
+      path = $RelativePath
+      bytes = $Item.Length
+      sha256 = Get-Sha256Hex -LiteralPath $FullPath
+    }
+  }
+  $Receipt = [ordered]@{
+    schema = 'zh_asr.model_receipt.v1'
+    repository = 'FireRedTeam/FireRedASR2-LLM'
+    revision = $FireRedRevision
+    created_utc = [DateTime]::UtcNow.ToString('o')
+    files = @($HashRecords)
+  }
+  $ReceiptPath = Join-Path $FireRedDir 'MODEL_RECEIPT.json'
+  $ReceiptTempPath = "$ReceiptPath.partial-$PID"
+  try {
+    [System.IO.File]::WriteAllText(
+      $ReceiptTempPath,
+      (($Receipt | ConvertTo-Json -Depth 5 -Compress) + [Environment]::NewLine),
+      [System.Text.UTF8Encoding]::new($false)
+    )
+    Move-Item -LiteralPath $ReceiptTempPath -Destination $ReceiptPath -Force
+  }
+  finally {
+    if (Test-Path -LiteralPath $ReceiptTempPath) {
+      Remove-Item -LiteralPath $ReceiptTempPath -Force
+    }
+  }
+  Write-Host "FireRedASR2-LLM weights ready at pinned revision $FireRedRevision`: $FireRedDir"
+  Write-Host "SHA-256 receipt: $ReceiptPath"
+  Write-Host 'The isolated WSL runtime is loaded only during transcription; Windows warmup is intentionally skipped.'
+  exit 0
+}
 
 if ($Engine -eq 'qwen3-asr-1.7b') {
   $QwenDir = Join-Path $CacheDir 'Qwen\Qwen3-ASR-1.7B'

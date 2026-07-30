@@ -177,9 +177,161 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("engine_failure", audit_text)
             self.assertIn("sensevoice", audit_text)
             self.assertEqual("engine_failure", audit_json["status"])
+            self.assertEqual("provisional", audit_json["evidence_status"])
+            self.assertEqual("provisional", paths["evidence_status"])
+            self.assertEqual(
+                ["sensevoice"],
+                [
+                    item["engine"]
+                    for item in audit_json["engine_evidence"]
+                    if item["execution_status"] == "failed"
+                ],
+            )
             self.assertIn("engine_failure", audit_json["flags"])
             self.assertEqual("sensevoice", secondary_raw["engine"])
             self.assertEqual("TypeError", secondary_raw["error"]["type"])
+
+    def test_firered_input_is_normalized_and_rejects_audio_over_model_limit(self):
+        from zh_asr.audio_frontend import PreparedAudio
+        from zh_asr.config import load_model_config
+        from zh_asr.pipeline import _prepare_engine_input
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "call.mp3"
+            source.write_bytes(b"source")
+            derivative = root / "derived.wav"
+            derivative.write_bytes(b"derived")
+            prepared = PreparedAudio(
+                source_path=source,
+                path=derivative,
+                converted=True,
+                source_sha256="source-hash",
+                derivative_sha256="derived-hash",
+                sample_rate=16000,
+                channels=1,
+                sample_width_bytes=2,
+                duration_sec=41.0,
+                ffmpeg_version="ffmpeg test",
+            )
+
+            with patch("zh_asr.pipeline.prepare_pcm16_mono", return_value=prepared):
+                with self.assertRaisesRegex(ValueError, "40 seconds"):
+                    _prepare_engine_input(
+                        source,
+                        "fireredasr2-llm",
+                        root / "_derived",
+                        load_model_config(),
+                    )
+
+    def test_strict_transcribe_records_prepared_audio_provenance_and_roles(self):
+        from zh_asr.audio_frontend import PreparedAudio
+        from zh_asr.pipeline import strict_transcribe_audio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "call.mp3"
+            source.write_bytes(b"source")
+            derivative = root / "call.wav"
+            derivative.write_bytes(b"derived")
+            prepared = PreparedAudio(
+                source_path=source,
+                path=derivative,
+                converted=True,
+                source_sha256="source-hash",
+                derivative_sha256="derived-hash",
+                sample_rate=16000,
+                channels=1,
+                sample_width_bytes=2,
+                duration_sec=10.0,
+            )
+
+            with (
+                patch("zh_asr.pipeline.prepare_pcm16_mono", return_value=prepared),
+                patch(
+                    "zh_asr.pipeline._generate_once",
+                    side_effect=lambda audio, engine, *_: [{"text": f"{engine}:{audio.name}"}],
+                ),
+                patch("zh_asr.pipeline.write_strict_bundle") as writer,
+            ):
+                writer.return_value = {}
+                strict_transcribe_audio(
+                    source,
+                    primary_engine="fireredasr2-llm",
+                    secondary_engine="sensevoice",
+                    out_dir=root / "outputs",
+                )
+
+            kwargs = writer.call_args.kwargs
+            self.assertEqual(kwargs["primary_role"], "lexical_primary")
+            self.assertEqual(kwargs["secondary_role"], "lexical_verifier")
+            self.assertEqual(kwargs["primary_provenance"]["audio"]["derivative_sha256"], "derived-hash")
+            self.assertEqual(kwargs["primary_provenance"]["registry_role"], "lexical_primary")
+
+    def test_strict_transcribe_many_loads_each_engine_once_and_uses_generate_many(self):
+        from zh_asr.pipeline import strict_transcribe_many
+
+        class PrimaryModel:
+            def __init__(self):
+                self.calls = []
+
+            def generate_many(self, inputs):
+                self.calls.append(list(inputs))
+                return [
+                    {"text": f"primary-{Path(value).stem}"}
+                    for value in inputs
+                ]
+
+        class SecondaryModel:
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, input, **_kwargs):
+                self.calls.append(input)
+                return [{"text": f"secondary-{Path(input).stem}"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audios = []
+            out_dirs = []
+            for name in ("one.wav", "two.wav"):
+                audio = root / name
+                audio.write_bytes(b"fake wav")
+                audios.append(audio)
+                out_dirs.append(root / f"out-{audio.stem}")
+            primary = PrimaryModel()
+            secondary = SecondaryModel()
+
+            def fake_build(engine, **_kwargs):
+                return primary if engine == "fireredasr2-llm" else secondary
+
+            with (
+                patch("zh_asr.pipeline.build_model", side_effect=fake_build) as build,
+                patch(
+                    "zh_asr.pipeline._prepare_engine_input",
+                    side_effect=lambda audio, _engine, _derived, _config: (
+                        audio,
+                        {"audio": {"path": str(audio)}},
+                    ),
+                ),
+                patch("zh_asr.pipeline.write_strict_bundle") as writer,
+            ):
+                writer.side_effect = lambda **kwargs: {
+                    "final": kwargs["out_dir"] / "final.md"
+                }
+                results = strict_transcribe_many(
+                    audios,
+                    out_dirs=out_dirs,
+                    primary_engine="fireredasr2-llm",
+                    secondary_engine="sensevoice",
+                )
+
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(len(primary.calls), 1)
+        self.assertEqual(len(primary.calls[0]), 2)
+        self.assertEqual(len(secondary.calls), 2)
+        self.assertEqual(writer.call_count, 2)
+        self.assertEqual(len(results), 2)
 
 
 if __name__ == "__main__":

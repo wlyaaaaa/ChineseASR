@@ -21,7 +21,14 @@ from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import parse_qs, urlparse
 
+from .audit import validate_strict_artifact_bundle
 from .gpu_broker import GpuBrokerConflict, GpuBrokerLease
+from .process_control import (
+    managed_popen_kwargs,
+    tagged_process_env,
+    terminate_process_tree,
+    terminate_wsl_processes,
+)
 
 
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "blocked"}
@@ -33,6 +40,8 @@ OBSERVER_MODEL_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 OBSERVER_MANIFEST_LIMIT_BYTES = 8 * 1024 * 1024
 OBSERVER_DEFAULT_LIMIT = 50
 OBSERVER_MAX_LIMIT = 200
+DEFAULT_PROCESS_TIMEOUT_SEC = 24 * 60 * 60
+PROCESS_CANCEL_WAIT_SEC = 5.0
 OBSERVER_STATES = {"queued", "running", "succeeded", "failed", "canceled", "blocked"}
 OBSERVER_STAGES = {
     "queued",
@@ -66,6 +75,10 @@ class ProcessResult:
     stderr: str = ""
 
 
+class ProcessExecutionTimeout(TimeoutError):
+    """The service command exceeded its finite total deadline."""
+
+
 @dataclass(frozen=True)
 class JobRequest:
     audio: Path
@@ -80,6 +93,13 @@ class JobRequest:
     overlap_sec: int = 1
     force: bool = False
     allow_gpu_conflicts: bool = False
+    timeout_sec: float = DEFAULT_PROCESS_TIMEOUT_SEC
+    resolved_engine: str | None = None
+    resolved_primary_engine: str | None = None
+    resolved_secondary_engine: str | None = None
+    model_config_sha256: str = ""
+    audio_sha256: str = ""
+    wsl_distributions: tuple[str, ...] = ()
 
     @classmethod
     def from_payload(cls, payload: dict, root: Path, default_out_root: Path | None = None) -> "JobRequest":
@@ -98,13 +118,28 @@ class JobRequest:
         out_root = Path(str(payload.get("out_root") or payload.get("out_dir") or fallback_out_root)).expanduser()
         cache_value = payload.get("cache_dir")
         cache_dir = Path(str(cache_value)).expanduser().resolve() if cache_value else None
+        engine = _optional_str(payload.get("engine"))
+        primary_engine = _optional_str(payload.get("primary_engine"))
+        secondary_engine = _optional_str(payload.get("secondary_engine"))
+        (
+            resolved_engine,
+            resolved_primary_engine,
+            resolved_secondary_engine,
+            model_config_sha256,
+            wsl_distributions,
+        ) = _resolve_request_models(
+            mode,
+            engine=engine,
+            primary_engine=primary_engine,
+            secondary_engine=secondary_engine,
+        )
 
         return cls(
             audio=audio,
             mode=mode,
-            engine=_optional_str(payload.get("engine")),
-            primary_engine=_optional_str(payload.get("primary_engine")),
-            secondary_engine=_optional_str(payload.get("secondary_engine")),
+            engine=engine,
+            primary_engine=primary_engine,
+            secondary_engine=secondary_engine,
             device=str(payload.get("device", "cuda:0")),
             out_root=out_root.resolve(),
             cache_dir=cache_dir,
@@ -112,18 +147,31 @@ class JobRequest:
             overlap_sec=int(payload.get("overlap_sec", 1)),
             force=bool(payload.get("force", False)),
             allow_gpu_conflicts=bool(payload.get("allow_gpu_conflicts", False)),
+            timeout_sec=_positive_timeout(
+                payload.get("timeout_sec", DEFAULT_PROCESS_TIMEOUT_SEC)
+            ),
+            resolved_engine=resolved_engine,
+            resolved_primary_engine=resolved_primary_engine,
+            resolved_secondary_engine=resolved_secondary_engine,
+            model_config_sha256=model_config_sha256,
+            audio_sha256=_sha256_path(audio),
+            wsl_distributions=wsl_distributions,
         )
 
     def fingerprint(self) -> str:
-        stat = self.audio.stat()
+        audio_sha256 = self.audio_sha256 or _sha256_path(self.audio)
         payload = {
             "audio": str(self.audio),
-            "audio_size": stat.st_size,
-            "audio_mtime_ns": stat.st_mtime_ns,
+            "audio_sha256": audio_sha256,
             "mode": self.mode,
             "engine": self.engine,
             "primary_engine": self.primary_engine,
             "secondary_engine": self.secondary_engine,
+            "resolved_engine": self.resolved_engine,
+            "resolved_primary_engine": self.resolved_primary_engine,
+            "resolved_secondary_engine": self.resolved_secondary_engine,
+            "model_config_sha256": self.model_config_sha256,
+            "wsl_distributions": self.wsl_distributions,
             "device": self.device,
             "cache_dir": str(self.cache_dir) if self.cache_dir else None,
             "out_root": str(self.out_root),
@@ -133,13 +181,19 @@ class JobRequest:
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
-    def to_dict(self) -> dict[str, str | bool | None]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "audio": str(self.audio),
             "mode": self.mode,
             "engine": self.engine,
             "primary_engine": self.primary_engine,
             "secondary_engine": self.secondary_engine,
+            "resolved_engine": self.resolved_engine,
+            "resolved_primary_engine": self.resolved_primary_engine,
+            "resolved_secondary_engine": self.resolved_secondary_engine,
+            "model_config_sha256": self.model_config_sha256,
+            "audio_sha256": self.audio_sha256,
+            "wsl_distributions": list(self.wsl_distributions),
             "device": self.device,
             "out_root": str(self.out_root),
             "cache_dir": str(self.cache_dir) if self.cache_dir else None,
@@ -147,6 +201,7 @@ class JobRequest:
             "overlap_sec": self.overlap_sec,
             "force": self.force,
             "allow_gpu_conflicts": self.allow_gpu_conflicts,
+            "timeout_sec": self.timeout_sec,
         }
 
 
@@ -168,6 +223,8 @@ class Job:
     stdout_tail: str = ""
     stderr_tail: str = ""
     outputs: dict[str, str] = field(default_factory=dict)
+    evidence_status: str = "pending"
+    evidence_failures: list[dict[str, str]] = field(default_factory=list)
     conflicts: list[GpuProcess] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -188,6 +245,8 @@ class Job:
             "stdout_tail": self.stdout_tail,
             "stderr_tail": self.stderr_tail,
             "outputs": self.outputs,
+            "evidence_status": self.evidence_status,
+            "evidence_failures": self.evidence_failures,
             "conflicts": [conflict.to_dict() for conflict in self.conflicts],
         }
 
@@ -246,18 +305,22 @@ class TranscriptionService:
     def submit(self, request: JobRequest) -> tuple[Job, bool]:
         fingerprint = request.fingerprint()
         with self._lock:
-            if not request.force:
-                existing_id = self._fingerprints.get(fingerprint)
-                existing = self._jobs.get(existing_id or "")
+            existing_id = self._fingerprints.get(fingerprint)
+            existing = self._jobs.get(existing_id or "")
+            if request.mode == "long-strict":
+                if existing and existing.status in {"queued", "running"}:
+                    return existing, True
+            elif not request.force:
                 if existing and existing.status in {"queued", "running", "succeeded"}:
                     return existing, True
 
             conflicts = [] if request.allow_gpu_conflicts else self._foreign_gpu_processes()
-            job = self._new_job(request, conflicts=conflicts)
+            job = self._new_job(request, conflicts=conflicts, fingerprint=fingerprint)
             self._jobs[job.job_id] = job
             self._fingerprints[fingerprint] = job.job_id
             if conflicts:
                 job.status = "blocked"
+                _mark_job_evidence_unavailable(job, "GPU conflict blocked transcription.")
                 job.stage = "gpu_conflict"
                 job.message = _format_conflict_message(conflicts)
                 job.finished_at = time.time()
@@ -322,14 +385,15 @@ class TranscriptionService:
             if job.status in TERMINAL_STATUSES:
                 return job
             job.status = "canceled"
+            _mark_job_evidence_unavailable(job, "Job was canceled before evidence completed.")
             job.stage = "canceled"
             job.message = "Canceled by request."
             job.finished_at = time.time()
             job.updated_at = job.finished_at
             process = self._processes.get(job_id)
-            if process and process.poll() is None:
-                process.terminate()
-            return job
+        if process:
+            _terminate_job_process(job, process)
+        return job
 
     def health(self) -> dict:
         with self._lock:
@@ -372,6 +436,9 @@ class TranscriptionService:
             if job.status == "canceled":
                 return
             job.status = "running"
+            if job.request.mode != "quick":
+                job.evidence_status = "pending"
+                job.evidence_failures = []
             job.stage = "running_command"
             job.started_at = time.time()
             job.updated_at = job.started_at
@@ -394,11 +461,21 @@ class TranscriptionService:
                 job.outputs = _collect_outputs(
                     job.out_dir,
                     job.request.mode,
-                    job.request.engine,
-                    primary_engine=job.request.primary_engine,
-                    secondary_engine=job.request.secondary_engine,
+                    job.request.resolved_engine or job.request.engine,
+                    primary_engine=job.request.resolved_primary_engine or job.request.primary_engine,
+                    secondary_engine=job.request.resolved_secondary_engine or job.request.secondary_engine,
                 )
                 job.status = "succeeded" if result.returncode == 0 else "failed"
+                if result.returncode == 0:
+                    (
+                        job.evidence_status,
+                        job.evidence_failures,
+                    ) = _evidence_from_job_outputs(job)
+                else:
+                    _mark_job_evidence_unavailable(
+                        job,
+                        "Transcription command failed before evidence completed.",
+                    )
                 job.stage = "finished" if result.returncode == 0 else "failed"
                 job.message = "Completed." if result.returncode == 0 else "Transcription command failed."
                 job.finished_at = time.time()
@@ -407,6 +484,7 @@ class TranscriptionService:
             with self._lock:
                 if job.status != "canceled":
                     job.status = "blocked"
+                    _mark_job_evidence_unavailable(job, str(exc))
                     job.stage = "gpu_broker_conflict"
                     job.message = str(exc)
                     job.finished_at = time.time()
@@ -415,6 +493,10 @@ class TranscriptionService:
             with self._lock:
                 if job.status != "canceled":
                     job.status = "failed"
+                    _mark_job_evidence_unavailable(
+                        job,
+                        f"{type(exc).__name__}: {exc}",
+                    )
                     job.stage = "failed"
                     job.message = f"{type(exc).__name__}: {exc}"
                     job.finished_at = time.time()
@@ -425,11 +507,30 @@ class TranscriptionService:
                 if self._active_job_id == job_id:
                     self._active_job_id = None
 
-    def _new_job(self, request: JobRequest, conflicts: list[GpuProcess]) -> Job:
+    def _new_job(
+        self,
+        request: JobRequest,
+        conflicts: list[GpuProcess],
+        fingerprint: str | None = None,
+    ) -> Job:
         job_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
-        out_dir = request.out_root / job_id
+        recovery_fingerprint = fingerprint or request.fingerprint()
+        out_dir = (
+            request.out_root / "long-strict" / recovery_fingerprint
+            if request.mode == "long-strict"
+            else request.out_root / job_id
+        )
         command = self._build_command(request, out_dir)
-        return Job(job_id=job_id, request=request, out_dir=out_dir, command=command, conflicts=list(conflicts))
+        return Job(
+            job_id=job_id,
+            request=request,
+            out_dir=out_dir,
+            command=command,
+            evidence_status=(
+                "not_applicable" if request.mode == "quick" else "pending"
+            ),
+            conflicts=list(conflicts),
+        )
 
     def _build_command(self, request: JobRequest, out_dir: Path) -> list[str]:
         if request.mode == "long-strict":
@@ -448,10 +549,14 @@ class TranscriptionService:
                 "--overlap-sec",
                 str(request.overlap_sec),
             ]
-            if request.primary_engine:
-                command.extend(["--primary-engine", request.primary_engine])
-            if request.secondary_engine:
-                command.extend(["--secondary-engine", request.secondary_engine])
+            primary_engine = request.resolved_primary_engine or request.primary_engine
+            secondary_engine = request.resolved_secondary_engine or request.secondary_engine
+            if primary_engine:
+                command.extend(["--primary-engine", primary_engine])
+            if secondary_engine:
+                command.extend(["--secondary-engine", secondary_engine])
+            if request.force:
+                command.append("--force")
         elif request.mode == "strict":
             command = [
                 sys.executable,
@@ -464,10 +569,12 @@ class TranscriptionService:
                 "--out-dir",
                 str(out_dir),
             ]
-            if request.primary_engine:
-                command.extend(["--primary-engine", request.primary_engine])
-            if request.secondary_engine:
-                command.extend(["--secondary-engine", request.secondary_engine])
+            primary_engine = request.resolved_primary_engine or request.primary_engine
+            secondary_engine = request.resolved_secondary_engine or request.secondary_engine
+            if primary_engine:
+                command.extend(["--primary-engine", primary_engine])
+            if secondary_engine:
+                command.extend(["--secondary-engine", secondary_engine])
         else:
             command = [
                 sys.executable,
@@ -480,14 +587,16 @@ class TranscriptionService:
                 "--out-dir",
                 str(out_dir),
             ]
-            if request.engine:
-                command.extend(["--engine", request.engine])
+            engine = request.resolved_engine or request.engine
+            if engine:
+                command.extend(["--engine", engine])
         if request.cache_dir:
             command.extend(["--cache-dir", str(request.cache_dir)])
         return command
 
     def _run_subprocess(self, job: Job) -> ProcessResult:
         job.out_dir.mkdir(parents=True, exist_ok=True)
+        process_token = _process_token(job)
         process = subprocess.Popen(
             job.command,
             cwd=self.root,
@@ -496,12 +605,31 @@ class TranscriptionService:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=tagged_process_env(process_token),
+            **managed_popen_kwargs(),
         )
         with self._lock:
             job.process_id = process.pid
             self._processes[job.job_id] = process
             job.updated_at = time.time()
-        stdout, stderr = process.communicate()
+            canceled = job.status == "canceled"
+        if canceled:
+            _terminate_job_process(job, process)
+            stdout, stderr = _bounded_communicate_after_stop(process)
+            return ProcessResult(
+                returncode=process.returncode if process.returncode is not None else -1,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+        try:
+            stdout, stderr = process.communicate(timeout=job.request.timeout_sec)
+        except subprocess.TimeoutExpired as exc:
+            _terminate_job_process(job, process)
+            _bounded_communicate_after_stop(process)
+            raise ProcessExecutionTimeout(
+                f"Transcription command timed out after {job.request.timeout_sec:g}s."
+            ) from exc
         return ProcessResult(returncode=process.returncode, stdout=stdout, stderr=stderr)
 
     def _foreign_gpu_processes(self) -> list[GpuProcess]:
@@ -599,9 +727,9 @@ def _collect_outputs(
         raw_matches = sorted(out_dir.glob("*.raw.json"))
         primary_raw = _find_raw_json(raw_matches, primary_name)
         secondary_raw = _find_raw_json(raw_matches, secondary_name)
-        if primary_raw is None and raw_matches:
+        if primary_raw is None and primary_name is None and raw_matches:
             primary_raw = raw_matches[0]
-        if secondary_raw is None:
+        if secondary_raw is None and secondary_name is None:
             secondary_raw = next((path for path in raw_matches if path != primary_raw), None)
         if primary_raw:
             outputs["primary_raw_json"] = str(primary_raw)
@@ -616,6 +744,137 @@ def _collect_outputs(
         if json_matches:
             outputs["raw_json"] = str(json_matches[0])
     return outputs
+
+
+def _mark_job_evidence_unavailable(job: Job, error: str) -> None:
+    if job.request.mode == "quick":
+        job.evidence_status = "not_applicable"
+        job.evidence_failures = []
+        return
+    job.evidence_status = "unavailable"
+    job.evidence_failures = [{"kind": "job_failure", "error": error}]
+
+
+def _evidence_from_job_outputs(job: Job) -> tuple[str, list[dict[str, str]]]:
+    if job.request.mode == "quick":
+        return "not_applicable", []
+    if job.request.mode == "long-strict":
+        return _long_manifest_evidence(job.outputs.get("manifest"))
+    return validate_strict_artifact_bundle(
+        job.outputs,
+        expected_primary_engine=(
+            job.request.resolved_primary_engine or job.request.primary_engine
+        ),
+        expected_secondary_engine=(
+            job.request.resolved_secondary_engine or job.request.secondary_engine
+        ),
+    )
+
+
+def _long_manifest_evidence(
+    manifest_path_value: str | None,
+) -> tuple[str, list[dict[str, str]]]:
+    manifest, load_failure = _load_evidence_json(
+        manifest_path_value,
+        "long manifest JSON",
+    )
+    if load_failure:
+        return "unavailable", [load_failure]
+    assert manifest is not None
+    chunks = manifest.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        return (
+            "unavailable",
+            [
+                {
+                    "kind": "artifact_failure",
+                    "error": "long manifest has no chunk evidence",
+                }
+            ],
+        )
+    failures = _coerce_failure_list(manifest.get("evidence_failures"))
+    chunk_statuses = [
+        str(chunk.get("evidence_status") or "")
+        for chunk in chunks
+        if isinstance(chunk, dict)
+    ]
+    execution_statuses = [
+        str(chunk.get("status") or "")
+        for chunk in chunks
+        if isinstance(chunk, dict)
+    ]
+    if len(chunk_statuses) != len(chunks):
+        return "unavailable", failures or [
+            {
+                "kind": "artifact_failure",
+                "error": "long manifest contains a non-object chunk",
+            }
+        ]
+    if any(
+        evidence == "pending" or execution in {"pending", "running", "stale"}
+        for evidence, execution in zip(chunk_statuses, execution_statuses)
+    ):
+        return "pending", failures
+    if any(
+        evidence == "unavailable" or execution != "succeeded"
+        for evidence, execution in zip(chunk_statuses, execution_statuses)
+    ):
+        return "unavailable", failures
+    if any(evidence == "provisional" for evidence in chunk_statuses):
+        return "provisional", failures
+    if all(evidence == "verified" for evidence in chunk_statuses):
+        return "verified", failures
+    return (
+        "unavailable",
+        failures
+        or [
+            {
+                "kind": "artifact_failure",
+                "error": "long manifest has unrecognized chunk evidence_status",
+            }
+        ],
+    )
+
+
+def _load_evidence_json(
+    path_value: str | None,
+    label: str,
+) -> tuple[dict | None, dict[str, str] | None]:
+    if not path_value:
+        return None, {
+            "kind": "artifact_failure",
+            "error": f"{label} is missing",
+        }
+    try:
+        payload = json.loads(Path(path_value).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return None, {
+            "kind": "artifact_failure",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if not isinstance(payload, dict):
+        return None, {
+            "kind": "artifact_failure",
+            "error": f"{label} is not an object",
+        }
+    return payload, None
+
+
+def _coerce_failure_list(value) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    failures: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        failures.append(
+            {
+                str(key): str(field)
+                for key, field in item.items()
+                if isinstance(key, str) and field is not None
+            }
+        )
+    return failures
 
 
 def _strict_engine_names(primary_engine: str | None, secondary_engine: str | None) -> tuple[str | None, str | None]:
@@ -643,6 +902,120 @@ def _format_conflict_message(conflicts: Iterable[GpuProcess]) -> str:
         for process in conflicts
     )
     return f"GPU conflict detected: {details}"
+
+
+def _resolve_request_models(
+    mode: str,
+    *,
+    engine: str | None,
+    primary_engine: str | None,
+    secondary_engine: str | None,
+) -> tuple[str | None, str | None, str | None, str, tuple[str, ...]]:
+    from .config import load_model_config
+
+    config = load_model_config()
+    config_hash = ""
+    if config.path.exists():
+        config_hash = hashlib.sha256(config.path.read_bytes()).hexdigest()
+    if mode == "quick":
+        resolved_engine = engine or config.default_engine
+        return (
+            resolved_engine,
+            None,
+            None,
+            config_hash,
+            _wsl_distributions_for_engines(config, (resolved_engine,)),
+        )
+    resolved_primary = primary_engine or config.strict_primary_engine
+    resolved_secondary = secondary_engine or config.strict_secondary_engine
+    return (
+        None,
+        resolved_primary,
+        resolved_secondary,
+        config_hash,
+        _wsl_distributions_for_engines(
+            config,
+            (resolved_primary, resolved_secondary),
+        ),
+    )
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _positive_timeout(value) -> float:
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("timeout_sec must be a positive finite number") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout_sec must be a positive finite number")
+    return timeout
+
+
+def _process_token(job: Job) -> str:
+    return f"chineseasr-{job.job_id}"
+
+
+def _terminate_job_process(job: Job, process: subprocess.Popen) -> None:
+    terminate_process_tree(process)
+    terminate_wsl_processes(
+        _request_wsl_distributions(job.request),
+        _process_token(job),
+    )
+
+
+def _bounded_communicate_after_stop(
+    process: subprocess.Popen,
+) -> tuple[str, str]:
+    try:
+        return process.communicate(timeout=PROCESS_CANCEL_WAIT_SEC)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.output if isinstance(exc.output, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        return stdout, stderr
+
+
+def _request_wsl_distributions(request: JobRequest) -> tuple[str, ...]:
+    if request.wsl_distributions:
+        return request.wsl_distributions
+    try:
+        from .config import load_model_config
+
+        config = load_model_config()
+    except Exception:
+        return ()
+    return _wsl_distributions_for_engines(
+        config,
+        (
+            request.resolved_engine or request.engine,
+            request.resolved_primary_engine or request.primary_engine,
+            request.resolved_secondary_engine or request.secondary_engine,
+        ),
+    )
+
+
+def _wsl_distributions_for_engines(
+    config,
+    selected: Iterable[str | None],
+) -> tuple[str, ...]:
+    distributions: list[str] = []
+    for engine_name in selected:
+        if not engine_name:
+            continue
+        spec = config.engines.get(engine_name)
+        options = getattr(spec, "options", None) or {}
+        if str(options.get("runtime", "")).strip().lower() != "wsl":
+            continue
+        distribution = str(options.get("wsl_distribution", "Ubuntu")).strip()
+        if distribution and distribution not in distributions:
+            distributions.append(distribution)
+    return tuple(distributions)
 
 
 def _optional_str(value) -> str | None:
@@ -728,10 +1101,16 @@ def _observer_model(request: JobRequest, config) -> str:
         return selected
 
     if request.mode == "quick":
-        return configured(request.engine, config.default_engine) or "unknown"
+        return configured(request.resolved_engine or request.engine, config.default_engine) or "unknown"
 
-    primary = configured(request.primary_engine, config.strict_primary_engine)
-    secondary = configured(request.secondary_engine, config.strict_secondary_engine)
+    primary = configured(
+        request.resolved_primary_engine or request.primary_engine,
+        config.strict_primary_engine,
+    )
+    secondary = configured(
+        request.resolved_secondary_engine or request.secondary_engine,
+        config.strict_secondary_engine,
+    )
     if primary is None or secondary is None:
         return "unknown"
     return f"{primary} + {secondary}"
