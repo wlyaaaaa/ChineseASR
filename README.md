@@ -8,7 +8,7 @@
 - **低幻觉和可复核**：双模型分歧、静音出字、模板废话、异常重复、繁体残留、超长无标点等都会进入 audit / metrics / review。
 - **适合 AI Agent 调用**：`scripts\asr-smart.ps1` 通过本地 API 提交任务，快速返回 job 状态，避免长时间卡住命令行或上层 Agent。
 
-它不是云转写服务，不会默认上传音频。模型、输出、wheelhouse 和私人评测数据都保留在本机。
+它是本地优先而不是云转写服务：默认路径不会上传音频。只有调用独立的“重要录音专业云入口”并同时声明录音重要、授权本次云上传时，才会把本机切片发送给阿里云百炼；模型、输出、wheelhouse 和私人评测数据仍保留在本机。
 
 ## 当前状态
 
@@ -33,7 +33,7 @@
 
 - 只想要一个极简 GUI。
 - 不愿意本地安装模型权重和 Python 环境。
-- 需要直接把音频交给云厂商转写。
+- 希望普通录音或整个文件夹自动上传云端转写；云入口只接受明确的重要录音。
 - 需要英文、多语种或字幕生产工具链作为主目标。
 
 ## 默认模型策略
@@ -46,6 +46,7 @@
 | `strict` 对照引擎 | `sensevoice` | 快速中文声学锚点，用于发现分歧和疑似幻觉 |
 | `quick` | `sensevoice` | 单模型快速转写 |
 | 可选证据级词汇主引擎 | `fireredasr2-llm` | 隔离在 WSL 中运行；仅在显式选择时作为 strict 主引擎 |
+| 重要录音专业云入口 | `qwen-audio-3.0-asr-flash` | 仅由独立脚本显式调用；Key 经 Password Center SecretRef 注入，普通模式无法触发 |
 | baseline | `paraformer` | 保守普通话基线，可用于回归对照 |
 | fallback/comparison | `whisper-large-v3` | 已注册为备用/对照，不作为中文 strict 默认路径 |
 
@@ -75,6 +76,9 @@ cd <repo-root>
 # 重要录音的证据级组合；不会改变默认配置
 .\scripts\asr-smart.ps1 -Audio C:\path\to\long.mp3 -Mode long-strict -PrimaryEngine fireredasr2-llm -SecondaryEngine qwen3-asr-1.7b -WaitSec 15 -Json
 
+# 明确的重要/专业录音才允许使用最强云候选；两个开关缺一即在上传前阻断
+.\scripts\asr-professional-cloud.ps1 -Audio C:\path\to\important.wav -Important -CloudUploadAuthorized -Json
+
 # 快速单模型，只在明确接受较少审计时使用
 .\scripts\asr-smart.ps1 -Audio C:\path\to\audio.wav -Mode quick -WaitSec 15 -Json
 
@@ -93,6 +97,24 @@ cd <repo-root>
 ```powershell
 .\scripts\smoke-evidence-asr.ps1 -Audio C:\path\to\important.mp3 -Json
 ```
+
+## 重要录音专业云入口
+
+`scripts\asr-professional-cloud.ps1` 是唯一的云上传入口，固定调用阿里云百炼
+`qwen-audio-3.0-asr-flash`。它与 `quick`、`strict`、`long-strict` 隔离，普通调用、
+批量文件夹和仅因录音较长都不会触发云端。
+
+入口在创建任务和读取音频前依次要求：
+
+1. `-Important`：当前录音已被明确归类为重要或专业录音；
+2. `-CloudUploadAuthorized`：调用方确认这次可以把音频切片发送给阿里云百炼；
+3. Password Center 的受管目标 `qwen-audio3-asr-important-once` 完整性验证通过。
+
+API Key 只由 Secret Broker 注入固定、哈希绑定的子进程环境，不进入命令行、请求文件、
+转写结果或模型上下文。音频先在本机转为 16 kHz 单声道 WAV，再按最多 180 秒切片；
+每段使用 HTTPS Base64 同步接口，结果保存到被 Git 忽略的 `outputs\cloud-jobs`。云调用失败会
+明确返回失败原因，不会静默冒充本地结果。对于法律、投诉、雇佣等证据录音，云结果是能力优先的
+专业候选，同时仍应运行 FireRed + Qwen 本地证据链并人工核听，不能把云转写本身当作证据认证。
 
 ## 安装与模型下载
 
