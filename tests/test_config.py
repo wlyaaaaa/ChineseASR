@@ -20,7 +20,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(spec.model, "iic/SenseVoiceSmall")
         self.assertEqual(spec.vad_model, "fsmn-vad")
         self.assertEqual(spec.punc_model, "ct-punc")
-        self.assertEqual(spec.spk_model, "cam++")
+        self.assertIsNone(spec.spk_model)
         self.assertFalse(spec.is_whisper)
 
     def test_whisper_is_marked_as_fallback_only(self):

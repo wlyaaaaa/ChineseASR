@@ -69,9 +69,8 @@ engines:
     model: iic/SenseVoiceSmall
     vad_model: fsmn-vad
     punc_model: ct-punc
-    spk_model: cam++
     language: auto
-    note: Primary local Chinese low-hallucination engine.
+    note: Primary local Chinese lexical verifier; speaker attribution is intentionally disabled.
 
   paraformer:
     adapter: funasr

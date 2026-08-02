@@ -27,7 +27,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(kwargs["model"], str(cache / "iic/SenseVoiceSmall"))
             self.assertEqual(kwargs["vad_model"], str(cache / "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"))
             self.assertEqual(kwargs["punc_model"], str(cache / "iic/punc_ct-transformer_cn-en-common-vocab471067-large"))
-            self.assertEqual(kwargs["spk_model"], str(cache / "iic/speech_campplus_sv_zh-cn_16k-common"))
+            self.assertNotIn("spk_model", kwargs)
 
     def test_funasr_kwargs_resolve_aliases_from_model_registry(self):
         from zh_asr.config import EngineSpec
