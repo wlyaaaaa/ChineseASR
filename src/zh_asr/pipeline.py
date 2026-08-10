@@ -8,9 +8,17 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import get_adapter
-from .adapters.base import MissingDependencyError
-from .adapters.funasr import ensure_funasr_available, funasr_kwargs as _funasr_kwargs
-from .audio_frontend import prepare_pcm16_mono
+from .adapters.base import MissingDependencyError  # noqa: F401 - compatibility re-export
+from .adapters.funasr import (  # noqa: F401 - compatibility re-export
+    ensure_funasr_available,
+    funasr_kwargs as _funasr_kwargs,
+)
+from .audio_frontend import (
+    PreparedAudio,
+    _locked_prepared_audio_owner,
+    prepare_pcm16_mono,
+    validate_prepared_audio_owner,
+)
 from .config import ModelConfig, get_engine_spec, load_model_config
 from .proxy_guard import sanitize_current_process_env
 from .result_writer import write_transcript_bundle
@@ -93,12 +101,43 @@ def strict_transcribe_audio(
     output_dir = out_dir or project_root() / "outputs"
     derived_dir = output_dir / "_derived"
     total_started = time.perf_counter()
-    primary_result, primary_error, primary_sec, primary_provenance = _generate_for_strict(
-        audio_path, primary_name, device, cache_dir, model_config, derived_dir
-    )
-    secondary_result, secondary_error, secondary_sec, secondary_provenance = _generate_for_strict(
-        audio_path, secondary_name, device, cache_dir, model_config, derived_dir
-    )
+    if _uses_shared_default_strict_audio(primary_name, secondary_name, model_config):
+        prepared = prepare_pcm16_mono(
+            audio_path,
+            derived_dir,
+            materialize_owner=True,
+        )
+        audio_provenance = prepared.as_dict()
+        with _locked_prepared_audio_owner(prepared, derived_dir):
+            primary_result, primary_error, primary_sec, primary_provenance = (
+                _generate_prepared_for_strict(
+                    prepared,
+                    audio_provenance,
+                    primary_name,
+                    device,
+                    cache_dir,
+                    model_config,
+                    derived_dir,
+                )
+            )
+            secondary_result, secondary_error, secondary_sec, secondary_provenance = (
+                _generate_prepared_for_strict(
+                    prepared,
+                    audio_provenance,
+                    secondary_name,
+                    device,
+                    cache_dir,
+                    model_config,
+                    derived_dir,
+                )
+            )
+    else:
+        primary_result, primary_error, primary_sec, primary_provenance = _generate_for_strict(
+            audio_path, primary_name, device, cache_dir, model_config, derived_dir
+        )
+        secondary_result, secondary_error, secondary_sec, secondary_provenance = _generate_for_strict(
+            audio_path, secondary_name, device, cache_dir, model_config, derived_dir
+        )
     paths = write_strict_bundle(
         audio_path=audio_path,
         primary_engine=primary_name,
@@ -299,6 +338,37 @@ def _generate_for_strict(
         return _engine_failure_result(engine, exc), error, time.perf_counter() - started, provenance
 
 
+def _generate_prepared_for_strict(
+    prepared: PreparedAudio,
+    audio_provenance: dict[str, object],
+    engine: str,
+    device: str,
+    cache_dir: Path | None,
+    config: ModelConfig,
+    derived_dir: Path,
+) -> tuple[Any, str | None, float, dict[str, Any]]:
+    started = time.perf_counter()
+    provenance = _engine_provenance(engine, config)
+    provenance["audio"] = dict(audio_provenance)
+    validate_prepared_audio_owner(prepared, derived_dir)
+    try:
+        result, runtime_identity = _generate_once_with_identity(
+            prepared.path,
+            engine,
+            device,
+            cache_dir,
+            config,
+        )
+        if runtime_identity:
+            provenance["runtime_identity"] = runtime_identity
+        error = None
+    except Exception as exc:
+        result = _engine_failure_result(engine, exc)
+        error = f"{type(exc).__name__}: {exc}"
+    validate_prepared_audio_owner(prepared, derived_dir)
+    return result, error, time.perf_counter() - started, provenance
+
+
 def _engine_failure_result(engine: str, exc: Exception) -> dict[str, Any]:
     return {
         "engine": engine,
@@ -371,6 +441,23 @@ def _prepare_engine_input(
         )
     provenance["audio"] = prepared.as_dict()
     return prepared.path, provenance
+
+
+def _uses_shared_default_strict_audio(
+    primary_engine: str,
+    secondary_engine: str,
+    config: ModelConfig,
+) -> bool:
+    if (
+        primary_engine != config.strict_primary_engine
+        or secondary_engine != config.strict_secondary_engine
+    ):
+        return False
+    for engine in (primary_engine, secondary_engine):
+        options = get_engine_spec(engine, config=config).options or {}
+        if bool(options.get("requires_pcm16_mono", False)):
+            return False
+    return True
 
 
 def _engine_provenance(engine: str, config: ModelConfig) -> dict[str, Any]:

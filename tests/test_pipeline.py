@@ -1,12 +1,28 @@
+from contextlib import contextmanager
+import os
 import tempfile
 import sys
 import types
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import patch
 
 
 class PipelineTests(unittest.TestCase):
+    def _write_wav(
+        self,
+        path: Path,
+        *,
+        frames: int = 1600,
+        sample_rate: int = 16000,
+    ) -> None:
+        with wave.open(str(path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(sample_rate)
+            handle.writeframes(b"\0" * frames * 2)
+
     def test_funasr_kwargs_use_local_cache_paths_when_available(self):
         from zh_asr.config import get_engine_spec, load_model_config
         from zh_asr.pipeline import _funasr_kwargs
@@ -229,7 +245,7 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             audio = root / "sample.wav"
-            audio.write_bytes(b"fake wav")
+            self._write_wav(audio)
 
             def fake_generate(audio_path, engine, device, cache_dir, config):
                 if engine == "sensevoice":
@@ -269,6 +285,248 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("engine_failure", audit_json["flags"])
             self.assertEqual("sensevoice", secondary_raw["engine"])
             self.assertEqual("TypeError", secondary_raw["error"]["type"])
+            evidence_by_engine = {
+                item["engine"]: item["provenance"]["audio"]
+                for item in audit_json["engine_evidence"]
+            }
+            self.assertEqual(
+                evidence_by_engine["qwen3-asr-1.7b"],
+                evidence_by_engine["sensevoice"],
+            )
+            self.assertTrue(
+                {
+                    "source_sha256",
+                    "derivative_sha256",
+                    "duration_sec",
+                    "sample_rate",
+                    "channels",
+                    "sample_width",
+                    "format",
+                    "converted",
+                }.issubset(evidence_by_engine["qwen3-asr-1.7b"])
+            )
+
+    def test_default_strict_materializes_one_owner_wav_for_both_engines(self):
+        from zh_asr.audio_frontend import prepare_pcm16_mono
+        from zh_asr.pipeline import strict_transcribe_audio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "sample.wav"
+            out_dir = root / "outputs"
+            self._write_wav(audio, frames=3200)
+
+            with (
+                patch(
+                    "zh_asr.pipeline.prepare_pcm16_mono",
+                    wraps=prepare_pcm16_mono,
+                ) as prepare,
+                patch(
+                    "zh_asr.pipeline._generate_once_with_identity",
+                    side_effect=lambda prepared, engine, *_: (
+                        [{"text": engine}],
+                        {},
+                    ),
+                ) as generate,
+                patch("zh_asr.pipeline.write_strict_bundle") as writer,
+            ):
+                writer.return_value = {}
+                strict_transcribe_audio(
+                    audio,
+                    primary_engine="qwen3-asr-1.7b",
+                    secondary_engine="sensevoice",
+                    out_dir=out_dir,
+                )
+
+            self.assertEqual(prepare.call_count, 1)
+            self.assertTrue(prepare.call_args.kwargs["materialize_owner"])
+            prepared_paths = [call.args[0] for call in generate.call_args_list]
+            self.assertEqual(prepared_paths[0], prepared_paths[1])
+            self.assertNotEqual(audio.resolve(), prepared_paths[0])
+            self.assertEqual((out_dir / "_derived").resolve(), prepared_paths[0].parent)
+
+            kwargs = writer.call_args.kwargs
+            primary_audio = kwargs["primary_provenance"]["audio"]
+            secondary_audio = kwargs["secondary_provenance"]["audio"]
+            self.assertEqual(primary_audio, secondary_audio)
+            self.assertEqual(primary_audio["source_sha256"], primary_audio["derivative_sha256"])
+            self.assertEqual(primary_audio["sample_rate"], 16000)
+            self.assertEqual(primary_audio["channels"], 1)
+            self.assertEqual(primary_audio["sample_width"], 2)
+            self.assertEqual(primary_audio["format"], "wav")
+            self.assertFalse(primary_audio["converted"])
+
+    def test_default_strict_converts_one_synthetic_wav_for_both_engines(self):
+        from zh_asr.pipeline import strict_transcribe_audio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "sample-8k.wav"
+            out_dir = root / "outputs"
+            self._write_wav(audio, frames=800, sample_rate=8000)
+
+            def fake_ffmpeg(command, **_kwargs):
+                self._write_wav(Path(command[-1]), frames=1600, sample_rate=16000)
+                return type("Completed", (), {"stdout": "", "stderr": ""})()
+
+            with (
+                patch(
+                    "zh_asr.audio_frontend.subprocess.run",
+                    side_effect=fake_ffmpeg,
+                ) as ffmpeg,
+                patch(
+                    "zh_asr.audio_frontend._ffmpeg_version",
+                    return_value="ffmpeg test",
+                ),
+                patch(
+                    "zh_asr.pipeline._generate_once_with_identity",
+                    side_effect=lambda prepared, engine, *_: (
+                        [{"text": engine}],
+                        {},
+                    ),
+                ) as generate,
+                patch("zh_asr.pipeline.write_strict_bundle") as writer,
+            ):
+                writer.return_value = {}
+                strict_transcribe_audio(
+                    audio,
+                    primary_engine="qwen3-asr-1.7b",
+                    secondary_engine="sensevoice",
+                    out_dir=out_dir,
+                )
+
+            self.assertEqual(ffmpeg.call_count, 1)
+            prepared_paths = [call.args[0] for call in generate.call_args_list]
+            self.assertEqual(prepared_paths[0], prepared_paths[1])
+            primary_audio = writer.call_args.kwargs["primary_provenance"]["audio"]
+            secondary_audio = writer.call_args.kwargs["secondary_provenance"]["audio"]
+            self.assertEqual(primary_audio, secondary_audio)
+            self.assertNotEqual(
+                primary_audio["source_sha256"],
+                primary_audio["derivative_sha256"],
+            )
+            self.assertTrue(primary_audio["converted"])
+            self.assertEqual(primary_audio["sample_rate"], 16000)
+            self.assertEqual(primary_audio["channels"], 1)
+            self.assertEqual(primary_audio["sample_width"], 2)
+            self.assertEqual(primary_audio["format"], "wav")
+
+    def test_default_strict_fails_closed_if_owner_audio_drifts_before_lock(self):
+        from zh_asr.audio_frontend import (
+            PreparedAudioIntegrityError,
+            _locked_prepared_audio_owner,
+        )
+        from zh_asr.pipeline import strict_transcribe_audio
+
+        def tamper(path: Path) -> None:
+            path.write_bytes(b"tampered")
+
+        def remove(path: Path) -> None:
+            path.unlink()
+
+        def duplicate(path: Path) -> None:
+            self._write_wav(path.parent / "unexpected.wav")
+
+        for label, mutate in (
+            ("tamper", tamper),
+            ("missing", remove),
+            ("multiple", duplicate),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                audio = root / "sample.wav"
+                self._write_wav(audio)
+
+                @contextmanager
+                def drift_before_lock(prepared, derived_dir):
+                    mutate(prepared.path)
+                    with _locked_prepared_audio_owner(prepared, derived_dir):
+                        yield
+
+                with (
+                    patch(
+                        "zh_asr.pipeline._locked_prepared_audio_owner",
+                        side_effect=drift_before_lock,
+                    ),
+                    patch(
+                        "zh_asr.pipeline._generate_once_with_identity",
+                    ) as generate,
+                    patch("zh_asr.pipeline.write_strict_bundle") as writer,
+                ):
+                    with self.assertRaises(PreparedAudioIntegrityError):
+                        strict_transcribe_audio(
+                            audio,
+                            primary_engine="qwen3-asr-1.7b",
+                            secondary_engine="sensevoice",
+                            out_dir=root / "outputs",
+                        )
+
+                generate.assert_not_called()
+                writer.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows share-mode lock contract")
+    def test_default_strict_holds_one_read_lock_across_both_engine_reads(self):
+        from zh_asr.audio_frontend import _open_windows_owner_read_lock
+        from zh_asr.pipeline import strict_transcribe_audio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "sample.wav"
+            replacement = root / "replacement.bin"
+            backup = root / "owner-backup.bin"
+            self._write_wav(audio, frames=3200)
+            replacement.write_bytes(b"replacement")
+            observed: list[bytes] = []
+            mutation_succeeded: list[str] = []
+
+            def must_be_blocked(label, operation):
+                try:
+                    operation()
+                except OSError:
+                    return
+                mutation_succeeded.append(label)
+
+            def fake_generate(prepared, engine, *_):
+                observed.append(prepared.read_bytes())
+                if len(observed) == 1:
+                    must_be_blocked(
+                        "write",
+                        lambda: prepared.write_bytes(b"tampered"),
+                    )
+                    must_be_blocked(
+                        "swap",
+                        lambda: os.replace(prepared, backup),
+                    )
+                    must_be_blocked(
+                        "replace",
+                        lambda: os.replace(replacement, prepared),
+                    )
+                    must_be_blocked("delete", prepared.unlink)
+                return [{"text": engine}], {}
+
+            with (
+                patch(
+                    "zh_asr.pipeline._generate_once_with_identity",
+                    side_effect=fake_generate,
+                ),
+                patch(
+                    "zh_asr.audio_frontend._open_windows_owner_read_lock",
+                    wraps=_open_windows_owner_read_lock,
+                ) as open_lock,
+                patch("zh_asr.pipeline.write_strict_bundle") as writer,
+            ):
+                writer.return_value = {}
+                strict_transcribe_audio(
+                    audio,
+                    primary_engine="qwen3-asr-1.7b",
+                    secondary_engine="sensevoice",
+                    out_dir=root / "outputs",
+                )
+
+            self.assertEqual(mutation_succeeded, [])
+            self.assertEqual(open_lock.call_count, 1)
+            self.assertEqual(len(observed), 2)
+            self.assertEqual(observed[0], observed[1])
 
     def test_firered_input_is_normalized_and_rejects_audio_over_model_limit(self):
         from zh_asr.audio_frontend import PreparedAudio

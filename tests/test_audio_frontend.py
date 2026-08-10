@@ -1,3 +1,5 @@
+import hashlib
+import os
 import subprocess
 import tempfile
 import unittest
@@ -39,6 +41,167 @@ class AudioFrontendTests(unittest.TestCase):
         self.assertEqual(prepared.sample_width_bytes, 2)
         self.assertEqual(prepared.source_sha256, prepared.derivative_sha256)
 
+    def test_compliant_pcm_wav_can_be_materialized_as_a_verified_owner_file(self):
+        from zh_asr.audio_frontend import (
+            prepare_pcm16_mono,
+            validate_prepared_audio_owner,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "source.wav"
+            derived_dir = root / "outputs" / "_derived"
+            self._write_wav(audio, frames=3200)
+
+            prepared = prepare_pcm16_mono(
+                audio,
+                derived_dir,
+                materialize_owner=True,
+            )
+            evidence = prepared.as_dict()
+
+            self.assertNotEqual(audio.resolve(), prepared.path)
+            self.assertEqual(derived_dir.resolve(), prepared.path.parent)
+            self.assertTrue(prepared.path.exists())
+            self.assertFalse(prepared.converted)
+            self.assertEqual(prepared.source_sha256, prepared.derivative_sha256)
+            self.assertEqual(evidence["format"], "wav")
+            self.assertEqual(evidence["sample_rate"], 16000)
+            self.assertEqual(evidence["channels"], 1)
+            self.assertEqual(evidence["sample_width"], 2)
+            self.assertEqual(evidence["sample_width_bytes"], 2)
+            self.assertAlmostEqual(evidence["duration_sec"], 0.2)
+            validate_prepared_audio_owner(prepared, derived_dir)
+
+    def test_owner_validation_fails_closed_for_tamper_missing_or_multiple_derivatives(self):
+        from zh_asr.audio_frontend import (
+            PreparedAudioIntegrityError,
+            prepare_pcm16_mono,
+            validate_prepared_audio_owner,
+        )
+
+        def tamper(prepared, _derived_dir):
+            prepared.path.write_bytes(b"tampered")
+
+        def remove(prepared, _derived_dir):
+            prepared.path.unlink()
+
+        def duplicate(_prepared, derived_dir):
+            self._write_wav(derived_dir / "unexpected.wav")
+
+        for label, mutate in (
+            ("tamper", tamper),
+            ("missing", remove),
+            ("multiple", duplicate),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                audio = root / "source.wav"
+                derived_dir = root / "outputs" / "_derived"
+                self._write_wav(audio)
+                prepared = prepare_pcm16_mono(
+                    audio,
+                    derived_dir,
+                    materialize_owner=True,
+                )
+
+                mutate(prepared, derived_dir)
+
+                with self.assertRaises(PreparedAudioIntegrityError):
+                    validate_prepared_audio_owner(prepared, derived_dir)
+
+    def test_owner_materialization_rejects_reparse_directory_chain(self):
+        from zh_asr.audio_frontend import (
+            PreparedAudioIntegrityError,
+            prepare_pcm16_mono,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.wav"
+            outside = root / "outside"
+            linked_out_dir = root / "linked-output"
+            self._write_wav(source)
+            outside.mkdir()
+            try:
+                linked_out_dir.symlink_to(outside, target_is_directory=True)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"directory symlink unavailable: {exc}")
+
+            with self.assertRaises(PreparedAudioIntegrityError):
+                prepare_pcm16_mono(
+                    source,
+                    linked_out_dir / "_derived",
+                    materialize_owner=True,
+                )
+
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_owner_materialization_rejects_preexisting_partial_hardlink(self):
+        from zh_asr.audio_frontend import (
+            PreparedAudioIntegrityError,
+            prepare_pcm16_mono,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.wav"
+            sentinel = root / "sentinel.wav"
+            derived_dir = root / "outputs" / "_derived"
+            derived_dir.mkdir(parents=True)
+            self._write_wav(source, frames=1600)
+            self._write_wav(sentinel, frames=3200)
+            sentinel_bytes = sentinel.read_bytes()
+            source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            partial = derived_dir / (
+                f"source.{source_hash[:16]}.16k-mono.partial.wav"
+            )
+            os.link(sentinel, partial)
+
+            with self.assertRaises(PreparedAudioIntegrityError):
+                prepare_pcm16_mono(
+                    source,
+                    derived_dir,
+                    materialize_owner=True,
+                )
+
+            self.assertEqual(sentinel.read_bytes(), sentinel_bytes)
+            self.assertEqual(partial.stat().st_nlink, 2)
+
+    def test_owner_materialization_rejects_preexisting_partial_reparse(self):
+        from zh_asr.audio_frontend import (
+            PreparedAudioIntegrityError,
+            prepare_pcm16_mono,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.wav"
+            sentinel = root / "sentinel.wav"
+            derived_dir = root / "outputs" / "_derived"
+            derived_dir.mkdir(parents=True)
+            self._write_wav(source, frames=1600)
+            self._write_wav(sentinel, frames=3200)
+            sentinel_bytes = sentinel.read_bytes()
+            source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            partial = derived_dir / (
+                f"source.{source_hash[:16]}.16k-mono.partial.wav"
+            )
+            try:
+                partial.symlink_to(sentinel)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"file symlink unavailable: {exc}")
+
+            with self.assertRaises(PreparedAudioIntegrityError):
+                prepare_pcm16_mono(
+                    source,
+                    derived_dir,
+                    materialize_owner=True,
+                )
+
+            self.assertEqual(sentinel.read_bytes(), sentinel_bytes)
+            self.assertTrue(partial.is_symlink())
+
     def test_noncompliant_input_uses_deterministic_ffmpeg_derivative(self):
         from zh_asr.audio_frontend import prepare_pcm16_mono
 
@@ -69,6 +232,9 @@ class AudioFrontendTests(unittest.TestCase):
             self.assertEqual(first.channels, 1)
             self.assertEqual(first.sample_width_bytes, 2)
             self.assertNotEqual(first.source_sha256, first.derivative_sha256)
+            self.assertNotEqual(source.resolve(), first.path)
+            self.assertEqual(first.as_dict()["format"], "wav")
+            self.assertEqual(first.as_dict()["sample_width"], 2)
             self.assertEqual(run.call_count, 1)
             command = run.call_args.args[0]
             self.assertIn("-ac", command)
