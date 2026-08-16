@@ -72,6 +72,21 @@ engines:
     language: auto
     note: Primary local Chinese lexical verifier; speaker attribution is intentionally disabled.
 
+  fun-asr-nano:
+    adapter: funasr
+    role: gpu_flagship
+    model: FunAudioLLM/Fun-ASR-Nano-2512
+    vad_model: fsmn-vad
+    language: Chinese
+    options:
+      requires_gpu: true
+      runtime: funasr-automodel
+      hub: ms
+      model_revision: 05201c46f1c38592b1567f857c0d56eab3d0d8ef
+      trust_remote_code: true
+      remote_code: ./model.py
+    note: Official FunASR GPU flagship; explicit profile only because it is a heavier LLM-ASR path than the SenseVoice quick default.
+
   paraformer:
     adapter: funasr
     role: baseline

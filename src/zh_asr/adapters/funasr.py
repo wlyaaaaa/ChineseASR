@@ -9,6 +9,14 @@ from zh_asr.config import EngineSpec
 from zh_asr.adapters.base import MissingDependencyError
 
 
+_MODEL_OPTION_KEYS = {
+    "hub",
+    "model_revision",
+    "remote_code",
+    "trust_remote_code",
+}
+
+
 class FunASRAdapter:
     name = "funasr"
 
@@ -54,6 +62,18 @@ def funasr_kwargs(
         kwargs["punc_model"] = resolve_model_ref(spec.punc_model, cache_dir, aliases)
     if spec.spk_model:
         kwargs["spk_model"] = resolve_model_ref(spec.spk_model, cache_dir, aliases)
+    # Only pass the small, documented loader options used by custom FunASR
+    # checkpoints.  Registry metadata such as ``requires_gpu`` and ``runtime``
+    # must not become arbitrary AutoModel kwargs.
+    options = spec.options or {}
+    for key in _MODEL_OPTION_KEYS:
+        if key not in options:
+            continue
+        value = options[key]
+        if key == "trust_remote_code":
+            kwargs[key] = bool(value)
+        elif value is not None and str(value).strip():
+            kwargs[key] = str(value).strip()
     return kwargs
 
 

@@ -1,6 +1,6 @@
 # ChineseASR
 
-`ChineseASR` 是一个本地优先的中文语音转文字项目，目标是把中文录音转成可审计、低幻觉、可复现的文本。它面向 Windows + CUDA 工作站，默认 quick 使用 `SenseVoiceSmall`，strict 使用 `Qwen3-ASR-1.7B + SenseVoiceSmall`。可选的 `FireRedASR2-LLM` 是证据级词汇主引擎，不会因为安装完成而自动取代默认 strict 组合。
+`ChineseASR` 是一个本地优先的中文语音转文字项目，目标是把中文录音转成可审计、低幻觉、可复现的文本。它面向 Windows + CUDA 工作站，默认 quick 使用 `SenseVoiceSmall`，strict 使用 `Qwen3-ASR-1.7B + SenseVoiceSmall`。FunASR 官方 GPU flagship `Fun-ASR-Nano-2512` 已作为显式 `fun-asr-nano` profile 提供，但不会因为安装完成而改变 quick 默认；可选的 `FireRedASR2-LLM` 是证据级词汇主引擎，也不会自动取代默认 strict 组合。
 
 这个项目优先解决三件事：
 
@@ -45,6 +45,7 @@
 | `strict` 主引擎 | `qwen3-asr-1.7b` | 准确率优先的中文主转写线，基于 Qwen3-ASR 权重和 `qwen-asr` runtime |
 | `strict` 对照引擎 | `sensevoice` | 快速中文声学锚点，用于发现分歧和疑似幻觉 |
 | `quick` | `sensevoice` | 单模型快速转写 |
+| 显式 GPU flagship | `fun-asr-nano` | `FunAudioLLM/Fun-ASR-Nano-2512`；需要 GPU，作为较重的 LLM-ASR 候选，不改变 quick 默认 |
 | 可选证据级词汇主引擎 | `fireredasr2-llm` | 隔离在 WSL 中运行；仅在显式选择时作为 strict 主引擎 |
 | 重要录音专业云入口 | `qwen-audio-3.0-asr-flash` | 仅由独立脚本显式调用；Key 经 Password Center SecretRef 注入，普通模式无法触发 |
 | baseline | `paraformer` | 保守普通话基线，可用于回归对照 |
@@ -82,6 +83,9 @@ cd <repo-root>
 # 快速单模型，只在明确接受较少审计时使用
 .\scripts\asr-smart.ps1 -Audio C:\path\to\audio.wav -Mode quick -WaitSec 15 -Json
 
+# 显式使用 FunASR GPU flagship；不会改变 quick 默认
+.\scripts\asr-smart.ps1 -Audio C:\path\to\audio.wav -Mode quick -Engine fun-asr-nano -Device cuda:0 -WaitSec 15 -Json
+
 # 批量转写文件夹
 .\scripts\transcribe-folder.ps1 -InputDir C:\path\to\audio-folder
 ```
@@ -100,9 +104,11 @@ cd <repo-root>
 
 ## 重要录音专业云入口
 
-`scripts\asr-professional-cloud.ps1` 是唯一的云上传入口，固定调用阿里云百炼
-`qwen-audio-3.0-asr-flash`。它与 `quick`、`strict`、`long-strict` 隔离，普通调用、
-批量文件夹和仅因录音较长都不会触发云端。
+`scripts\asr-professional-cloud.ps1` 是唯一的云上传入口，当前 worker 固定调用阿里云百炼
+`qwen-audio-3.0-asr-flash` 同步接口。它与 `quick`、`strict`、`long-strict` 隔离，普通调用、
+批量文件夹和仅因录音较长都不会触发云端。阿里云当前对非实时长文件/说话人分离推荐
+`qwen-audio-3.0-asr-flash-filetrans`，但该接口要求公网可访问的文件 URL；本项目坚持本地音频边界，
+因此尚未把它接入本地 worker。现有入口会在本机切片后调用同步模型。
 
 入口在创建任务和读取音频前依次要求：
 
@@ -125,11 +131,22 @@ API Key 只由 Secret Broker 注入固定、哈希绑定的子进程环境，不
 .\scripts\setup-core.ps1
 ```
 
+核心依赖文件 `requirements-core.txt` 固定 `funasr==1.4.2`。Fun-ASR-Nano 是面向 GPU 的较重模型，先完成 CUDA/PyTorch 与核心依赖安装，再按需下载；不需要 Nano 的机器无需额外安装模型。
+
 下载 quick / secondary 默认需要的 SenseVoice：
 
 ```powershell
 .\scripts\download-models.ps1 -Engine sensevoice
 ```
+
+按需下载官方 GPU flagship `Fun-ASR-Nano-2512`：
+
+```powershell
+.\scripts\download-models.ps1 -Engine fun-asr-nano
+```
+
+该命令只准备显式 profile 的模型，不会把它设为默认 quick 引擎；profile 固定 ModelScope revision
+`05201c46f1c38592b1567f857c0d56eab3d0d8ef` 并启用官方 `trust_remote_code` 加载路径。没有可用 CUDA GPU 时继续使用 `sensevoice`。
 
 strict 主线需要 Qwen ASR runtime 和权重：
 

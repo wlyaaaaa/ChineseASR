@@ -64,6 +64,25 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(kwargs["vad_model"], str(cache / "iic/custom-vad"))
 
+    def test_funasr_kwargs_pass_only_documented_custom_model_options(self):
+        from zh_asr.config import get_engine_spec, load_model_config
+        from zh_asr.adapters.funasr import funasr_kwargs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            kwargs = funasr_kwargs(
+                get_engine_spec("fun-asr-nano"),
+                "cuda:0",
+                Path(tmp),
+                load_model_config().model_aliases,
+            )
+
+        self.assertEqual(kwargs["hub"], "ms")
+        self.assertEqual(kwargs["model_revision"], "05201c46f1c38592b1567f857c0d56eab3d0d8ef")
+        self.assertTrue(kwargs["trust_remote_code"])
+        self.assertEqual(kwargs["remote_code"], "./model.py")
+        self.assertNotIn("requires_gpu", kwargs)
+        self.assertNotIn("runtime", kwargs)
+
     def test_build_model_passes_resolved_cache_paths_to_automodel(self):
         from zh_asr.pipeline import build_model
 

@@ -23,6 +23,21 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(spec.spk_model)
         self.assertFalse(spec.is_whisper)
 
+    def test_fun_asr_nano_is_an_explicit_gpu_flagship_profile(self):
+        from zh_asr.config import get_engine_spec
+
+        spec = get_engine_spec("fun-asr-nano")
+
+        self.assertEqual(spec.adapter, "funasr")
+        self.assertEqual(spec.role, "gpu_flagship")
+        self.assertEqual(spec.model, "FunAudioLLM/Fun-ASR-Nano-2512")
+        self.assertEqual(spec.vad_model, "fsmn-vad")
+        self.assertEqual(spec.language, "Chinese")
+        self.assertTrue(spec.options["requires_gpu"])
+        self.assertEqual(spec.options["runtime"], "funasr-automodel")
+        self.assertEqual(spec.options["model_revision"], "05201c46f1c38592b1567f857c0d56eab3d0d8ef")
+        self.assertTrue(spec.options["trust_remote_code"])
+
     def test_whisper_is_marked_as_fallback_only(self):
         from zh_asr.config import get_engine_spec
 
@@ -46,6 +61,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.strict_primary_engine, "qwen3-asr-1.7b")
         self.assertEqual(config.strict_secondary_engine, "sensevoice")
         self.assertIn("speech_fsmn_vad_zh-cn-16k-common-pytorch", config.model_aliases["fsmn-vad"])
+
+    def test_core_requirements_pin_funasr_142(self):
+        requirements = (PROJECT_ROOT / "requirements-core.txt").read_text(encoding="utf-8").splitlines()
+
+        self.assertIn("funasr==1.4.2", requirements)
 
     def test_llm_arbitration_defaults_to_disabled_ollama_with_keep_alive_zero(self):
         import yaml
