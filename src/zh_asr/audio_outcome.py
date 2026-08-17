@@ -783,6 +783,9 @@ def aggregate_objective_result(
                     "idempotency_key": child.get("idempotency_key"),
                     "raw_artifacts": child.get("raw_artifacts", []),
                     "detection": child.get("detection", {}),
+                    "detection_global": child.get("detection_global", child.get("detection", {})),
+                    "chunk_interval_ms": child.get("chunk_interval_ms"),
+                    "chunk_local_coverage": child.get("chunk_local_coverage"),
                     "coverage": (child.get("audio") or {}).get("coverage", {})
                     if isinstance(child.get("audio"), Mapping)
                     else {},

@@ -176,6 +176,38 @@ class LongAudioTests(unittest.TestCase):
         self.assertIn("chunk-000002 Strict Audit", audit)
         self.assertTrue(metrics_exists)
 
+    def test_long_objective_aggregate_projects_chunk_local_coverage_to_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "silence.wav"
+            out_dir = root / "out"
+            _write_wav(audio, seconds=7)
+
+            def fake_empty_strict(audio_path, **kwargs):
+                return write_strict_bundle(
+                    audio_path,
+                    kwargs["primary_engine"],
+                    {"text": ""},
+                    kwargs["secondary_engine"],
+                    {"text": ""},
+                    kwargs["out_dir"],
+                )
+
+            summary = run_long_transcription(
+                audio,
+                out_dir,
+                chunk_sec=3,
+                overlap_sec=1,
+                strict_fn=fake_empty_strict,
+            )
+            objective = json.loads((out_dir / "objective-result.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("no_speech_detected", summary.objective_outcome)
+        self.assertEqual("no_speech_detected", objective["objective_outcome"])
+        self.assertEqual("complete", objective["coverage"]["status"])
+        self.assertGreater(objective["audio"]["coverage"]["overlap_ms"], 0)
+        self.assertTrue(objective["negative_evidence"]["artifact"]["children"])
+
     def test_run_long_transcription_default_batches_pending_chunks_and_preserves_resume_force(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

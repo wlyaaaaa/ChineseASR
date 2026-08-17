@@ -394,6 +394,7 @@ def run_long_transcription(
             }
         child = dict(child)
         child["chunk_id"] = state.spec.chunk_id
+        child = _globalize_chunk_objective(child, state.spec)
         objective_children.append(child)
     objective_result = aggregate_objective_result(
         audio_path=audio_path,
@@ -711,6 +712,74 @@ def _load_chunk_objective(state: ChunkState) -> dict[str, Any] | None:
         return None
     state.objective_outcome = str(payload.get("objective_outcome") or "indeterminate")
     return payload
+
+
+def _globalize_chunk_objective(
+    payload: Mapping[str, Any],
+    spec: ChunkSpec,
+) -> dict[str, Any]:
+    """Project a chunk-local sidecar interval into source-audio coordinates.
+
+    Each strict chunk is its own WAV and therefore correctly records coverage
+    from zero.  The root long sidecar must reason in source coordinates so an
+    intentional overlap is not mistaken for repeated coverage of the first
+    chunk only.
+    """
+
+    child = dict(payload)
+    audio = child.get("audio")
+    if not isinstance(audio, Mapping):
+        return child
+    local_coverage = audio.get("coverage")
+    if not isinstance(local_coverage, Mapping):
+        return child
+    local_start = local_coverage.get("start_ms")
+    local_end = local_coverage.get("end_ms")
+    if not isinstance(local_start, (int, float)) or not isinstance(local_end, (int, float)):
+        return child
+    chunk_duration = float(spec.end_ms - spec.start_ms)
+    is_local = (
+        abs(float(local_start)) <= 1.0
+        and float(local_end) <= chunk_duration + 1.0
+        and (spec.start_ms != 0 or abs(float(local_end) - chunk_duration) > 1.0)
+    )
+    if not is_local:
+        return child
+
+    global_coverage = dict(local_coverage)
+    global_coverage["start_ms"] = float(local_start) + spec.start_ms
+    global_coverage["end_ms"] = float(local_end) + spec.start_ms
+    intervals = local_coverage.get("intervals_ms")
+    if isinstance(intervals, list):
+        global_coverage["intervals_ms"] = [
+            [float(item[0]) + spec.start_ms, float(item[1]) + spec.start_ms]
+            for item in intervals
+            if isinstance(item, (list, tuple))
+            and len(item) >= 2
+            and isinstance(item[0], (int, float))
+            and isinstance(item[1], (int, float))
+        ]
+    child["chunk_interval_ms"] = [spec.start_ms, spec.end_ms]
+    child["chunk_local_coverage"] = dict(local_coverage)
+    child["audio"] = {**dict(audio), "coverage": global_coverage}
+
+    detection = child.get("detection")
+    if isinstance(detection, Mapping):
+        segments = detection.get("segments")
+        if isinstance(segments, list):
+            global_segments = [
+                [float(item[0]) + spec.start_ms, float(item[1]) + spec.start_ms]
+                for item in segments
+                if isinstance(item, (list, tuple))
+                and len(item) >= 2
+                and isinstance(item[0], (int, float))
+                and isinstance(item[1], (int, float))
+            ]
+            child["detection_global"] = {
+                **dict(detection),
+                "segments": global_segments,
+            }
+    return child
 
 
 def _mark_chunk_failed(state: ChunkState, error: str) -> None:
