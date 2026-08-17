@@ -18,10 +18,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .audit import validate_strict_artifact_bundle
+from .audio_outcome import load_objective_result
 from .gpu_broker import (
     GPU_BROKER_CHILD_TOKEN_ENV,
     GpuBrokerConflict,
@@ -232,6 +233,8 @@ class Job:
     outputs: dict[str, str] = field(default_factory=dict)
     evidence_status: str = "pending"
     evidence_failures: list[dict[str, str]] = field(default_factory=list)
+    objective_outcome: str = "indeterminate"
+    objective_execution_status: str = "pending"
     conflicts: list[GpuProcess] = field(default_factory=list)
     gpu_broker_token: str = field(default="", repr=False)
     gpu_broker_loss_error: str = field(default="", repr=False)
@@ -256,6 +259,9 @@ class Job:
             "outputs": self.outputs,
             "evidence_status": self.evidence_status,
             "evidence_failures": self.evidence_failures,
+            "objective_outcome": self.objective_outcome,
+            "audio_result_status": self.objective_outcome,
+            "objective_execution_status": self.objective_execution_status,
             "conflicts": [conflict.to_dict() for conflict in self.conflicts],
         }
 
@@ -508,6 +514,10 @@ class TranscriptionService:
                     primary_engine=job.request.resolved_primary_engine or job.request.primary_engine,
                     secondary_engine=job.request.resolved_secondary_engine or job.request.secondary_engine,
                 )
+                (
+                    job.objective_outcome,
+                    job.objective_execution_status,
+                ) = _objective_from_job_outputs(job.outputs, job.request.mode)
                 job.status = "succeeded" if result.returncode == 0 else "failed"
                 if result.returncode == 0:
                     (
@@ -790,6 +800,7 @@ def _collect_outputs(
             "audit": "audit.md",
             "metrics": "metrics.json",
             "manifest": "manifest.json",
+            "objective_result": "objective-result.json",
         }.items():
             path = out_dir / name
             if path.exists():
@@ -801,6 +812,7 @@ def _collect_outputs(
             "audit_json": "*.strict.audit.json",
             "review_json": "*.strict.review.json",
             "receipt": "*.strict.receipt.json",
+            "objective_result": "*.objective-result.json",
         }
         for key, pattern in mapping.items():
             matches = sorted(out_dir.glob(pattern))
@@ -826,10 +838,15 @@ def _collect_outputs(
         json_matches = sorted(out_dir.glob("*.raw.json"))
         if json_matches:
             outputs["raw_json"] = str(json_matches[0])
+        objective_matches = sorted(out_dir.glob("*.objective-result.json"))
+        if objective_matches:
+            outputs["objective_result"] = str(objective_matches[0])
     return outputs
 
 
 def _mark_job_evidence_unavailable(job: Job, error: str) -> None:
+    job.objective_outcome = "indeterminate"
+    job.objective_execution_status = "failed"
     if job.request.mode == "quick":
         job.evidence_status = "not_applicable"
         job.evidence_failures = []
@@ -852,6 +869,28 @@ def _evidence_from_job_outputs(job: Job) -> tuple[str, list[dict[str, str]]]:
             job.request.resolved_secondary_engine or job.request.secondary_engine
         ),
     )
+
+
+def _objective_from_job_outputs(
+    outputs: Mapping[str, str],
+    mode: str,
+) -> tuple[str, str]:
+    payload = load_objective_result(outputs.get("objective_result"))
+    if not isinstance(payload, dict):
+        return "indeterminate", "failed"
+    outcome = str(payload.get("objective_outcome") or "indeterminate")
+    execution = payload.get("execution")
+    declared_execution_status = (
+        str(execution.get("status") or "unknown")
+        if isinstance(execution, dict)
+        else "failed"
+    )
+    execution_status = (
+        declared_execution_status
+        if declared_execution_status in {"completed", "failed", "unsupported", "corrupt"}
+        else "failed"
+    )
+    return outcome, execution_status
 
 
 def _long_manifest_evidence(

@@ -167,6 +167,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"Markdown: {paths['markdown']}")
             print(f"Raw JSON: {paths['json']}")
+            print(f"Objective: {paths.get('objective_outcome', 'indeterminate')}")
+            if paths.get("objective_result"):
+                print(f"Objective result: {paths['objective_result']}")
             return 0
         if args.command == "strict":
             paths = _run_with_gpu_lease(
@@ -186,6 +189,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Audit JSON: {paths['audit_json']}")
             print(f"Primary raw JSON: {paths['primary_json']}")
             print(f"Secondary raw JSON: {paths['secondary_json']}")
+            print(f"Objective: {paths.get('objective_outcome', 'indeterminate')}")
+            if paths.get("objective_result"):
+                print(f"Objective result: {paths['objective_result']}")
             return 0
         if args.command == "long":
             arbiter = make_arbiter(load_arbitration_config(model_config.path))
@@ -208,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Audit: {summary.audit_path}")
             print(f"Metrics: {summary.metrics_path}")
             print(f"Manifest: {summary.manifest_path}")
+            print(f"Objective: {summary.objective_outcome}")
             print(
                 f"Total: {summary.total}; "
                 f"Processed: {summary.processed}; "

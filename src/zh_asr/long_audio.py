@@ -7,10 +7,16 @@ import wave
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Any
+from typing import Callable, Any, Mapping
 
 from .arbitration import ArbitrationEvidence
 from .audit import validate_strict_artifact_bundle
+from .audio_outcome import (
+    aggregate_objective_result,
+    load_objective_result,
+    validate_objective_result,
+    write_objective_result,
+)
 from .audio_frontend import PreparedAudio, prepare_pcm16_mono
 from .config import load_model_config
 from .metadata import file_metadata, sha256_file
@@ -44,6 +50,7 @@ class ChunkState:
     outputs: dict[str, str] = field(default_factory=dict)
     error: str = ""
     arbitration: dict[str, Any] | None = None
+    objective_outcome: str = "indeterminate"
 
     def to_dict(self) -> dict[str, Any]:
         payload = self.spec.to_dict()
@@ -55,6 +62,7 @@ class ChunkState:
                 "outputs": self.outputs,
                 "error": self.error,
                 "arbitration": self.arbitration,
+                "objective_outcome": self.objective_outcome,
             }
         )
         return payload
@@ -72,6 +80,7 @@ class LongRunSummary:
     skipped: int
     failed: int
     evidence_status: str
+    objective_outcome: str = "indeterminate"
 
 
 StrictFn = Callable[..., dict[str, Any]]
@@ -138,6 +147,7 @@ def run_long_transcription(
     force: bool = False,
     strict_fn: StrictFn | None = None,
     arbiter=None,
+    caller_binding: Mapping[str, Any] | None = None,
 ) -> LongRunSummary:
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -283,6 +293,7 @@ def run_long_transcription(
                             for key, path in outputs.items()
                             if isinstance(path, Path)
                         }
+                        _load_chunk_objective(state)
                         (
                             state.evidence_status,
                             state.evidence_failures,
@@ -331,6 +342,7 @@ def run_long_transcription(
                     for key, path in outputs.items()
                     if isinstance(path, Path)
                 }
+                _load_chunk_objective(state)
                 (
                     state.evidence_status,
                     state.evidence_failures,
@@ -355,6 +367,62 @@ def run_long_transcription(
     _write_merged_audit(audit_path, audio_path, states)
     _write_metrics(metrics_path, audio_path, states, processed, skipped, failed)
 
+    objective_children = []
+    for state in states:
+        child = load_objective_result(state.outputs.get("objective_result"))
+        if not isinstance(child, dict):
+            child = {
+                "schema": "media.objective-result.v1",
+                "objective_outcome": "indeterminate",
+                "media_kind": "audio",
+                "execution": {"status": "failed" if state.status != "succeeded" else "completed"},
+                "coverage": {"status": "partial"},
+                "quality": {"status": "unknown"},
+                "execution_status": "engine_failure" if state.status != "succeeded" else "succeeded",
+                "coverage_status": "partial_coverage",
+                "quality_status": "unknown",
+                "chunk_id": state.spec.chunk_id,
+                "idempotency_key": "",
+                "audio": {
+                    "coverage": {
+                        "start_ms": state.spec.start_ms,
+                        "end_ms": state.spec.end_ms,
+                        "excluded_ranges_ms": [],
+                        "complete": False,
+                    }
+                },
+            }
+        child = dict(child)
+        child["chunk_id"] = state.spec.chunk_id
+        objective_children.append(child)
+    objective_result = aggregate_objective_result(
+        audio_path=audio_path,
+        mode="long-strict",
+        engines=[resolved_primary_engine, resolved_secondary_engine],
+        children=objective_children,
+        request={
+            "requested_chunk_sec": chunk_sec,
+            "effective_chunk_sec": effective_chunk_sec,
+            "overlap_sec": overlap_sec,
+            "duration_ms": round(prepared_audio.duration_sec * 1000),
+            "run_fingerprint": run_fingerprint,
+        },
+        caller_binding=caller_binding,
+    )
+    objective_path = out_dir / "objective-result.json"
+    write_objective_result(objective_path, objective_result)
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_payload["objective_outcome"] = objective_result["objective_outcome"]
+    manifest_payload["objective_result_reference"] = objective_path.name
+    _write_manifest(manifest_path, manifest_payload)
+    metrics_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics_payload["objective_outcome"] = objective_result["objective_outcome"]
+    metrics_payload["objective_result_reference"] = objective_path.name
+    metrics_path.write_text(
+        json.dumps(metrics_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
     return LongRunSummary(
         out_dir=out_dir,
         manifest_path=manifest_path,
@@ -366,6 +434,7 @@ def run_long_transcription(
         skipped=skipped,
         failed=failed,
         evidence_status=_aggregate_evidence_status(states),
+        objective_outcome=str(objective_result["objective_outcome"]),
     )
 
 
@@ -615,6 +684,7 @@ def _build_states(
                     outputs=outputs,
                     error=str(saved.get("error") or ""),
                     arbitration=saved.get("arbitration"),
+                    objective_outcome=str(saved.get("objective_outcome") or "indeterminate"),
                 )
             )
         else:
@@ -632,6 +702,15 @@ def _strict_outputs_evidence(
         expected_primary_engine=primary_engine,
         expected_secondary_engine=secondary_engine,
     )
+
+
+def _load_chunk_objective(state: ChunkState) -> dict[str, Any] | None:
+    payload = load_objective_result(state.outputs.get("objective_result"))
+    if not isinstance(payload, dict):
+        state.objective_outcome = "indeterminate"
+        return None
+    state.objective_outcome = str(payload.get("objective_outcome") or "indeterminate")
+    return payload
 
 
 def _mark_chunk_failed(state: ChunkState, error: str) -> None:
@@ -719,6 +798,14 @@ def _can_skip(
         state.status = "stale"
         state.error = "Persisted strict evidence failed fresh bundle verification"
         return False
+    objective_payload = load_objective_result(state.outputs.get("objective_result"))
+    objective_failures = validate_objective_result(objective_payload)
+    if objective_failures:
+        state.status = "stale"
+        state.error = "Persisted objective result failed sidecar verification"
+        state.objective_outcome = "indeterminate"
+        return False
+    state.objective_outcome = str(objective_payload.get("objective_outcome") or "indeterminate")
     return not any(
         failure.get("kind") == "artifact_failure"
         for failure in evidence_failures

@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from .audio_outcome import build_objective_result, write_objective_result
 from .audit import (
     STRICT_BUNDLE_ARTIFACT_KEYS,
     STRICT_BUNDLE_RECEIPT_SCHEMA_VERSION,
@@ -35,11 +36,31 @@ def write_strict_bundle(
     secondary_role: str = "lexical_verifier",
     primary_provenance: Mapping[str, Any] | None = None,
     secondary_provenance: Mapping[str, Any] | None = None,
+    caller_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = audio_path.stem
     primary_text = extract_text(primary_result)
     secondary_text = extract_text(secondary_result)
+    objective_path = out_dir / f"{stem}.objective-result.json"
+    objective = build_objective_result(
+        audio_path=audio_path,
+        mode="strict",
+        engines=[primary_engine, secondary_engine],
+        primary_text=primary_text,
+        secondary_text=secondary_text,
+        primary_result=primary_result,
+        secondary_result=secondary_result,
+        primary_error=primary_error,
+        secondary_error=secondary_error,
+        primary_provenance=primary_provenance,
+        secondary_provenance=secondary_provenance,
+        request={
+            "primary_engine": primary_engine,
+            "secondary_engine": secondary_engine,
+        },
+        caller_binding=caller_binding,
+    )
 
     final_path = out_dir / f"{stem}.strict.md"
     audit_path = out_dir / f"{stem}.strict.audit.md"
@@ -65,6 +86,10 @@ def write_strict_bundle(
         secondary_raw_result_reference=secondary_json_path.name,
         primary_provenance=primary_provenance,
         secondary_provenance=secondary_provenance,
+        objective_outcome=str(objective["objective_outcome"]),
+        objective_confidence=str(objective.get("confidence") or "unknown"),
+        objective_reason=str(objective.get("reason") or ""),
+        objective_result_reference=objective_path.name,
     )
 
     primary_json_path.write_text(
@@ -117,6 +142,49 @@ def write_strict_bundle(
         ),
         encoding="utf-8",
     )
+    objective = build_objective_result(
+        audio_path=audio_path,
+        mode="strict",
+        engines=[primary_engine, secondary_engine],
+        primary_text=primary_text,
+        secondary_text=secondary_text,
+        primary_result=primary_result,
+        secondary_result=secondary_result,
+        primary_error=primary_error,
+        secondary_error=secondary_error,
+        primary_provenance=primary_provenance,
+        secondary_provenance=secondary_provenance,
+        raw_artifacts=[
+            {
+                "schema": "media.raw-artifact-ref.v1",
+                "role": "lexical_primary",
+                "engine": primary_engine,
+                "path": primary_json_path.name,
+                "size_bytes": primary_json_path.stat().st_size,
+                "sha256": file_sha256(primary_json_path),
+            },
+            {
+                "schema": "media.raw-artifact-ref.v1",
+                "role": "lexical_verifier",
+                "engine": secondary_engine,
+                "path": secondary_json_path.name,
+                "size_bytes": secondary_json_path.stat().st_size,
+                "sha256": file_sha256(secondary_json_path),
+            },
+        ],
+        strict_receipt={
+            "schema": "media.strict-receipt-ref.v1",
+            "path": receipt_path.name,
+            "size_bytes": receipt_path.stat().st_size,
+            "sha256": file_sha256(receipt_path),
+        },
+        request={
+            "primary_engine": primary_engine,
+            "secondary_engine": secondary_engine,
+        },
+        caller_binding=caller_binding,
+    )
+    write_objective_result(objective_path, objective)
     evidence_status, evidence_failures = validate_strict_artifact_bundle(
         {
             **artifact_paths,
@@ -128,6 +196,9 @@ def write_strict_bundle(
     return {
         **artifact_paths,
         "receipt": receipt_path,
+        "objective_result": objective_path,
+        "objective_outcome": objective["objective_outcome"],
+        "audio_result_status": objective["objective_outcome"],
         "evidence_status": evidence_status,
         "evidence_failures": evidence_failures,
     }
@@ -147,6 +218,8 @@ def _format_final_markdown(
             f"- Secondary: `{report.secondary_engine}`",
             f"- Status: `{report.status}`",
             f"- Evidence status: `{report.evidence_status}`",
+            f"- Objective outcome: `{report.objective_outcome}`",
+            f"- Objective result: `{report.objective_result_reference or 'not_recorded'}`",
             f"- Bundle receipt: `{receipt_path.name}`",
             f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`",
             "",
@@ -200,6 +273,8 @@ def _format_audit_markdown(
             f"- Audio: `{audio_path}`",
             f"- Status: `{report.status}`",
             f"- Evidence status: `{report.evidence_status}`",
+            f"- Objective outcome: `{report.objective_outcome}`",
+            f"- Objective confidence: `{report.objective_confidence}`",
             f"- Needs review: `{str(report.needs_review).lower()}`",
             f"- Similarity: `{report.similarity:.3f}`",
             f"- Flags: `{flags}`",
@@ -261,6 +336,10 @@ def _review_payload(
         "status": report.status,
         "evidence_status": report.evidence_status,
         "evidence_status_rationale": report.evidence_status_rationale,
+        "objective_outcome": report.objective_outcome,
+        "objective_confidence": report.objective_confidence,
+        "objective_reason": report.objective_reason,
+        "objective_result_reference": report.objective_result_reference,
         "final_text": report.final_text,
         "primary_text": report.primary_text,
         "secondary_text": report.secondary_text,
@@ -299,6 +378,7 @@ def _strict_bundle_receipt(
     claims = {
         "status": report.status,
         "evidence_status": report.evidence_status,
+        "objective_outcome": report.objective_outcome,
         "final_text_sha256": text_sha256(report.final_text),
         "engine_evidence": engine_claims,
     }

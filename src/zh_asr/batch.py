@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from .audio_outcome import load_objective_result, validate_objective_result
 from .config import ModelConfig, load_model_config
 from .pipeline import strict_transcribe_audio, transcribe_audio
 
@@ -20,6 +21,7 @@ class BatchItem:
     out_dir: Path
     status: str
     message: str = ""
+    objective_outcome: str = "indeterminate"
 
 
 @dataclass(frozen=True)
@@ -83,13 +85,22 @@ def run_batch(
         expected = _expected_output_path(item_dir, audio_path, mode_key, quick_engine)
 
         if expected.exists() and not force:
-            items.append(BatchItem(audio=audio_path, out_dir=item_dir, status="skipped", message="already complete"))
+            objective_outcome = _read_objective_outcome(item_dir, audio_path)
+            items.append(
+                BatchItem(
+                    audio=audio_path,
+                    out_dir=item_dir,
+                    status="skipped",
+                    message="already complete",
+                    objective_outcome=objective_outcome,
+                )
+            )
             continue
 
         item_dir.mkdir(parents=True, exist_ok=True)
         try:
             if mode_key == "strict":
-                strict_fn(
+                outputs = strict_fn(
                     audio_path,
                     primary_engine=strict_primary,
                     secondary_engine=strict_secondary,
@@ -99,7 +110,7 @@ def run_batch(
                     config=model_config,
                 )
             else:
-                transcribe_fn(
+                outputs = transcribe_fn(
                     audio_path,
                     engine=quick_engine,
                     device=device,
@@ -107,9 +118,24 @@ def run_batch(
                     cache_dir=cache_dir,
                     config=model_config,
                 )
-            items.append(BatchItem(audio=audio_path, out_dir=item_dir, status="processed"))
+            items.append(
+                BatchItem(
+                    audio=audio_path,
+                    out_dir=item_dir,
+                    status="processed",
+                    objective_outcome=_result_objective_outcome(outputs, item_dir, audio_path),
+                )
+            )
         except Exception as exc:
-            items.append(BatchItem(audio=audio_path, out_dir=item_dir, status="failed", message=str(exc)))
+            items.append(
+                BatchItem(
+                    audio=audio_path,
+                    out_dir=item_dir,
+                    status="failed",
+                    message=str(exc),
+                    objective_outcome="indeterminate",
+                )
+            )
             _append_failure(failed_path, audio_path, item_dir, exc)
 
     summary = BatchSummary(
@@ -172,6 +198,25 @@ def _write_summary(path: Path, summary: BatchSummary) -> None:
     else:
         for item in summary.items:
             suffix = f" - {item.message}" if item.message else ""
+            suffix += f"; objective={item.objective_outcome}"
             lines.append(f"- `{item.status}` `{item.audio}` -> `{item.out_dir}`{suffix}")
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _read_objective_outcome(item_dir: Path, audio_path: Path) -> str:
+    matches = sorted(item_dir.glob("*.objective-result.json"))
+    if not matches:
+        return "indeterminate"
+    payload = load_objective_result(matches[0])
+    if validate_objective_result(payload):
+        return "indeterminate"
+    return str(payload.get("objective_outcome") or "indeterminate")
+
+
+def _result_objective_outcome(outputs: object, item_dir: Path, audio_path: Path) -> str:
+    if isinstance(outputs, dict):
+        direct = outputs.get("objective_outcome") or outputs.get("audio_result_status")
+        if direct:
+            return str(direct)
+    return _read_objective_outcome(item_dir, audio_path)

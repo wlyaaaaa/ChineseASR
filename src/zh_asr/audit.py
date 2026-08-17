@@ -7,6 +7,12 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .audio_outcome import (
+    classify_objective_outcome,
+    file_sha256 as objective_file_sha256,
+    load_objective_result,
+    validate_objective_result,
+)
 from .result_writer import (
     TranscriptSegment,
     canonical_json_sha256,
@@ -93,6 +99,10 @@ class AuditReport:
     engine_evidence: tuple[EngineEvidence, ...] = ()
     disagreements: tuple[Disagreement, ...] = ()
     review_items: tuple[ReviewItem, ...] = ()
+    objective_outcome: str = "indeterminate"
+    objective_confidence: str = "unknown"
+    objective_reason: str = ""
+    objective_result_reference: str = ""
 
 
 def build_audit_report(
@@ -112,6 +122,10 @@ def build_audit_report(
     secondary_raw_result_reference: str = "",
     primary_provenance: Mapping[str, Any] | None = None,
     secondary_provenance: Mapping[str, Any] | None = None,
+    objective_outcome: str | None = None,
+    objective_confidence: str = "unknown",
+    objective_reason: str = "",
+    objective_result_reference: str = "",
 ) -> AuditReport:
     primary = to_simplified(primary_text.strip())
     secondary = to_simplified(secondary_text.strip())
@@ -148,6 +162,22 @@ def build_audit_report(
         conflict_threshold,
     )
     error_hits = _engine_error_hits(primary_engine, primary_error, secondary_engine, secondary_error)
+    objective = classify_objective_outcome(
+        primary_text=primary,
+        secondary_text=secondary,
+        primary_error=primary_error,
+        secondary_error=secondary_error,
+    )
+    objective_fields = {
+        "objective_outcome": objective_outcome or str(objective["objective_outcome"]),
+        "objective_confidence": objective_confidence
+        if objective_outcome is not None
+        else str(objective.get("confidence") or "unknown"),
+        "objective_reason": objective_reason
+        if objective_outcome is not None
+        else str(objective.get("reason") or ""),
+        "objective_result_reference": objective_result_reference,
+    }
 
     if error_hits:
         chosen = primary or secondary
@@ -186,6 +216,7 @@ def build_audit_report(
             engine_evidence=engine_evidence,
             disagreements=disagreements,
             review_items=_build_review_items(disagreements, rule_hits),
+            **objective_fields,
         )
 
     if not primary_norm and not secondary_norm:
@@ -218,6 +249,7 @@ def build_audit_report(
             engine_evidence=engine_evidence,
             disagreements=disagreements,
             review_items=_build_review_items(disagreements, rule_hits),
+            **objective_fields,
         )
 
     chosen = primary or secondary
@@ -253,6 +285,7 @@ def build_audit_report(
             engine_evidence=engine_evidence,
             disagreements=disagreements,
             review_items=_build_review_items(disagreements, rule_hits),
+            **objective_fields,
         )
 
     if rule_hits:
@@ -277,6 +310,7 @@ def build_audit_report(
             engine_evidence=engine_evidence,
             disagreements=disagreements,
             review_items=_build_review_items(disagreements, rule_hits),
+            **objective_fields,
         )
 
     if primary_norm == secondary_norm:
@@ -301,6 +335,7 @@ def build_audit_report(
             engine_evidence=engine_evidence,
             disagreements=disagreements,
             review_items=(),
+            **objective_fields,
         )
 
     if similarity >= conflict_threshold:
@@ -325,6 +360,7 @@ def build_audit_report(
             engine_evidence=engine_evidence,
             disagreements=disagreements,
             review_items=_build_review_items(disagreements, ()),
+            **objective_fields,
         )
 
     conflict_hit = RuleHit(
@@ -354,6 +390,7 @@ def build_audit_report(
         engine_evidence=engine_evidence,
         disagreements=disagreements,
         review_items=_build_review_items(disagreements, (conflict_hit,)),
+        **objective_fields,
     )
 
 
@@ -816,6 +853,10 @@ def _validate_audit_projection(
     for key, label in (
         ("status", "status"),
         ("evidence_status", "evidence_status"),
+        ("objective_outcome", "objective_outcome"),
+        ("objective_confidence", "objective_confidence"),
+        ("objective_reason", "objective_reason"),
+        ("objective_result_reference", "objective_result_reference"),
         ("final_text", "final_text"),
         ("primary_text", "primary_text"),
         ("secondary_text", "secondary_text"),
@@ -860,6 +901,53 @@ def _validate_audit_projection(
             by_role=by_role,
         )
     )
+    objective_reference = audit.get("objective_result_reference")
+    legacy_absolute_refs = any(
+        Path(str(item.get("raw_result_reference") or "")).is_absolute()
+        for item in by_role.values()
+        if isinstance(item, Mapping)
+    )
+    if objective_reference and not legacy_absolute_refs:
+        objective_path = _resolve_bundle_reference(
+            objective_reference,
+            paths["audit_json"].parent,
+        )
+        objective_payload = load_objective_result(objective_path)
+        raw_refs = [
+            {
+                "schema": "media.raw-artifact-ref.v1",
+                "path": paths["primary_json"].name,
+                "size_bytes": paths["primary_json"].stat().st_size,
+                "sha256": objective_file_sha256(paths["primary_json"]),
+            },
+            {
+                "schema": "media.raw-artifact-ref.v1",
+                "path": paths["secondary_json"].name,
+                "size_bytes": paths["secondary_json"].stat().st_size,
+                "sha256": objective_file_sha256(paths["secondary_json"]),
+            },
+        ]
+        failures.extend(
+            _artifact_failure(error)
+            for error in validate_objective_result(
+                objective_payload,
+                raw_artifacts=raw_refs,
+                strict_receipt={
+                    "schema": "media.strict-receipt-ref.v1",
+                    "path": paths["receipt"].name,
+                    "size_bytes": paths["receipt"].stat().st_size,
+                    "sha256": objective_file_sha256(paths["receipt"]),
+                },
+            )
+        )
+        if isinstance(objective_payload, Mapping) and objective_payload.get(
+            "objective_outcome"
+        ) != audit.get("objective_outcome"):
+            failures.append(
+                _artifact_failure(
+                    "objective result outcome does not match strict audit"
+                )
+            )
     return failures
 
 
@@ -881,6 +969,14 @@ def _validate_receipt_claims(
         failures.append(
             _artifact_failure(
                 "bundle receipt evidence_status claim does not match strict audit"
+            )
+        )
+    if "objective_outcome" in claims and claims.get("objective_outcome") != audit.get(
+        "objective_outcome"
+    ):
+        failures.append(
+            _artifact_failure(
+                "bundle receipt objective_outcome claim does not match strict audit"
             )
         )
     final_text = audit.get("final_text")

@@ -10,6 +10,7 @@ from typing import Any
 from .adapters import get_adapter
 from .adapters.base import MissingDependencyError  # noqa: F401 - compatibility re-export
 from .adapters.funasr import (  # noqa: F401 - compatibility re-export
+    detect_speech_segments,
     ensure_funasr_available,
     funasr_kwargs as _funasr_kwargs,
 )
@@ -21,7 +22,7 @@ from .audio_frontend import (
 )
 from .config import ModelConfig, get_engine_spec, load_model_config
 from .proxy_guard import sanitize_current_process_env
-from .result_writer import write_transcript_bundle
+from .result_writer import canonical_json_sha256, extract_text, write_transcript_bundle
 from .strict_writer import write_strict_bundle
 
 
@@ -273,13 +274,27 @@ def _generate_many_for_strict(
                         f"for {len(valid_indices)} inputs."
                     )
                 for index, value in zip(valid_indices, generated):
-                    results[index] = value if isinstance(value, list) else [value]
+                    normalized = value if isinstance(value, list) else [value]
+                    results[index] = _attach_speech_detection_if_empty(
+                        normalized,
+                        model,
+                        prepared[index],
+                        engine,
+                        config,
+                    )
             else:
                 for index in valid_indices:
                     try:
-                        results[index] = model.generate(
+                        generated = model.generate(
                             input=str(prepared[index]),
                             batch_size_s=300,
+                        )
+                        results[index] = _attach_speech_detection_if_empty(
+                            generated,
+                            model,
+                            prepared[index],
+                            engine,
+                            config,
                         )
                     except Exception as exc:
                         errors[index] = f"{type(exc).__name__}: {exc}"
@@ -400,10 +415,15 @@ def _generate_once_with_identity(
 ) -> tuple[Any, dict[str, Any]]:
     model = build_model(engine, device=device, cache_dir=cache_dir, config=config)
     try:
-        return (
-            model.generate(input=str(audio_path), batch_size_s=300),
-            _model_runtime_identity(model),
+        result = model.generate(input=str(audio_path), batch_size_s=300)
+        result = _attach_speech_detection_if_empty(
+            result,
+            model,
+            audio_path,
+            engine,
+            config,
         )
+        return result, _model_runtime_identity(model)
     finally:
         del model
         gc.collect()
@@ -413,6 +433,59 @@ def _generate_once_with_identity(
 def _model_runtime_identity(model: Any) -> dict[str, Any]:
     identity = getattr(model, "runtime_identity", None)
     return dict(identity) if isinstance(identity, dict) else {}
+
+
+def _attach_speech_detection_if_empty(
+    result: Any,
+    model: Any,
+    audio_path: Path | None,
+    engine: str,
+    config: ModelConfig,
+) -> Any:
+    """Attach same-lifecycle FunASR VAD evidence without adding an engine."""
+
+    if extract_text(result) or audio_path is None:
+        return result
+    spec = get_engine_spec(engine, config=config)
+    if spec.adapter != "funasr":
+        return result
+    detection = detect_speech_segments(model, audio_path)
+    resolved_vad_model = (
+        config.model_aliases.get(spec.vad_model, spec.vad_model)
+        if spec.vad_model
+        else None
+    )
+    vad_config = {
+        "engine": engine,
+        "vad_model": resolved_vad_model,
+        "vad_kwargs": dict(getattr(model, "vad_kwargs", {}) or {}),
+    }
+    detection.update(
+        {
+            "processor": "funasr-vad",
+            "processor_version": "funasr-auto-model",
+            "model": resolved_vad_model,
+            "config": vad_config,
+            "config_sha256": canonical_json_sha256(vad_config),
+        }
+    )
+    if isinstance(result, dict):
+        updated = dict(result)
+        updated["speech_detection"] = detection
+        return updated
+    if isinstance(result, list):
+        if result and isinstance(result[0], dict):
+            updated = list(result)
+            first = dict(updated[0])
+            first["speech_detection"] = detection
+            updated[0] = first
+            return updated
+        return [{"text": "", "speech_detection": detection}]
+    return {
+        "text": "",
+        "result": result,
+        "speech_detection": detection,
+    }
 
 
 def _prepare_engine_input(

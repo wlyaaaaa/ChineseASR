@@ -156,6 +156,9 @@ $Result = [ordered]@{
   status = $FinalJob.status
   evidence_status = $FinalJob.evidence_status
   evidence_failures = $FinalJob.evidence_failures
+  objective_outcome = $FinalJob.objective_outcome
+  audio_result_status = $FinalJob.audio_result_status
+  objective_execution_status = $FinalJob.objective_execution_status
   job_id = $FinalJob.job_id
   out_dir = $FinalJob.out_dir
   outputs = $FinalJob.outputs
@@ -169,6 +172,7 @@ if ($Json) {
 } else {
   Write-Host "Status: $($Result.status)"
   Write-Host "Evidence: $($Result.evidence_status)"
+  Write-Host "Objective: $($Result.objective_outcome)"
   Write-Host "Job: $($Result.job_id)"
   Write-Host "Output: $($Result.out_dir)"
   if ($Result.outputs) {

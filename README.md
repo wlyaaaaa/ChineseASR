@@ -229,6 +229,17 @@ strict 模式会把最终稿和证据拆开：
 
 显式使用 FireRed 时，若 FireRed 失败而对照引擎成功，流程仍会生成带 `[疑似]` 的回退文本，但 job、长音频 manifest 和对应 chunk 都会标为 `provisional`，并列出 `evidence_failures`。状态判定会重新验证收据覆盖的六项内容产物，核对路径、字节数、SHA-256、两路 raw 独立性、引擎身份、文本、执行状态、错误以及 final/audit/review 对 audit JSON 的投影；未同步重建收据的替换、损坏、缺失或语义错配会使 `verified` 降为 `unavailable`。该收据是自包含的一致性清单，不是数字签名或可信时间戳，不能单独证明外部真实性。证据级验收还必须确认每个 FireRed raw JSON 文本非空、`error=null`、运行时 dtype 正确，并且逐段审计不含 `engine_failure`；原始录音始终是权威来源，`verified` 不能替代人工核听。
 
+### 空转写的客观结果
+
+每个 quick/strict 结果都会旁写一个版本化的 `*.objective-result.json`（long-strict 为根目录的 `objective-result.json`，chunk 也各有一个）。它与旧 strict 两条 `engine_evidence` 和 receipt 分开，机器消费者必须读取 `objective_outcome`，不能把空字符串、空数组、零字节或 `expect_empty` 当作无语音：
+
+- `speech_transcribed`：至少有可观察转写文本；单引擎空文本会附带 `quality_status=low_confidence`，不能把双引擎链的 `verified` 当成准确性证明；
+- `no_speech_detected`：只在完整音频覆盖下取得规范 VAD 零区间，或完整有效 PCM 的全零负证据时使用，并绑定 raw SHA-256、处理器/配置/策略/request hash、区间和非空负证据 hash；
+- `speech_detected_but_not_transcribable`：检测到语音区间但文本为空，保持 deferred/unknown，可交给音频理解路线；
+- `indeterminate`：没有完整 VAD/负证据，或存在预处理、模型、子进程、格式、覆盖等不确定性。
+
+sidecar 的正式正交字段是 `execution.status ∈ {completed, failed, unsupported, corrupt}`、`coverage.status ∈ {complete, partial, unknown}` 和 `quality.status ∈ {sufficient, low_confidence, unknown}`；旧 `*_status` 名称只在 `compatibility` 中保留。`media_kind` 固定为 `audio`。调用方若有 package/batch/checkpoint/member/governance 绑定，可通过 `caller_binding` 原样透传；ChineseASR 不解释或伪造这些治理字段。long-strict 允许配置的 chunk overlap，但必须从 0 连续覆盖到原音频时长、没有 gap/exclusion、首尾闭合，且所有 child 负证据、区间、raw 引用和幂等身份都绑定时才允许聚合为 `no_speech_detected`。旧 Markdown 或缺 sidecar 的缓存最多是未验证的历史产物，不得据此宣称无语音。
+
 ## 本地 API 与 Smart Wrapper
 
 本地 API 只绑定 `127.0.0.1`：

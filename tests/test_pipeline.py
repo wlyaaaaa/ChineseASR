@@ -23,6 +23,54 @@ class PipelineTests(unittest.TestCase):
             handle.setframerate(sample_rate)
             handle.writeframes(b"\0" * frames * 2)
 
+    def test_funasr_vad_zero_segments_is_full_coverage_negative_evidence(self):
+        from zh_asr.adapters.funasr import detect_speech_segments
+
+        class DummyModel:
+            vad_model = object()
+            vad_kwargs = {"max_single_segment_time": 30000}
+
+            def inference(self, audio, *, model, kwargs):
+                self.call = (audio, model, kwargs)
+                return [{"value": []}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "silence.wav"
+            self._write_wav(audio)
+            detection = detect_speech_segments(DummyModel(), audio)
+
+        self.assertEqual(detection["status"], "no_speech_detected")
+        self.assertTrue(detection["coverage_complete"])
+        self.assertEqual(detection["segments"], [])
+
+    def test_pipeline_attaches_vad_processor_model_and_config_telemetry(self):
+        from zh_asr.config import load_model_config
+        from zh_asr.pipeline import _attach_speech_detection_if_empty
+
+        class DummyModel:
+            vad_model = object()
+            vad_kwargs = {"max_single_segment_time": 30000}
+
+            def inference(self, audio, *, model, kwargs):
+                return [{"value": [[0, 50]]}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "speech.wav"
+            self._write_wav(audio)
+            result = _attach_speech_detection_if_empty(
+                {"text": ""},
+                DummyModel(),
+                audio,
+                "sensevoice",
+                load_model_config(),
+            )
+
+        detection = result["speech_detection"]
+        self.assertEqual(detection["status"], "speech_detected")
+        self.assertEqual(detection["processor"], "funasr-vad")
+        self.assertEqual(detection["model"], "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch")
+        self.assertTrue(detection["config_sha256"])
+
     def test_funasr_kwargs_use_local_cache_paths_when_available(self):
         from zh_asr.config import get_engine_spec, load_model_config
         from zh_asr.pipeline import _funasr_kwargs

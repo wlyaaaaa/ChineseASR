@@ -6,7 +6,9 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+from .audio_outcome import build_objective_result, write_objective_result
 
 
 @dataclass(frozen=True)
@@ -70,11 +72,13 @@ def write_transcript_bundle(
     result: object,
     out_dir: Path,
     engine: str,
+    caller_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Path | str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = audio_path.stem
     json_path = out_dir / f"{stem}.{engine}.raw.json"
     markdown_path = out_dir / f"{stem}.{engine}.md"
+    objective_path = out_dir / f"{stem}.{engine}.objective-result.json"
 
     json_path.write_text(
         json.dumps(result, ensure_ascii=False, indent=2),
@@ -82,6 +86,26 @@ def write_transcript_bundle(
     )
 
     transcript = extract_text(result)
+    objective = build_objective_result(
+        audio_path=audio_path,
+        mode="quick",
+        engines=[engine],
+        primary_text=transcript,
+        primary_result=result,
+        raw_artifacts=[
+            {
+                "schema": "media.raw-artifact-ref.v1",
+                "role": "lexical_primary",
+                "engine": engine,
+                "path": json_path.name,
+                "size_bytes": json_path.stat().st_size,
+                "sha256": file_sha256(json_path),
+            }
+        ],
+        request={"engine": engine},
+        caller_binding=caller_binding,
+    )
+    write_objective_result(objective_path, objective)
     markdown = "\n".join(
         [
             f"# {stem} Transcript",
@@ -89,6 +113,8 @@ def write_transcript_bundle(
             f"- Audio: `{audio_path}`",
             f"- Engine: `{engine}`",
             "- Evidence status: `not_applicable`",
+            f"- Objective outcome: `{objective['objective_outcome']}`",
+            f"- Objective result: `{objective_path.name}`",
             f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`",
             "",
             "## Transcript",
@@ -101,6 +127,9 @@ def write_transcript_bundle(
     return {
         "json": json_path,
         "markdown": markdown_path,
+        "objective_result": objective_path,
+        "objective_outcome": objective["objective_outcome"],
+        "audio_result_status": objective["objective_outcome"],
         "evidence_status": "not_applicable",
     }
 

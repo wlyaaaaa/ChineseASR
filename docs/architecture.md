@@ -60,6 +60,8 @@ audio
 
 如果 strict 中某个引擎抛错，流程不会直接丢弃整次任务。成功的一路会继续进入最终猜测，正文标记 `[疑似]`，审计报告状态为 `engine_failure`，并在 raw JSON 中保留失败引擎、异常类型和错误摘要。如果两路都失败，则输出 `[听不清]` 并要求人工复核。
 
+空转写的声学语义由独立的 `media.objective-result.v1` sidecar 表达，不增加旧 strict `engine_evidence` 条目。`speech_transcribed`、`no_speech_detected`、`speech_detected_but_not_transcribable` 和 `indeterminate` 是唯一的客观结果；空文本、空数组、零字节或 `expect_empty` 本身不能证明无语音。sidecar 的 execution/coverage/quality 正式状态分别是 `completed|failed|unsupported|corrupt`、`complete|partial|unknown`、`sufficient|low_confidence|unknown`，调用方治理绑定只通过 `caller_binding` 透传。
+
 任务执行状态和证据完整性状态相互独立。顶层 `succeeded` 只说明命令成功产出；`evidence_status` 在 strict audit、长音频 manifest/chunk 和 API job 上统一使用 `pending / verified / provisional / unavailable / not_applicable`。其中 `verified` 要求双引擎链完整执行，并要求 final、audit、review、两路 raw 通过 `strict.receipt.json` 的路径、大小、SHA-256 与语义交叉验证，但仍不保证文本逐字正确；有引擎失败但仍产出回退文本时必须是 `provisional`，必要产物缺失、未同步重建收据的修改、语义错配或任务失败时必须是 `unavailable`，quick 单引擎任务为 `not_applicable`。该 receipt 只证明包内一致性，不是数字签名或可信时间戳，外部真实性仍以原始录音和独立保全链为准。
 
 因此，显式选择 FireRed 的证据级验收不能只检查顶层 job 为 `succeeded`。还必须逐段确认 `evidence_status=verified`、FireRed raw 文本非空、`error=null`、初始装载 dtype 符合配置，且 strict audit 不含 `engine_failure`；否则只算有审计记录的对照引擎回退。即使状态为 `verified`，精确引用前仍要回听原始录音。
