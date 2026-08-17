@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import json
 import os
 import tempfile
 import sys
@@ -70,6 +71,38 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(detection["processor"], "funasr-vad")
         self.assertEqual(detection["model"], "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch")
         self.assertTrue(detection["config_sha256"])
+
+    def test_pipeline_excludes_runtime_only_objects_from_vad_config(self):
+        from zh_asr.config import load_model_config
+        from zh_asr.pipeline import _attach_speech_detection_if_empty
+
+        class WavFrontendOnline:
+            pass
+
+        class DummyModel:
+            vad_model = object()
+            vad_kwargs = {
+                "max_single_segment_time": 30000,
+                "frontend": WavFrontendOnline(),
+            }
+
+            def inference(self, audio, *, model, kwargs):
+                return [{"value": []}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "silence.wav"
+            self._write_wav(audio)
+            result = _attach_speech_detection_if_empty(
+                {"text": ""},
+                DummyModel(),
+                audio,
+                "sensevoice",
+                load_model_config(),
+            )
+
+        json.dumps(result)
+        vad_config = result["speech_detection"]["config"]["vad_kwargs"]
+        self.assertEqual(vad_config, {"max_single_segment_time": 30000})
 
     def test_funasr_kwargs_use_local_cache_paths_when_available(self):
         from zh_asr.config import get_engine_spec, load_model_config

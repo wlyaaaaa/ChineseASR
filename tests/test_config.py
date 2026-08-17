@@ -66,6 +66,9 @@ class ConfigTests(unittest.TestCase):
         requirements = (PROJECT_ROOT / "requirements-core.txt").read_text(encoding="utf-8").splitlines()
 
         self.assertIn("funasr==1.4.2", requirements)
+        self.assertTrue(any(line.startswith("more-itertools>=") for line in requirements))
+        self.assertTrue(any(line.startswith("rapidfuzz>=") for line in requirements))
+        self.assertTrue(any(line.startswith("websockets>=") for line in requirements))
 
     def test_llm_arbitration_defaults_to_disabled_ollama_with_keep_alive_zero(self):
         import yaml

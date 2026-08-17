@@ -6,6 +6,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ScriptTests(unittest.TestCase):
+    def test_setup_core_falls_back_to_official_pypi_and_checks_environment(self):
+        script = (PROJECT_ROOT / "scripts" / "setup-core.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("pypi.tuna.tsinghua.edu.cn", script)
+        self.assertIn("https://pypi.org/simple", script)
+        self.assertIn("pip check", script)
+        self.assertIn("$LASTEXITCODE", script)
+
     def test_setup_qwen_uses_no_proxy_and_local_requirements_file(self):
         script = (PROJECT_ROOT / "scripts" / "setup-qwen.ps1").read_text(encoding="utf-8")
 

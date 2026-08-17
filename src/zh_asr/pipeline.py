@@ -475,10 +475,21 @@ def _attach_speech_detection_if_empty(
         if spec.vad_model
         else None
     )
+    # FunASR mutates ``model.vad_kwargs`` during inference and can leave
+    # runtime-only objects such as ``WavFrontendOnline`` in that mapping.
+    # Objective evidence must bind stable JSON configuration, never live
+    # model objects that make the raw/result sidecars unserializable.
+    stable_vad_kwargs: dict[str, Any] = {}
+    for key, value in dict(getattr(model, "vad_kwargs", {}) or {}).items():
+        try:
+            canonical_json_sha256(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        stable_vad_kwargs[str(key)] = value
     vad_config = {
         "engine": engine,
         "vad_model": resolved_vad_model,
-        "vad_kwargs": dict(getattr(model, "vad_kwargs", {}) or {}),
+        "vad_kwargs": stable_vad_kwargs,
     }
     detection.update(
         {
