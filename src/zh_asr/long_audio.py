@@ -267,14 +267,19 @@ def run_long_transcription(
             persist_manifest()
 
             try:
+                batch_kwargs = {
+                    "out_dirs": batch_out_dirs,
+                    "primary_engine": resolved_primary_engine,
+                    "secondary_engine": resolved_secondary_engine,
+                    "device": device,
+                    "cache_dir": resolved_cache_dir,
+                    "config": model_config,
+                }
+                if caller_binding is not None:
+                    batch_kwargs["caller_binding"] = caller_binding
                 batch_outputs = strict_transcribe_many(
                     [state.spec.audio_path for state in batch_states],
-                    out_dirs=batch_out_dirs,
-                    primary_engine=resolved_primary_engine,
-                    secondary_engine=resolved_secondary_engine,
-                    device=device,
-                    cache_dir=resolved_cache_dir,
-                    config=model_config,
+                    **batch_kwargs,
                 )
                 if len(batch_outputs) != len(batch_states):
                     raise RuntimeError(
@@ -328,15 +333,17 @@ def run_long_transcription(
             persist_manifest()
             chunk_out_dir = chunks_dir / state.spec.chunk_id
             try:
-                outputs = strict_fn(
-                    state.spec.audio_path,
-                    primary_engine=resolved_primary_engine,
-                    secondary_engine=resolved_secondary_engine,
-                    device=device,
-                    out_dir=chunk_out_dir,
-                    cache_dir=resolved_cache_dir,
-                    config=model_config,
-                )
+                strict_kwargs = {
+                    "primary_engine": resolved_primary_engine,
+                    "secondary_engine": resolved_secondary_engine,
+                    "device": device,
+                    "out_dir": chunk_out_dir,
+                    "cache_dir": resolved_cache_dir,
+                    "config": model_config,
+                }
+                if caller_binding is not None:
+                    strict_kwargs["caller_binding"] = caller_binding
+                outputs = strict_fn(state.spec.audio_path, **strict_kwargs)
                 state.outputs = {
                     key: str(path)
                     for key, path in outputs.items()

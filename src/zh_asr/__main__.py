@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextvars
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -23,7 +24,7 @@ from .long_audio import run_long_transcription
 from .pipeline import MissingDependencyError, build_model, default_cache_dir, project_root, strict_transcribe_audio, transcribe_audio
 from .process_control import managed_popen_kwargs, terminate_process_tree
 from .proxy_guard import PROXY_ENV_NAMES, sanitize_current_process_env
-from .service import serve_api
+from .service import CALLER_BINDING_ENV, serve_api
 
 
 _GPU_LEASE_AUTHENTICATED = contextvars.ContextVar(
@@ -120,6 +121,11 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--check", action="store_true", help="Validate serve configuration without blocking.")
 
     args = parser.parse_args(argv)
+    try:
+        caller_binding = _caller_binding_from_env()
+    except ValueError as exc:
+        print(f"ValueError: {exc}", file=sys.stderr)
+        return 1
 
     if _command_requires_gpu_supervision(args):
         try:
@@ -163,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
                     out_dir=args.out_dir,
                     cache_dir=args.cache_dir,
                     config=model_config,
+                    caller_binding=caller_binding,
                 ),
             )
             print(f"Markdown: {paths['markdown']}")
@@ -182,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
                     out_dir=args.out_dir,
                     cache_dir=args.cache_dir,
                     config=model_config,
+                    caller_binding=caller_binding,
                 ),
             )
             print(f"Final: {paths['final']}")
@@ -208,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
                     cache_dir=args.cache_dir,
                     force=args.force,
                     arbiter=arbiter,
+                    caller_binding=caller_binding,
                 ),
             )
             print(f"Transcript: {summary.transcript_path}")
@@ -236,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
                     cache_dir=args.cache_dir,
                     config=model_config,
                     force=args.force,
+                    caller_binding=caller_binding,
                 ),
             )
             print(f"Summary: {summary.out_dir / 'summary.md'}")
@@ -330,6 +340,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     return 1
+
+
+def _caller_binding_from_env() -> dict | None:
+    raw = os.environ.get(CALLER_BINDING_ENV)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{CALLER_BINDING_ENV} must contain a JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{CALLER_BINDING_ENV} must contain a JSON object")
+    return value
 
 
 def _run_with_gpu_lease(device: str, operation):

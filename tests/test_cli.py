@@ -12,6 +12,16 @@ PYTHONPATH = str(PROJECT_ROOT / "src")
 
 
 class CliTests(unittest.TestCase):
+    def test_caller_binding_env_round_trips_as_opaque_json_object(self):
+        from zh_asr.__main__ import CALLER_BINDING_ENV, _caller_binding_from_env
+
+        binding = {"opaque_ref": "caller-owned"}
+        with patch.dict(os.environ, {CALLER_BINDING_ENV: '{"opaque_ref":"caller-owned"}'}, clear=False):
+            self.assertEqual(binding, _caller_binding_from_env())
+        with patch.dict(os.environ, {CALLER_BINDING_ENV: "[]"}, clear=False):
+            with self.assertRaises(ValueError):
+                _caller_binding_from_env()
+
     def test_gpu_operation_refuses_unauthenticated_in_process_execution(self):
         from zh_asr.__main__ import _run_with_gpu_lease
         from zh_asr.gpu_broker import GpuBrokerError

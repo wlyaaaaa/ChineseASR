@@ -34,7 +34,39 @@ class AudioOutcomeTests(unittest.TestCase):
         self.assertTrue(payload["negative_evidence"]["sha256"])
         self.assertGreater(payload["negative_evidence"]["artifact"]["size_bytes"], 0)
         self.assertTrue(payload["negative_evidence"]["artifact"]["sha256"])
+        negative = payload["negative_evidence"]["artifact"]
+        self.assertEqual(negative["source_audio_sha256"], payload["audio"]["raw_sha256"])
+        self.assertEqual(negative["request_sha256"], payload["request"]["sha256"])
+        self.assertEqual(negative["processor_config_sha256"], payload["processor_config_sha256"])
         self.assertEqual(validate_objective_result(payload), [])
+
+    def test_model_provenance_retains_options_revision_version_and_config_hash(self):
+        from zh_asr.audio_outcome import build_objective_result, canonical_json_sha256
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = _write_wav(Path(tmp) / "silence.wav", seconds=1, value=0)
+            provenance = {
+                "adapter": "funasr",
+                "model": "iic/SenseVoiceSmall",
+                "registry_role": "anchor",
+                "options": {"runtime_version": "1.4.2", "model_revision": "rev-1"},
+            }
+            payload = build_objective_result(
+                audio_path=audio,
+                mode="quick",
+                engines=["sensevoice"],
+                primary_text="",
+                primary_provenance=provenance,
+            )
+
+        model = payload["models"][0]
+        self.assertEqual(model["revision"], "rev-1")
+        self.assertEqual(model["version"], "1.4.2")
+        self.assertEqual(model["config_sha256"], canonical_json_sha256({
+            key: model[key]
+            for key in ("engine", "adapter", "model", "registry_role", "options", "runtime_identity")
+        }))
+        self.assertEqual(payload["request"]["model_config_sha256"], payload["model_config_sha256"])
 
     def test_nonzero_audio_without_vad_stays_indeterminate(self):
         from zh_asr.audio_outcome import build_objective_result
@@ -96,6 +128,38 @@ class AudioOutcomeTests(unittest.TestCase):
             "speech_detected_but_not_transcribable",
         )
         self.assertEqual(payload["confidence"], "deferred")
+
+    def test_vad_zero_segments_negative_evidence_keeps_actual_detector_telemetry(self):
+        from zh_asr.audio_outcome import build_objective_result, validate_objective_result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = _write_wav(Path(tmp) / "quiet.wav", seconds=1, value=1200)
+            result = {
+                "text": "",
+                "speech_detection": {
+                    "status": "no_speech_detected",
+                    "segments": [],
+                    "coverage_complete": True,
+                    "processor": "funasr-vad",
+                    "processor_version": "funasr-auto-model",
+                    "model": "iic/fsmn-vad",
+                    "config_sha256": "vad-config",
+                },
+            }
+            payload = build_objective_result(
+                audio_path=audio,
+                mode="quick",
+                engines=["sensevoice"],
+                primary_text="",
+                primary_result=result,
+            )
+
+        self.assertEqual(payload["objective_outcome"], "no_speech_detected")
+        self.assertEqual(
+            payload["negative_evidence"]["artifact"]["detection"],
+            payload["detection"],
+        )
+        self.assertEqual(validate_objective_result(payload), [])
 
     def test_incomplete_vad_does_not_upgrade_empty_text(self):
         from zh_asr.audio_outcome import build_objective_result
@@ -225,7 +289,7 @@ class AudioOutcomeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             audio = _write_wav(Path(tmp) / "silence.wav", seconds=1, value=0)
-            binding = {"package_id": "pkg-1", "governance_version": "g-1"}
+            binding = {"opaque_ref": "caller-owned"}
             payload = build_objective_result(
                 audio_path=audio,
                 mode="quick",

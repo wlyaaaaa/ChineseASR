@@ -73,6 +73,7 @@ def write_transcript_bundle(
     out_dir: Path,
     engine: str,
     caller_binding: Mapping[str, Any] | None = None,
+    primary_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Path | str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = audio_path.stem
@@ -104,6 +105,7 @@ def write_transcript_bundle(
         ],
         request={"engine": engine},
         caller_binding=caller_binding,
+        primary_provenance=primary_provenance,
     )
     write_objective_result(objective_path, objective)
     markdown = "\n".join(

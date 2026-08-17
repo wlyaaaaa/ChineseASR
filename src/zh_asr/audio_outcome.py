@@ -400,6 +400,12 @@ def build_objective_result(
         "engines": list(engines),
         **dict(request or {}),
     }
+    model_payload = [
+        _model_provenance(engines[0] if engines else "", primary_provenance),
+        _model_provenance(engines[1] if len(engines) > 1 else "", secondary_provenance),
+    ]
+    model_config_hash = canonical_json_sha256(model_payload)
+    request_payload["model_config_sha256"] = model_config_hash
     if caller_binding is not None:
         request_payload["caller_binding"] = dict(caller_binding)
     request_hash = canonical_json_sha256(request_payload)
@@ -431,16 +437,13 @@ def build_objective_result(
             confidence=classification.get("confidence"),
         ),
     }
-    model_payload = [
-        _model_provenance(engines[0] if engines else "", primary_provenance),
-        _model_provenance(engines[1] if len(engines) > 1 else "", secondary_provenance),
-    ]
     basis = {
         "source_audio_sha256": analysis.get("source_sha256") or _safe_file_sha256(source),
         "request_sha256": request_hash,
         "processor_config_sha256": processor_config_hash,
         "policy_sha256": policy_hash,
         "speech_detection_sha256": detection_hash,
+        "model_config_sha256": model_config_hash,
         "models": model_payload,
     }
     payload: dict[str, Any] = {
@@ -492,6 +495,7 @@ def build_objective_result(
         "policy_sha256": policy_hash,
         "request": {**request_payload, "sha256": request_hash},
         "models": model_payload,
+        "model_config_sha256": model_config_hash,
         "analysis": analysis,
         "raw_artifacts": raw_payloads,
         "strict_receipt": dict(strict_receipt or {}),
@@ -507,6 +511,13 @@ def build_objective_result(
             "schema_version": 1,
             "kind": "complete_zero_pcm_or_vad_zero_segments",
             "non_empty": True,
+            "source_audio_sha256": payload["audio"]["raw_sha256"],
+            "source_audio_size_bytes": payload["audio"].get("size_bytes"),
+            "request_sha256": request_hash,
+            "processor_config_sha256": processor_config_hash,
+            "policy_sha256": policy_hash,
+            "model_config_sha256": model_config_hash,
+            "models": model_payload,
             "coverage": coverage_payload,
             "excluded_ranges_ms": list(coverage_payload.get("excluded_ranges_ms", [])),
             "thresholds": analysis.get("thresholds", {}),
@@ -600,6 +611,27 @@ def validate_objective_result(
         failures.append("objective result request hash does not match request")
     elif not isinstance(basis, Mapping) or basis.get("request_sha256") != request.get("sha256"):
         failures.append("objective result idempotency basis request hash does not match")
+    models = payload.get("models")
+    model_config_hash = payload.get("model_config_sha256")
+    if not isinstance(models, list) or model_config_hash != canonical_json_sha256(models):
+        failures.append("objective result model config hash is invalid")
+    else:
+        for index, model in enumerate(models):
+            if not isinstance(model, Mapping):
+                failures.append(f"objective result model {index} is invalid")
+                continue
+            config = {
+                key: model.get(key)
+                for key in ("engine", "adapter", "model", "registry_role", "options", "runtime_identity")
+            }
+            if model.get("config_sha256") != canonical_json_sha256(config):
+                failures.append(f"objective result model {index} config hash is invalid")
+            if "revision" not in model or "version" not in model:
+                failures.append(f"objective result model {index} version/revision is missing")
+    if isinstance(request, Mapping) and request.get("model_config_sha256") != model_config_hash:
+        failures.append("objective result request model config hash does not match")
+    if isinstance(basis, Mapping) and basis.get("model_config_sha256") != model_config_hash:
+        failures.append("objective result idempotency model config hash does not match")
     processor = payload.get("processor")
     if not isinstance(processor, Mapping):
         failures.append("objective result processor is missing")
@@ -639,6 +671,31 @@ def validate_objective_result(
                 }
                 if artifact.get("sha256") != canonical_json_sha256(artifact_without_hash):
                     failures.append("negative evidence artifact hash is invalid")
+            if isinstance(artifact, Mapping):
+                audio_value = payload.get("audio")
+                request_value = payload.get("request")
+                expected_negative_fields = {
+                    "source_audio_sha256": audio_value.get("raw_sha256")
+                    if isinstance(audio_value, Mapping)
+                    else None,
+                    "source_audio_size_bytes": audio_value.get("size_bytes")
+                    if isinstance(audio_value, Mapping)
+                    else None,
+                    "request_sha256": request_value.get("sha256")
+                    if isinstance(request_value, Mapping)
+                    else None,
+                    "processor_config_sha256": payload.get("processor_config_sha256"),
+                    "policy_sha256": payload.get("policy_sha256"),
+                    "model_config_sha256": payload.get("model_config_sha256"),
+                    "models": payload.get("models", []),
+                    "coverage": audio_value.get("coverage")
+                    if isinstance(audio_value, Mapping)
+                    else None,
+                    "detection": payload.get("detection", {}),
+                }
+                for key, expected in expected_negative_fields.items():
+                    if artifact.get(key) != expected:
+                        failures.append(f"negative evidence {key} does not match objective result")
     elif negative is not None:
         failures.append("negative evidence is only valid for no_speech_detected")
     declared_raw_artifacts = payload.get("raw_artifacts")
@@ -774,6 +831,14 @@ def aggregate_objective_result(
             "schema_version": 1,
             "kind": "complete_chunk_vad_zero_segments",
             "non_empty": True,
+            "source_audio_sha256": (payload.get("audio") or {}).get("raw_sha256"),
+            "source_audio_size_bytes": (payload.get("audio") or {}).get("size_bytes"),
+            "request_sha256": (payload.get("request") or {}).get("sha256"),
+            "processor_config_sha256": payload.get("processor_config_sha256"),
+            "policy_sha256": payload.get("policy_sha256"),
+            "model_config_sha256": payload.get("model_config_sha256"),
+            "models": payload.get("models", []),
+            "detection": payload.get("detection", {}),
             "coverage": coverage,
             "excluded_ranges_ms": list(coverage.get("excluded_ranges_ms", [])),
             "children": [
@@ -792,7 +857,6 @@ def aggregate_objective_result(
                 }
                 for child in child_list
             ],
-            "source_audio_sha256": (payload.get("audio") or {}).get("raw_sha256"),
         }
         payload["negative_evidence"] = _hashed_negative_evidence(negative)
     else:
@@ -975,14 +1039,42 @@ def _provenance_audio_path(provenance: Mapping[str, Any] | None) -> Path | None:
 
 def _model_provenance(engine: str, provenance: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(provenance, Mapping):
-        return {"engine": engine}
-    return {
+        provenance = {}
+    options = (
+        dict(provenance.get("options") or {})
+        if isinstance(provenance.get("options"), Mapping)
+        else {}
+    )
+    runtime_identity = (
+        dict(provenance.get("runtime_identity") or {})
+        if isinstance(provenance.get("runtime_identity"), Mapping)
+        else {}
+    )
+    config = {
         "engine": engine,
         "adapter": provenance.get("adapter"),
         "model": provenance.get("model"),
-        "runtime_identity": dict(provenance.get("runtime_identity") or {})
-        if isinstance(provenance.get("runtime_identity"), Mapping)
-        else {},
+        "registry_role": provenance.get("registry_role"),
+        "options": options,
+        "runtime_identity": runtime_identity,
+    }
+    revision = (
+        options.get("model_revision")
+        or options.get("source_revision")
+        or runtime_identity.get("model_revision")
+        or runtime_identity.get("revision")
+    )
+    version = (
+        options.get("runtime_version")
+        or options.get("version")
+        or runtime_identity.get("runtime_version")
+        or runtime_identity.get("version")
+    )
+    return {
+        **config,
+        "revision": revision,
+        "version": version,
+        "config_sha256": canonical_json_sha256(config),
     }
 
 

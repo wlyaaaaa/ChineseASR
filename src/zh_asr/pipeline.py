@@ -5,7 +5,7 @@ import gc
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .adapters import get_adapter
 from .adapters.base import MissingDependencyError  # noqa: F401 - compatibility re-export
@@ -68,20 +68,36 @@ def transcribe_audio(
     out_dir: Path | None = None,
     cache_dir: Path | None = None,
     config: ModelConfig | None = None,
+    caller_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
     model_config = config or load_model_config()
     engine_name = engine or model_config.default_engine
     output_dir = out_dir or project_root() / "outputs"
-    engine_audio, _ = _prepare_engine_input(
+    engine_audio, provenance = _prepare_engine_input(
         audio_path,
         engine_name,
         output_dir / "_derived",
         model_config,
     )
-    result = _generate_once(engine_audio, engine_name, device, cache_dir, model_config)
-    return write_transcript_bundle(audio_path, result, output_dir, engine_name)
+    result, runtime_identity = _generate_once_with_identity(
+        engine_audio,
+        engine_name,
+        device,
+        cache_dir,
+        model_config,
+    )
+    if runtime_identity:
+        provenance["runtime_identity"] = runtime_identity
+    return write_transcript_bundle(
+        audio_path,
+        result,
+        output_dir,
+        engine_name,
+        primary_provenance=provenance,
+        caller_binding=caller_binding,
+    )
 
 
 def strict_transcribe_audio(
@@ -93,6 +109,7 @@ def strict_transcribe_audio(
     cache_dir: Path | None = None,
     config: ModelConfig | None = None,
     expect_empty: bool = False,
+    caller_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -153,6 +170,7 @@ def strict_transcribe_audio(
         secondary_role="lexical_verifier",
         primary_provenance=primary_provenance,
         secondary_provenance=secondary_provenance,
+        caller_binding=caller_binding,
     )
     paths["timing"] = {
         "total_sec": time.perf_counter() - total_started,
@@ -172,6 +190,7 @@ def strict_transcribe_many(
     cache_dir: Path | None = None,
     config: ModelConfig | None = None,
     expect_empty: bool = False,
+    caller_binding: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if len(audio_paths) != len(out_dirs):
         raise ValueError("audio_paths and out_dirs must have the same length")
@@ -218,6 +237,7 @@ def strict_transcribe_many(
             secondary_role="lexical_verifier",
             primary_provenance=primary["provenance"][index],
             secondary_provenance=secondary["provenance"][index],
+            caller_binding=caller_binding,
         )
         paths["timing"] = {
             "total_sec": time.perf_counter() - total_started,

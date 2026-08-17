@@ -18,11 +18,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .audit import validate_strict_artifact_bundle
-from .audio_outcome import load_objective_result
+from .audio_outcome import load_objective_result, validate_objective_result
 from .gpu_broker import (
     GPU_BROKER_CHILD_TOKEN_ENV,
     GpuBrokerConflict,
@@ -86,6 +86,9 @@ class ProcessExecutionTimeout(TimeoutError):
     """The service command exceeded its finite total deadline."""
 
 
+CALLER_BINDING_ENV = "ZH_ASR_CALLER_BINDING_JSON"
+
+
 @dataclass(frozen=True)
 class JobRequest:
     audio: Path
@@ -107,6 +110,7 @@ class JobRequest:
     model_config_sha256: str = ""
     audio_sha256: str = ""
     wsl_distributions: tuple[str, ...] = ()
+    caller_binding: Mapping[str, Any] | None = None
 
     @classmethod
     def from_payload(cls, payload: dict, root: Path, default_out_root: Path | None = None) -> "JobRequest":
@@ -128,6 +132,10 @@ class JobRequest:
         engine = _optional_str(payload.get("engine"))
         primary_engine = _optional_str(payload.get("primary_engine"))
         secondary_engine = _optional_str(payload.get("secondary_engine"))
+        caller_value = payload.get("caller_binding")
+        if caller_value is not None and not isinstance(caller_value, Mapping):
+            raise ValueError("caller_binding must be a JSON object when provided")
+        caller_binding = dict(caller_value) if isinstance(caller_value, Mapping) else None
         (
             resolved_engine,
             resolved_primary_engine,
@@ -163,6 +171,7 @@ class JobRequest:
             model_config_sha256=model_config_sha256,
             audio_sha256=_sha256_path(audio),
             wsl_distributions=wsl_distributions,
+            caller_binding=caller_binding,
         )
 
     def fingerprint(self) -> str:
@@ -185,6 +194,7 @@ class JobRequest:
             "chunk_sec": self.chunk_sec,
             "overlap_sec": self.overlap_sec,
             "allow_gpu_conflicts": self.allow_gpu_conflicts,
+            "caller_binding": self.caller_binding,
         }
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
@@ -210,6 +220,7 @@ class JobRequest:
             "force": self.force,
             "allow_gpu_conflicts": self.allow_gpu_conflicts,
             "timeout_sec": self.timeout_sec,
+            "caller_binding": self.caller_binding,
         }
 
 
@@ -676,6 +687,14 @@ class TranscriptionService:
         job.out_dir.mkdir(parents=True, exist_ok=True)
         process_token = _process_token(job)
         process_env = tagged_process_env(process_token)
+        process_env.pop(CALLER_BINDING_ENV, None)
+        if job.request.caller_binding is not None:
+            process_env[CALLER_BINDING_ENV] = json.dumps(
+                dict(job.request.caller_binding),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         if job.request.device.lower().startswith(("cuda", "gpu")):
             if not job.gpu_broker_token:
                 raise RuntimeError(
@@ -877,6 +896,43 @@ def _objective_from_job_outputs(
 ) -> tuple[str, str]:
     payload = load_objective_result(outputs.get("objective_result"))
     if not isinstance(payload, dict):
+        return "indeterminate", "failed"
+    raw_refs = []
+    for key in ("raw_json", "primary_json", "secondary_json"):
+        value = outputs.get(key)
+        if not value:
+            continue
+        path = Path(value)
+        try:
+            raw_refs.append(
+                {
+                    "schema": "media.raw-artifact-ref.v1",
+                    "path": path.name,
+                    "size_bytes": path.stat().st_size,
+                    "sha256": _sha256_path(path),
+                }
+            )
+        except OSError:
+            return "indeterminate", "failed"
+    strict_receipt = None
+    receipt_value = outputs.get("receipt")
+    if receipt_value:
+        receipt_path = Path(receipt_value)
+        try:
+            strict_receipt = {
+                "schema": "media.strict-receipt-ref.v1",
+                "path": receipt_path.name,
+                "size_bytes": receipt_path.stat().st_size,
+                "sha256": _sha256_path(receipt_path),
+            }
+        except OSError:
+            return "indeterminate", "failed"
+    validation_failures = validate_objective_result(
+        payload,
+        raw_artifacts=raw_refs,
+        strict_receipt=strict_receipt,
+    )
+    if validation_failures:
         return "indeterminate", "failed"
     outcome = str(payload.get("objective_outcome") or "indeterminate")
     execution = payload.get("execution")

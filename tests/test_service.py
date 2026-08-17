@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import wave
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 
 from zh_asr.service import (
+    CALLER_BINDING_ENV,
     GpuProcess,
     JobRequest,
     ProcessResult,
@@ -18,10 +20,90 @@ from zh_asr.service import (
     create_handler,
     detect_gpu_processes,
 )
+from zh_asr.audio_outcome import build_objective_result, write_objective_result
+from zh_asr.service import _objective_from_job_outputs
 from zh_asr.strict_writer import write_strict_bundle
 
 
 class ServiceTests(unittest.TestCase):
+    def test_caller_binding_reaches_child_only_via_json_environment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            request = JobRequest.from_payload(
+                {
+                    "audio": str(audio),
+                    "mode": "quick",
+                    "device": "cpu",
+                    "caller_binding": {"opaque_ref": "caller-owned"},
+                },
+                root=root,
+            )
+            service = TranscriptionService(root=root, autostart=False)
+            job = service._new_job(request, conflicts=[])
+            process = SimpleNamespace(
+                pid=1234,
+                returncode=0,
+                communicate=lambda timeout: ("", ""),
+            )
+            with (
+                patch("zh_asr.service.subprocess.Popen", return_value=process) as popen,
+                patch("zh_asr.service.managed_popen_kwargs", return_value={}),
+            ):
+                service._run_subprocess(job)
+
+        env = popen.call_args.kwargs["env"]
+        self.assertEqual('{"opaque_ref":"caller-owned"}', env[CALLER_BINDING_ENV])
+        self.assertNotIn("caller-owned", " ".join(job.command))
+
+    def test_caller_binding_is_opaque_in_request_identity_and_response(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            binding = {"opaque_ref": "caller-owned"}
+            request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "quick", "caller_binding": binding},
+                root=root,
+            )
+            other = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "quick", "caller_binding": {"opaque_ref": "other"}},
+                root=root,
+            )
+
+        self.assertEqual(request.caller_binding, binding)
+        self.assertEqual(request.to_dict()["caller_binding"], binding)
+        self.assertNotEqual(request.fingerprint(), other.fingerprint())
+
+    def test_service_rejects_tampered_objective_sidecar_before_reporting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "silence.wav")
+            with wave.open(str(audio), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(16000)
+                handle.writeframes(b"\0\0" * 1600)
+            payload = build_objective_result(
+                audio_path=audio,
+                mode="quick",
+                engines=["sensevoice"],
+                primary_text="",
+            )
+            sidecar = root / "silence.objective-result.json"
+            write_objective_result(sidecar, payload)
+            valid = _objective_from_job_outputs(
+                {"objective_result": str(sidecar)},
+                "quick",
+            )
+            payload["quality"]["status"] = "unknown"
+            write_objective_result(sidecar, payload)
+            tampered = _objective_from_job_outputs(
+                {"objective_result": str(sidecar)},
+                "quick",
+            )
+
+        self.assertEqual(("no_speech_detected", "completed"), valid)
+        self.assertEqual(("indeterminate", "failed"), tampered)
     def test_stop_cancels_queued_and_running_jobs_and_terminates_active_process(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

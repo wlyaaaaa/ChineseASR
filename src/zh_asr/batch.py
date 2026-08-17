@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 from .audio_outcome import load_objective_result, validate_objective_result
 from .config import ModelConfig, load_model_config
@@ -64,6 +64,7 @@ def run_batch(
     config: ModelConfig | None = None,
     transcribe_fn: TranscribeFn = transcribe_audio,
     strict_fn: StrictFn = strict_transcribe_audio,
+    caller_binding: Mapping[str, Any] | None = None,
 ) -> BatchSummary:
     mode_key = mode.strip().lower()
     if mode_key not in {"strict", "quick"}:
@@ -100,24 +101,28 @@ def run_batch(
         item_dir.mkdir(parents=True, exist_ok=True)
         try:
             if mode_key == "strict":
-                outputs = strict_fn(
-                    audio_path,
-                    primary_engine=strict_primary,
-                    secondary_engine=strict_secondary,
-                    device=device,
-                    out_dir=item_dir,
-                    cache_dir=cache_dir,
-                    config=model_config,
-                )
+                call_kwargs = {
+                    "primary_engine": strict_primary,
+                    "secondary_engine": strict_secondary,
+                    "device": device,
+                    "out_dir": item_dir,
+                    "cache_dir": cache_dir,
+                    "config": model_config,
+                }
+                if caller_binding is not None:
+                    call_kwargs["caller_binding"] = caller_binding
+                outputs = strict_fn(audio_path, **call_kwargs)
             else:
-                outputs = transcribe_fn(
-                    audio_path,
-                    engine=quick_engine,
-                    device=device,
-                    out_dir=item_dir,
-                    cache_dir=cache_dir,
-                    config=model_config,
-                )
+                call_kwargs = {
+                    "engine": quick_engine,
+                    "device": device,
+                    "out_dir": item_dir,
+                    "cache_dir": cache_dir,
+                    "config": model_config,
+                }
+                if caller_binding is not None:
+                    call_kwargs["caller_binding"] = caller_binding
+                outputs = transcribe_fn(audio_path, **call_kwargs)
             items.append(
                 BatchItem(
                     audio=audio_path,
