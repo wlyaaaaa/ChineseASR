@@ -100,6 +100,51 @@ def transcribe_audio(
     )
 
 
+def transcribe_audio_many(
+    audio_paths: list[Path],
+    *,
+    out_dirs: list[Path],
+    engine: str | None = None,
+    device: str = "cuda:0",
+    cache_dir: Path | None = None,
+    config: ModelConfig | None = None,
+    caller_binding: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Transcribe multiple files while loading the selected model only once."""
+    if len(audio_paths) != len(out_dirs):
+        raise ValueError("audio_paths and out_dirs must have the same length")
+    if not audio_paths:
+        return []
+    missing = [path for path in audio_paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Audio file not found: {missing[0]}")
+
+    model_config = config or load_model_config()
+    engine_name = engine or model_config.default_engine
+    generated = _generate_many_for_strict(
+        audio_paths,
+        out_dirs,
+        engine_name,
+        device,
+        cache_dir,
+        model_config,
+    )
+
+    bundles: list[dict[str, Any]] = []
+    for index, audio_path in enumerate(audio_paths):
+        bundles.append(
+            write_transcript_bundle(
+                audio_path,
+                generated["results"][index],
+                out_dirs[index],
+                engine_name,
+                primary_provenance=generated["provenance"][index],
+                caller_binding=caller_binding,
+            )
+        )
+    return bundles
+
+
 def strict_transcribe_audio(
     audio_path: Path,
     primary_engine: str | None = None,

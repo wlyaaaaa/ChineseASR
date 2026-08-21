@@ -9,7 +9,12 @@ from typing import Any, Callable, Mapping
 
 from .audio_outcome import load_objective_result, validate_objective_result
 from .config import ModelConfig, load_model_config
-from .pipeline import strict_transcribe_audio, transcribe_audio
+from .pipeline import (
+    strict_transcribe_audio,
+    strict_transcribe_many,
+    transcribe_audio,
+    transcribe_audio_many,
+)
 
 
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac"}
@@ -38,6 +43,8 @@ class BatchSummary:
 
 StrictFn = Callable[..., dict[str, Path]]
 TranscribeFn = Callable[..., dict[str, Path]]
+StrictManyFn = Callable[..., list[dict[str, Any]]]
+TranscribeManyFn = Callable[..., list[dict[str, Any]]]
 
 
 def find_audio_files(input_dir: Path) -> list[Path]:
@@ -64,6 +71,8 @@ def run_batch(
     config: ModelConfig | None = None,
     transcribe_fn: TranscribeFn = transcribe_audio,
     strict_fn: StrictFn = strict_transcribe_audio,
+    transcribe_many_fn: TranscribeManyFn = transcribe_audio_many,
+    strict_many_fn: StrictManyFn = strict_transcribe_many,
     caller_binding: Mapping[str, Any] | None = None,
 ) -> BatchSummary:
     mode_key = mode.strip().lower()
@@ -80,68 +89,128 @@ def run_batch(
     failed_path = output_root / "failed.jsonl"
     failed_path.write_text("", encoding="utf-8")
 
-    items: list[BatchItem] = []
-    for audio_path in find_audio_files(input_root):
+    audio_files = find_audio_files(input_root)
+    items_by_audio: dict[Path, BatchItem] = {}
+    pending: list[tuple[Path, Path]] = []
+    for audio_path in audio_files:
         item_dir = output_root / _output_dir_name(input_root, audio_path)
         expected = _expected_output_path(item_dir, audio_path, mode_key, quick_engine)
 
         if expected.exists() and not force:
             objective_outcome = _read_objective_outcome(item_dir, audio_path)
-            items.append(
-                BatchItem(
-                    audio=audio_path,
-                    out_dir=item_dir,
-                    status="skipped",
-                    message="already complete",
-                    objective_outcome=objective_outcome,
-                )
+            items_by_audio[audio_path] = BatchItem(
+                audio=audio_path,
+                out_dir=item_dir,
+                status="skipped",
+                message="already complete",
+                objective_outcome=objective_outcome,
             )
             continue
+        pending.append((audio_path, item_dir))
 
-        item_dir.mkdir(parents=True, exist_ok=True)
+    use_many = (
+        mode_key == "strict" and strict_fn is strict_transcribe_audio
+    ) or (
+        mode_key == "quick" and transcribe_fn is transcribe_audio
+    )
+    if pending and use_many:
+        for _, item_dir in pending:
+            item_dir.mkdir(parents=True, exist_ok=True)
         try:
             if mode_key == "strict":
                 call_kwargs = {
+                    "out_dirs": [item_dir for _, item_dir in pending],
                     "primary_engine": strict_primary,
                     "secondary_engine": strict_secondary,
                     "device": device,
-                    "out_dir": item_dir,
                     "cache_dir": cache_dir,
                     "config": model_config,
                 }
                 if caller_binding is not None:
                     call_kwargs["caller_binding"] = caller_binding
-                outputs = strict_fn(audio_path, **call_kwargs)
+                outputs_many = strict_many_fn(
+                    [audio_path for audio_path, _ in pending],
+                    **call_kwargs,
+                )
             else:
                 call_kwargs = {
+                    "out_dirs": [item_dir for _, item_dir in pending],
                     "engine": quick_engine,
                     "device": device,
-                    "out_dir": item_dir,
                     "cache_dir": cache_dir,
                     "config": model_config,
                 }
                 if caller_binding is not None:
                     call_kwargs["caller_binding"] = caller_binding
-                outputs = transcribe_fn(audio_path, **call_kwargs)
-            items.append(
-                BatchItem(
+                outputs_many = transcribe_many_fn(
+                    [audio_path for audio_path, _ in pending],
+                    **call_kwargs,
+                )
+            if len(outputs_many) != len(pending):
+                raise RuntimeError(
+                    f"Batch transcription returned {len(outputs_many)} results for {len(pending)} inputs."
+                )
+            for (audio_path, item_dir), outputs in zip(pending, outputs_many):
+                items_by_audio[audio_path] = BatchItem(
                     audio=audio_path,
                     out_dir=item_dir,
                     status="processed",
                     objective_outcome=_result_objective_outcome(outputs, item_dir, audio_path),
                 )
-            )
         except Exception as exc:
-            items.append(
-                BatchItem(
+            for audio_path, item_dir in pending:
+                items_by_audio[audio_path] = BatchItem(
                     audio=audio_path,
                     out_dir=item_dir,
                     status="failed",
                     message=str(exc),
                     objective_outcome="indeterminate",
                 )
-            )
-            _append_failure(failed_path, audio_path, item_dir, exc)
+                _append_failure(failed_path, audio_path, item_dir, exc)
+    else:
+        for audio_path, item_dir in pending:
+            item_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                if mode_key == "strict":
+                    call_kwargs = {
+                        "primary_engine": strict_primary,
+                        "secondary_engine": strict_secondary,
+                        "device": device,
+                        "out_dir": item_dir,
+                        "cache_dir": cache_dir,
+                        "config": model_config,
+                    }
+                    if caller_binding is not None:
+                        call_kwargs["caller_binding"] = caller_binding
+                    outputs = strict_fn(audio_path, **call_kwargs)
+                else:
+                    call_kwargs = {
+                        "engine": quick_engine,
+                        "device": device,
+                        "out_dir": item_dir,
+                        "cache_dir": cache_dir,
+                        "config": model_config,
+                    }
+                    if caller_binding is not None:
+                        call_kwargs["caller_binding"] = caller_binding
+                    outputs = transcribe_fn(audio_path, **call_kwargs)
+                items_by_audio[audio_path] = BatchItem(
+                    audio=audio_path,
+                    out_dir=item_dir,
+                    status="processed",
+                    objective_outcome=_result_objective_outcome(outputs, item_dir, audio_path),
+                )
+            except Exception as exc:
+                items_by_audio[audio_path] = BatchItem(
+                    audio=audio_path,
+                    out_dir=item_dir,
+                    status="failed",
+                    message=str(exc),
+                    objective_outcome="indeterminate",
+                )
+                _append_failure(failed_path, audio_path, item_dir, exc)
+
+    items = [items_by_audio[audio_path] for audio_path in audio_files]
 
     summary = BatchSummary(
         input_dir=input_root,

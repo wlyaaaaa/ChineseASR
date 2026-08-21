@@ -708,6 +708,54 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(kwargs["primary_provenance"]["audio"]["derivative_sha256"], "derived-hash")
             self.assertEqual(kwargs["primary_provenance"]["registry_role"], "lexical_primary")
 
+    def test_transcribe_audio_many_loads_engine_once_and_writes_each_bundle(self):
+        from zh_asr.pipeline import transcribe_audio_many
+
+        class QuickModel:
+            def __init__(self):
+                self.calls = []
+
+            def generate_many(self, inputs):
+                self.calls.append(list(inputs))
+                return [{"text": f"quick-{Path(value).stem}"} for value in inputs]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audios = []
+            out_dirs = []
+            for name in ("one.wav", "two.wav"):
+                audio = root / name
+                audio.write_bytes(b"fake wav")
+                audios.append(audio)
+                out_dirs.append(root / f"out-{audio.stem}")
+            model = QuickModel()
+
+            with (
+                patch("zh_asr.pipeline.build_model", return_value=model) as build,
+                patch(
+                    "zh_asr.pipeline._prepare_engine_input",
+                    side_effect=lambda audio, _engine, _derived, _config: (
+                        audio,
+                        {"audio": {"path": str(audio)}},
+                    ),
+                ),
+                patch("zh_asr.pipeline.write_transcript_bundle") as writer,
+            ):
+                writer.side_effect = lambda audio, _result, out_dir, *_args, **_kwargs: {
+                    "markdown": out_dir / f"{audio.stem}.md"
+                }
+                results = transcribe_audio_many(
+                    audios,
+                    out_dirs=out_dirs,
+                    engine="sensevoice",
+                )
+
+        self.assertEqual(build.call_count, 1)
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(len(model.calls[0]), 2)
+        self.assertEqual(writer.call_count, 2)
+        self.assertEqual(len(results), 2)
+
     def test_strict_transcribe_many_loads_each_engine_once_and_uses_generate_many(self):
         from zh_asr.pipeline import strict_transcribe_many
 

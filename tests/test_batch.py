@@ -110,6 +110,41 @@ class BatchTests(unittest.TestCase):
         self.assertEqual([path.name for path in calls], ["done.wav"])
         self.assertEqual(final_text, "new")
 
+    def test_run_batch_quick_uses_one_many_call_for_pending_files(self):
+        from zh_asr.batch import run_batch
+
+        calls: list[list[Path]] = []
+
+        def fake_many(audio_paths, *, out_dirs, engine, device, cache_dir, config):
+            calls.append(list(audio_paths))
+            results = []
+            for audio_path, out_dir in zip(audio_paths, out_dirs):
+                out_dir.mkdir(parents=True, exist_ok=True)
+                final = out_dir / f"{audio_path.stem}.{engine}.md"
+                final.write_text("ok", encoding="utf-8")
+                results.append({"markdown": final, "objective_outcome": "speech_transcribed"})
+            return results
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            output_dir = root / "out"
+            input_dir.mkdir()
+            (input_dir / "one.wav").write_text("", encoding="utf-8")
+            (input_dir / "two.mp3").write_text("", encoding="utf-8")
+
+            summary = run_batch(
+                input_dir=input_dir,
+                out_dir=output_dir,
+                mode="quick",
+                engine="sensevoice",
+                transcribe_many_fn=fake_many,
+            )
+
+        self.assertEqual([[path.name for path in call] for call in calls], [["one.wav", "two.mp3"]])
+        self.assertEqual(summary.processed, 2)
+        self.assertEqual(summary.failed, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
