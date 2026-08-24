@@ -219,6 +219,43 @@ strict 模式会把最终稿和证据拆开：
 
 不要把 raw JSON 当最终稿。常规读取顺序是：先看 `outputs.final` 或 `*.strict.md`，再看 `audit.md`、`audit_json`、`metrics.json` 和 `review.md`。
 
+## 按需说话人归属
+
+这不是声纹库，也不是把模型给出的 `speaker` 编号当成“本人”。只有某个真实问题需要知道一句话是谁说的时，才对**已有的、带起止时间的转写 JSON**运行一次小投影：
+
+```powershell
+python -m zh_asr attribute-speakers C:\private\call.raw.json `
+  --context C:\private\call.speaker-context.json `
+  --out C:\private\call.speaker-attribution.json
+```
+
+`context` 是一个很小的 JSON 对象：它声明录音类型，并只给需要判断的分段提供来源身份、对话角色、句义或声道依据。输出的每段只有起止时间、文字、匿名 `speaker`、`confirmed` / `inferred` / `unknown`、`self` / `other` / `unknown` 和一句依据；没有 embedding、声纹向量或跨录音 profile。
+
+```json
+{
+  "schema": "chinese-asr.speaker-attribution-context.v1",
+  "recording_kind": "mono_call",
+  "segment_evidence": [
+    {
+      "index": 0,
+      "dialogue_role": {
+        "candidate_role": "self",
+        "reason": "该句在快递员询问后回答了本人持有物的故障。"
+      }
+    }
+  ]
+}
+```
+
+`source_identity` 与 `dialogue_role` 形状相同，但前者代表明确来源事实并输出 `confirmed`；`semantic_role` 也使用相同形状。小米立体声还需同时提供 `recording_kind=\"xiaomi_app_stereo\"`、`stereo_cohort_id=\"xiaomi-app-stereo-2026-08-verified\"` 和该分段的 `channel=\"right\"`。
+
+- `confirmed` 只能来自明确的来源身份事实。
+- 单声道通话必须先有时间戳分句，再由联系人、对话角色或句义得到 `inferred`；模型 speaker 编号只用于匿名分段，不能认人。
+- 仅 `xiaomi-app-stereo-2026-08-verified` 这个已验证的小米应用立体声 cohort 的右声道可以得到“本人候选”；来源事实或句义可否决它。这不是所有 AAC、手机或应用的左右声道规则。
+- 没有足够依据时输出 `unknown` 且顶层 `speaker_attribution_gap=true`。这不会妨碍读取不依赖说话人的录音事实，也不能借此把话归给用户。
+
+这条入口不读取原始音频、不加载模型、不重跑历史录音；如果原转写没有可用时间戳，应只在真实问题需要时先补该一份录音的时间戳分句。
+
 顶层 job 的 `succeeded` 只表示流程产出了结果；机器消费者必须同时读取 `evidence_status`：
 
 - `verified`：要求的双引擎链完整执行，且 final、audit、review、两路 raw 已通过收据哈希和语义交叉校验；不表示转写逐字准确，仍需看 `status`、分歧和人工复核项；

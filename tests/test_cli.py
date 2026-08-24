@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -404,6 +405,24 @@ engines:
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("http://127.0.0.1:18666", result.stdout)
+
+    def test_attribute_speakers_writes_projection_without_loading_a_model(self):
+        fixture_root = PROJECT_ROOT / "tests" / "fixtures" / "speaker_attribution"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "attribution.json"
+            result = self.run_cli(
+                "attribute-speakers",
+                str(fixture_root / "stereo_transcript.json"),
+                "--context",
+                str(fixture_root / "stereo_context.json"),
+                "--out",
+                str(output),
+            )
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Speaker attribution gap: False", result.stdout)
+        self.assertEqual(payload["segments"][0]["candidate_role"], "self")
 
 
 if __name__ == "__main__":

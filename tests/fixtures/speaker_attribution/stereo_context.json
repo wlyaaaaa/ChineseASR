@@ -1,0 +1,19 @@
+{
+  "schema": "chinese-asr.speaker-attribution-context.v1",
+  "recording_kind": "xiaomi_app_stereo",
+  "stereo_cohort_id": "xiaomi-app-stereo-2026-08-verified",
+  "segment_evidence": [
+    {
+      "index": 0,
+      "channel": "right"
+    },
+    {
+      "index": 1,
+      "channel": "right",
+      "semantic_role": {
+        "candidate_role": "other",
+        "reason": "句义表明这句是对方承诺后续联系。"
+      }
+    }
+  ]
+}

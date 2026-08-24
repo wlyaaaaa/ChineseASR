@@ -24,6 +24,7 @@ from .long_audio import run_long_transcription
 from .pipeline import MissingDependencyError, build_model, default_cache_dir, project_root, strict_transcribe_audio, transcribe_audio
 from .process_control import managed_popen_kwargs, terminate_process_tree
 from .proxy_guard import PROXY_ENV_NAMES, sanitize_current_process_env
+from .speaker_attribution import write_speaker_attribution
 from .service import CALLER_BINDING_ENV, serve_api
 
 
@@ -119,6 +120,14 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--port", type=int, default=18666)
     serve.add_argument("--state-dir", type=Path, default=Path("outputs") / "api")
     serve.add_argument("--check", action="store_true", help="Validate serve configuration without blocking.")
+
+    attribution = subparsers.add_parser(
+        "attribute-speakers",
+        help="Create a fail-closed speaker-attribution projection from existing ASR JSON.",
+    )
+    attribution.add_argument("transcript_json", type=Path)
+    attribution.add_argument("--context", type=Path, required=True)
+    attribution.add_argument("--out", type=Path, required=True)
 
     args = parser.parse_args(argv)
     try:
@@ -329,6 +338,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"State directory: {state_dir}")
                 return 0
             return serve_api(args.host, args.port, state_dir, root=project_root())
+        if args.command == "attribute-speakers":
+            transcript_result = json.loads(args.transcript_json.read_text(encoding="utf-8"))
+            context = json.loads(args.context.read_text(encoding="utf-8"))
+            payload = write_speaker_attribution(args.out, transcript_result, context)
+            print(f"Speaker attribution: {args.out}")
+            print(f"Segments: {len(payload['segments'])}")
+            print(f"Speaker attribution gap: {payload['speaker_attribution_gap']}")
+            return 0
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         return 2
