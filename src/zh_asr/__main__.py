@@ -24,6 +24,7 @@ from .long_audio import run_long_transcription
 from .pipeline import MissingDependencyError, build_model, default_cache_dir, project_root, strict_transcribe_audio, transcribe_audio
 from .process_control import managed_popen_kwargs, terminate_process_tree
 from .proxy_guard import PROXY_ENV_NAMES, sanitize_current_process_env
+from .result_writer import file_sha256
 from .speaker_attribution import write_speaker_attribution
 from .speaker_evidence import (
     SELF_PERSON_ID,
@@ -64,6 +65,14 @@ def main(argv: list[str] | None = None) -> int:
     transcribe = subparsers.add_parser("transcribe", help="Transcribe one audio file.")
     transcribe.add_argument("audio", type=Path)
     transcribe.add_argument("--engine", choices=engine_choices, default=model_config.default_engine)
+    transcribe.add_argument(
+        "--preset-spk-num",
+        type=int,
+        help=(
+            "Only with explicit --engine paraformer: constrain anonymous diarization to a known "
+            "positive speaker count. Omit to retain automatic clustering."
+        ),
+    )
     transcribe.add_argument("--device", default="cuda:0")
     transcribe.add_argument("--out-dir", type=Path, default=Path("outputs"))
     transcribe.add_argument("--cache-dir", type=Path, default=default_cache_dir())
@@ -233,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                     out_dir=args.out_dir,
                     cache_dir=args.cache_dir,
                     config=model_config,
+                    preset_spk_num=args.preset_spk_num,
                     caller_binding=caller_binding,
                 ),
             )
@@ -405,6 +415,13 @@ def main(argv: list[str] | None = None) -> int:
                 transcript_result,
                 context,
                 voice_evidence=voice_evidence,
+                input_hashes={
+                    "transcript_json_sha256": file_sha256(args.transcript_json),
+                    "context_json_sha256": file_sha256(args.context),
+                    "voice_evidence_json_sha256": [
+                        file_sha256(path) for path in args.voice_evidence
+                    ],
+                },
             )
             print(f"Speaker attribution: {args.out}")
             print(f"Segments: {len(payload['segments'])}")

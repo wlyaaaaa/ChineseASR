@@ -4,7 +4,8 @@ The projection never treats a diarization cluster, an anonymous ``speaker``
 number, a CAM++ score, or a channel by itself as a confirmed identity. It can
 use any one usable positive signal to make a reversible ``inferred`` judgement;
 only unavailable, genuinely balanced, or conflicting evidence stays ``unknown``.
-``confirmed`` remains reserved for an authoritative source reference.
+There is currently no trusted source-receipt adapter, so caller-provided
+``authority_ref`` values also remain ``inferred`` rather than ``confirmed``.
 """
 
 from __future__ import annotations
@@ -13,18 +14,23 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any, Mapping, Sequence
 
 from .result_writer import TranscriptSegment, canonical_json_sha256, extract_segments
 from .speaker_evidence import (
     SELF_PERSON_ID,
+    SELF_SPEAKER_PROFILE_SCHEMA,
     SELF_SPEAKER_EVIDENCE_SCHEMA,
     SPEAKER_MODEL_EVIDENCE_SCHEMA,
     VOICE_SCORE_AMBIGUITY_MARGIN,
 )
 
 
-SPEAKER_ATTRIBUTION_SCHEMA = "chinese-asr.speaker-attribution.v2"
+SPEAKER_ATTRIBUTION_SCHEMA = "chinese-asr.speaker-attribution.v3"
+SPEAKER_ATTRIBUTION_INPUT_BINDING_SCHEMA = (
+    "chinese-asr.speaker-attribution-input-binding.v1"
+)
 SPEAKER_ATTRIBUTION_CONTEXT_SCHEMA = "chinese-asr.speaker-attribution-context.v2"
 _LEGACY_CONTEXT_SCHEMA = "chinese-asr.speaker-attribution-context.v1"
 XIAOMI_APP_STEREO_COHORT_ID = "xiaomi-app-stereo-2026-08-verified"
@@ -61,6 +67,7 @@ def attribute_transcript_result(
     context: Mapping[str, Any],
     *,
     voice_evidence: Sequence[Mapping[str, Any]] = (),
+    input_hashes: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Attribute timestamped existing transcript segments without loading audio/models."""
 
@@ -68,6 +75,8 @@ def attribute_transcript_result(
         extract_segments(transcript_result),
         context,
         voice_evidence=voice_evidence,
+        transcript_value=transcript_result,
+        input_hashes=input_hashes,
     )
 
 
@@ -76,8 +85,10 @@ def attribute_segments(
     context: Mapping[str, Any],
     *,
     voice_evidence: Sequence[Mapping[str, Any]] = (),
+    transcript_value: Any | None = None,
+    input_hashes: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return the minimal consumer-facing, evidence-explaining role projection."""
+    """Return the minimal consumer-facing role projection with source bindings."""
 
     parsed = _parse_context(context, len(segments))
     parsed_voice_evidence = _parse_voice_evidence(voice_evidence)
@@ -85,12 +96,19 @@ def attribute_segments(
         raise SpeakerAttributionError(
             "recording_audio.sha256 is required before voice evidence can bind to transcript segments."
         )
+    binding = _build_input_binding(
+        transcript_value if transcript_value is not None else _segments_for_hash(segments),
+        context,
+        voice_evidence,
+        parsed.recording_source_sha256,
+        input_hashes=input_hashes,
+    )
 
     anonymous_speakers: dict[str, str] = {}
     projected: list[dict[str, Any]] = []
     has_gap = False
     for segment in segments:
-        status, candidate_role, basis, evidence = _attribute_segment(
+        status, candidate_role, basis = _attribute_segment(
             segment,
             parsed,
             parsed.evidence_by_index.get(segment.index, {}),
@@ -104,14 +122,15 @@ def attribute_segments(
                 "end_ms": segment.end_ms,
                 "text": segment.text,
                 "speaker": _anonymous_speaker(segment.speaker, anonymous_speakers),
+                "raw_json_pointer": segment.raw_path,
                 "attribution_status": status,
                 "candidate_role": candidate_role,
-                "basis": basis,
-                "evidence": evidence,
+                "basis": _one_sentence_chinese(basis),
             }
         )
     return {
         "schema": SPEAKER_ATTRIBUTION_SCHEMA,
+        "input_binding": binding,
         "segments": projected,
         "speaker_attribution_gap": has_gap,
     }
@@ -123,6 +142,7 @@ def write_speaker_attribution(
     context: Mapping[str, Any],
     *,
     voice_evidence: Sequence[Mapping[str, Any]] = (),
+    input_hashes: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write one JSON projection and return the same in-memory result."""
 
@@ -130,6 +150,7 @@ def write_speaker_attribution(
         transcript_result,
         context,
         voice_evidence=voice_evidence,
+        input_hashes=input_hashes,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -144,36 +165,17 @@ def _attribute_segment(
     context: _Context,
     evidence: Mapping[str, Any],
     voice_evidence: Sequence[Mapping[str, Any]],
-) -> tuple[str, str, str, list[dict[str, Any]]]:
+) -> tuple[str, str, str]:
     if not _has_complete_time_range(segment):
         return (
             "unknown",
             "unknown",
             "转写没有可用的起止时间，不能把这段话与来源、声道或声纹证据精确绑定。",
-            [],
         )
 
     signals = _context_signals(evidence)
     signals.extend(_voice_signals(segment, context, voice_evidence))
     signals.extend(_xiaomi_channel_signals(segment, context, voice_evidence))
-
-    authoritative = [item for item in signals if item["kind"] == "authoritative_source"]
-    authoritative_roles = {item["candidate_role"] for item in authoritative}
-    if len(authoritative_roles) == 1:
-        role = next(iter(authoritative_roles))
-        return (
-            "confirmed",
-            role,
-            authoritative[0]["reason"],
-            signals,
-        )
-    if len(authoritative_roles) > 1:
-        return (
-            "unknown",
-            "unknown",
-            "多个权威来源引用对这段话给出了相互矛盾的身份结论。",
-            signals,
-        )
 
     directional = [item for item in signals if item["candidate_role"] in _ROLES]
     active_roles = {item["candidate_role"] for item in directional}
@@ -182,7 +184,6 @@ def _attribute_segment(
             "unknown",
             "unknown",
             _unknown_reason(context, signals),
-            signals,
         )
     if len(active_roles) == 1:
         role = next(iter(active_roles))
@@ -190,7 +191,6 @@ def _attribute_segment(
             "inferred",
             role,
             _basis_for_role(role, directional),
-            signals,
         )
 
     contextual = [item for item in directional if item["kind"] in _CONTEXTUAL_KINDS]
@@ -202,13 +202,12 @@ def _attribute_segment(
             "inferred",
             role,
             _basis_for_context_override(role, contextual, opposing),
-            signals,
         )
     if len(contextual_roles) > 1:
         reason = "来源、联系人、对话或句义判断彼此冲突，现有材料无法给出可解释的取舍，保留为 unknown。"
     else:
         reason = "只有相互矛盾的声纹或声道线索，缺少具体的来源、联系人、对话或句义判断来消解，保留为 unknown。"
-    return ("unknown", "unknown", reason, signals)
+    return ("unknown", "unknown", reason)
 
 
 def _parse_context(context: Mapping[str, Any], segment_count: int) -> _Context:
@@ -269,23 +268,17 @@ def _context_signals(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
     signals: list[dict[str, Any]] = []
     source = _role_evidence(evidence, "source_identity")
     if source is not None:
+        reference: dict[str, str] = {}
         if source["authority_ref"] is not None:
-            signals.append(
-                _signal(
-                    "authoritative_source",
-                    source["candidate_role"],
-                    source["reason"],
-                    authority_ref=source["authority_ref"],
-                )
+            reference["authority_ref"] = source["authority_ref"]
+        signals.append(
+            _signal(
+                "source_context",
+                source["candidate_role"],
+                source["reason"],
+                **reference,
             )
-        else:
-            signals.append(
-                _signal(
-                    "source_context",
-                    source["candidate_role"],
-                    source["reason"],
-                )
-            )
+        )
     for field in ("contact_role", "dialogue_role", "semantic_role", "cross_recording_role"):
         item = _role_evidence(evidence, field)
         if item is not None:
@@ -315,7 +308,7 @@ def _voice_signals(
                 _signal(
                     "voice_similarity_near_threshold",
                     "unknown",
-                    "本段 CAM++ 相似度接近当前阈值，单独不作为方向性身份线索。",
+                    "本段本地声纹比对接近阈值，单独不作为方向性身份线索。",
                     evidence_sha256=evidence_ref,
                 )
             )
@@ -325,7 +318,7 @@ def _voice_signals(
                 _signal(
                     "voice_similarity",
                     "self",
-                    f"本段 CAM++ 余弦相似度 {value:.4f} 高于阈值 {threshold:.4f}，支持本人候选。",
+                    "本段本地声纹比对支持本人候选。",
                     evidence_sha256=evidence_ref,
                 )
             )
@@ -334,7 +327,7 @@ def _voice_signals(
                 _signal(
                     "voice_similarity",
                     "other",
-                    f"本段 CAM++ 余弦相似度 {value:.4f} 低于阈值 {threshold:.4f}，仅是弱的非本人线索。",
+                    "本段本地声纹比对只提供可撤销的非本人线索。",
                     evidence_sha256=evidence_ref,
                 )
             )
@@ -404,6 +397,7 @@ def _parse_voice_evidence(value: Sequence[Mapping[str, Any]]) -> tuple[Mapping[s
             )
         if document.get("person_id") != SELF_PERSON_ID:
             raise SpeakerAttributionError("voice_evidence may only refer to person:self.")
+        _validate_voice_evidence_identity(document)
         target = document.get("target")
         if not isinstance(target, Mapping):
             raise SpeakerAttributionError("voice_evidence target must be an object.")
@@ -411,6 +405,7 @@ def _parse_voice_evidence(value: Sequence[Mapping[str, Any]]) -> tuple[Mapping[s
         segment = target.get("segment")
         if not isinstance(source, Mapping) or not isinstance(segment, Mapping):
             raise SpeakerAttributionError("voice_evidence target source/segment is malformed.")
+        _validate_source_reference(source, "voice_evidence target source")
         _validate_sha256(source.get("sha256"), "voice_evidence target source")
         _finite_time(segment.get("start_ms"), "voice_evidence start_ms")
         _finite_time(segment.get("end_ms"), "voice_evidence end_ms")
@@ -420,16 +415,159 @@ def _parse_voice_evidence(value: Sequence[Mapping[str, Any]]) -> tuple[Mapping[s
             raise SpeakerAttributionError("voice_evidence channel must be mix, left, or right.")
         if segment.get("channel_binding") not in _CHANNEL_BINDINGS:
             raise SpeakerAttributionError("voice_evidence channel binding is invalid.")
+        if segment["channel"] == "mix" and segment["channel_binding"] != "mixed_not_channel_evidence":
+            raise SpeakerAttributionError("mixed voice_evidence must declare mixed_not_channel_evidence.")
+        if segment["channel"] in {"left", "right"} and segment["channel_binding"] != "exact_stereo_channel":
+            raise SpeakerAttributionError("left/right voice_evidence must declare exact_stereo_channel.")
         score = document.get("score")
         if not isinstance(score, Mapping) or score.get("metric") != "cosine_similarity":
             raise SpeakerAttributionError("voice_evidence must contain a cosine similarity score.")
         for field in ("value", "threshold"):
             _finite_score(score.get(field), f"voice_evidence score.{field}")
+        if not -1 <= float(score["value"]) <= 1 or not -1 <= float(score["threshold"]) <= 1:
+            raise SpeakerAttributionError("voice_evidence cosine score/threshold must be in [-1, 1].")
+        comparison = score.get("comparison")
+        expected_comparison = (
+            "above_threshold"
+            if float(score["value"]) >= float(score["threshold"])
+            else "below_threshold"
+        )
+        if comparison != expected_comparison:
+            raise SpeakerAttributionError("voice_evidence score comparison is inconsistent with score value.")
         model = document.get("model")
-        if not isinstance(model, Mapping) or model.get("schema") != SPEAKER_MODEL_EVIDENCE_SCHEMA:
-            raise SpeakerAttributionError("voice_evidence must contain hash-bound speaker model evidence.")
+        _validate_voice_model_evidence(model, score_threshold=float(score["threshold"]))
         documents.append(document)
     return tuple(documents)
+
+
+def _validate_voice_evidence_identity(document: Mapping[str, Any]) -> None:
+    generated_utc = document.get("generated_utc")
+    if not isinstance(generated_utc, str) or not generated_utc.strip() or not generated_utc.endswith("Z"):
+        raise SpeakerAttributionError("voice_evidence generated_utc is invalid.")
+    if document.get("identity_status") != "unconfirmed":
+        raise SpeakerAttributionError("voice_evidence identity_status must be unconfirmed.")
+    meaning = document.get("meaning")
+    if not isinstance(meaning, str) or not meaning.strip() or "\n" in meaning:
+        raise SpeakerAttributionError("voice_evidence meaning must be one non-empty sentence.")
+
+    profile = document.get("profile")
+    if not isinstance(profile, Mapping):
+        raise SpeakerAttributionError("voice_evidence must bind the person:self profile.")
+    if profile.get("schema") != SELF_SPEAKER_PROFILE_SCHEMA:
+        raise SpeakerAttributionError("voice_evidence profile schema is invalid.")
+    _validate_sha256(profile.get("sha256"), "voice_evidence profile")
+    _validate_sha256(
+        profile.get("enrollment_source_sha256"),
+        "voice_evidence profile enrollment source",
+    )
+    if profile.get("identity_status") != "inferred":
+        raise SpeakerAttributionError("voice_evidence profile identity_status must be inferred.")
+    enrollment_basis = profile.get("enrollment_basis")
+    if (
+        not isinstance(enrollment_basis, str)
+        or not enrollment_basis.strip()
+        or "\n" in enrollment_basis
+    ):
+        raise SpeakerAttributionError("voice_evidence profile enrollment_basis is invalid.")
+
+
+def _validate_source_reference(source: Mapping[str, Any], label: str) -> None:
+    path = source.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise SpeakerAttributionError(f"{label} path is invalid.")
+    size = source.get("bytes")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise SpeakerAttributionError(f"{label} bytes are invalid.")
+    _validate_sha256(source.get("sha256"), label)
+
+
+def _validate_voice_model_evidence(value: Any, *, score_threshold: float) -> None:
+    if not isinstance(value, Mapping) or value.get("schema") != SPEAKER_MODEL_EVIDENCE_SCHEMA:
+        raise SpeakerAttributionError("voice_evidence must contain hash-bound speaker model evidence.")
+    for field in ("model_id", "configured_revision", "local_model_dir"):
+        item = value.get(field)
+        if not isinstance(item, str) or not item.strip():
+            raise SpeakerAttributionError(f"voice_evidence model {field} is invalid.")
+    _validate_sha256(value.get("registry_sha256"), "voice_evidence model registry")
+    threshold = value.get("threshold")
+    _finite_score(threshold, "voice_evidence model threshold")
+    if not -1 <= float(threshold) <= 1:
+        raise SpeakerAttributionError("voice_evidence model threshold must be in [-1, 1].")
+    if not math.isclose(float(threshold), score_threshold, rel_tol=0.0, abs_tol=1e-12):
+        raise SpeakerAttributionError("voice_evidence score threshold must match model evidence.")
+    runtime = value.get("runtime")
+    if not isinstance(runtime, Mapping):
+        raise SpeakerAttributionError("voice_evidence model runtime is invalid.")
+    for field in ("package", "version"):
+        item = runtime.get(field)
+        if not isinstance(item, str) or not item.strip():
+            raise SpeakerAttributionError(f"voice_evidence model runtime {field} is invalid.")
+    files = value.get("files")
+    if not isinstance(files, list) or not files:
+        raise SpeakerAttributionError("voice_evidence model files are invalid.")
+    for item in files:
+        if not isinstance(item, Mapping):
+            raise SpeakerAttributionError("voice_evidence model file record is invalid.")
+        path = item.get("path")
+        size = item.get("bytes")
+        if not isinstance(path, str) or not path.strip():
+            raise SpeakerAttributionError("voice_evidence model file path is invalid.")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise SpeakerAttributionError("voice_evidence model file bytes are invalid.")
+        _validate_sha256(item.get("sha256"), "voice_evidence model file")
+
+
+def _build_input_binding(
+    transcript_value: Any,
+    context: Mapping[str, Any],
+    voice_evidence: Sequence[Mapping[str, Any]],
+    recording_audio_sha256: str | None,
+    *,
+    input_hashes: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if input_hashes is None:
+        transcript_hash = canonical_json_sha256(transcript_value)
+        context_hash = canonical_json_sha256(context)
+        evidence_hashes = [canonical_json_sha256(item) for item in voice_evidence]
+        hash_kind = "canonical_json"
+    else:
+        transcript_hash = input_hashes.get("transcript_json_sha256")
+        context_hash = input_hashes.get("context_json_sha256")
+        evidence_hashes = input_hashes.get("voice_evidence_json_sha256")
+        hash_kind = "file_bytes"
+        _validate_sha256(transcript_hash, "input transcript JSON")
+        _validate_sha256(context_hash, "input context JSON")
+        if not isinstance(evidence_hashes, Sequence) or isinstance(
+            evidence_hashes, (str, bytes, bytearray)
+        ):
+            raise SpeakerAttributionError("input voice_evidence_json_sha256 must be a sequence.")
+        if len(evidence_hashes) != len(voice_evidence):
+            raise SpeakerAttributionError("input voice-evidence hash count does not match voice_evidence.")
+        for item in evidence_hashes:
+            _validate_sha256(item, "input voice-evidence JSON")
+    return {
+        "schema": SPEAKER_ATTRIBUTION_INPUT_BINDING_SCHEMA,
+        "hash_algorithm": "sha256",
+        "hash_kind": hash_kind,
+        "transcript_json_sha256": str(transcript_hash).lower(),
+        "context_json_sha256": str(context_hash).lower(),
+        "voice_evidence_json_sha256": [str(item).lower() for item in evidence_hashes],
+        "recording_audio_sha256": recording_audio_sha256,
+    }
+
+
+def _segments_for_hash(segments: Sequence[TranscriptSegment]) -> list[dict[str, Any]]:
+    return [
+        {
+            "index": segment.index,
+            "text": segment.text,
+            "start_ms": segment.start_ms,
+            "end_ms": segment.end_ms,
+            "speaker": segment.speaker,
+            "raw_path": segment.raw_path,
+        }
+        for segment in segments
+    ]
 
 
 def _role_evidence(evidence: Mapping[str, Any], field: str) -> dict[str, str | None] | None:
@@ -490,6 +628,15 @@ def _basis_for_context_override(
     )
 
 
+def _one_sentence_chinese(value: str) -> str:
+    """Expose a compact Chinese basis without leaking internal evidence details."""
+
+    text = " ".join(str(value).split())
+    text = re.sub(r"[。！？!?]+", "；", text)
+    text = re.sub(r"[；;]+", "；", text).strip("；;，, ")
+    return f"{text or '现有材料不足以形成可解释归属'}。"
+
+
 def _unknown_reason(context: _Context, signals: Sequence[Mapping[str, Any]]) -> str:
     if any(item["kind"] == "voice_similarity_near_threshold" for item in signals):
         return "现有声纹相似度接近阈值，且没有其他可用线索，保留为 unknown。"
@@ -526,7 +673,7 @@ def _has_complete_time_range(segment: TranscriptSegment) -> bool:
         return (
             math.isfinite(float(segment.start_ms))
             and math.isfinite(float(segment.end_ms))
-            and segment.end_ms >= segment.start_ms
+            and segment.end_ms > segment.start_ms
         )
     except (TypeError, ValueError):
         return False

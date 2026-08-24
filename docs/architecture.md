@@ -18,10 +18,10 @@
 1. `qwen3-asr-1.7b`：strict 准确率优先主线。基于 Qwen3-ASR 官方开源权重和 `qwen-asr` runtime。
 2. `sensevoice`：quick 默认和 strict 低幻觉锚点。组合 `iic/SenseVoiceSmall`、`fsmn-vad`、`ct-punc`；默认明确**不**加载 `cam++`。
 3. `fireredasr2-llm`：可选的证据级词汇主引擎，仅在显式选择时进入 strict；安装或下载不会改变默认组合。
-4. `paraformer`：中文保守备用线。可产出时间戳；显式 `cam++` 输出是 diarization/匿名聚类而非用户身份确认，可能过拆或合并。
+4. `paraformer`：显式时间线/匿名说话人备用线，固定 `iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4`，通过现有 FunASR adapter 传入 VAD、PUNC 与 `cam++`，输出逐句 `sentence_info` 时间和匿名 diarization/聚类。单文件 `transcribe --engine paraformer --preset-spk-num N` 只在调用方已知人数时把 `N` 传给 FunASR，并把 `automatic`/`preset` 与人数写入 objective-result 的 `request.speaker_diarization`；省略则保留自动聚类，其他引擎、quick、strict 和批量路径不会接受或传播该参数。它不改变 quick/strict 默认，且 cluster 仍不是用户身份确认，可能过拆或合并。
 5. `whisper-large-v3`：只记录为 fallback/comparison，不自动作为主输出。
 
-`speaker-enroll` / `speaker-evidence` 在真实问题需要时才按需读取一个有限音频片段。enroll 只允许创建一个带单句可回查依据、可替换且永远为 `inferred` 的本机私有 `person:self` 向量；目标片段只输出源哈希、时间、模型哈希和相似度。它不建设通用声纹平台，也不让分数、匿名 cluster 或默认下混音频单独产生 `confirmed`。归属投影保留来源、联系人、声道、对话角色、句义、跨录音与声纹的各项理由，但不计算固定权重、合成分数或长期置信等级：具体的来源/语义判断可以解释性地压过相反的弱声学线索，无法合理消解的实质冲突才是 `unknown`；`confirmed` 仍要求权威来源引用。
+`speaker-enroll` / `speaker-evidence` 在真实问题需要时才按需读取一个有限音频片段。enroll 只允许创建一个带单句可回查依据、可替换且永远为 `inferred` 的本机私有 `person:self` 向量；目标片段只输出源哈希、时间、模型哈希和相似度。它不建设通用声纹平台，也不让分数、匿名 cluster 或默认下混音频单独产生 `confirmed`。归属投影内部可融合来源、联系人、声道、对话角色、句义、跨录音与声纹，但对外只交付匿名说话人、状态、角色、单句依据、原转写 JSON pointer 与输入哈希绑定，不下发声纹分数或逐项内部线索。当前没有独立可信 receipt adapter，`authority_ref` 仅是 caller 提供的来源指针，不能使结果变为 `confirmed`；具体的来源/语义判断可以解释性地压过相反的弱声学线索，无法合理消解的实质冲突才是 `unknown`。
 
 FireRed 通过 Windows adapter 调用隔离的 WSL worker。默认 WSL Python 为 `/opt/chineseasr/firered/.venv/bin/python`；源码和权重位于 Git 忽略的 `models/firered/FireRedASR2S` 与 `models/firered/FireRedASR2-LLM`。固定来源是：
 

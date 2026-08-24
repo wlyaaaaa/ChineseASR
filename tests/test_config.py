@@ -38,6 +38,22 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(spec.options["model_revision"], "05201c46f1c38592b1567f857c0d56eab3d0d8ef")
         self.assertTrue(spec.options["trust_remote_code"])
 
+    def test_paraformer_is_an_explicit_timestamped_anonymous_diarization_profile(self):
+        from zh_asr.config import get_engine_spec
+
+        spec = get_engine_spec("paraformer")
+
+        self.assertEqual(spec.adapter, "funasr")
+        self.assertEqual(spec.role, "baseline")
+        self.assertEqual(
+            spec.model,
+            "iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        )
+        self.assertEqual(spec.options["model_revision"], "v2.0.4")
+        self.assertEqual(spec.vad_model, "fsmn-vad")
+        self.assertEqual(spec.punc_model, "ct-punc")
+        self.assertEqual(spec.spk_model, "cam++")
+
     def test_whisper_is_marked_as_fallback_only(self):
         from zh_asr.config import get_engine_spec
 

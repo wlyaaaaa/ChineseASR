@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -235,6 +236,45 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Audio file not found", result.stderr)
 
+    def test_transcribe_cli_passes_explicit_paraformer_preset_speaker_count_without_loading_model(self):
+        from zh_asr.__main__ import main
+
+        paths = {
+            "markdown": Path("out.md"),
+            "json": Path("out.raw.json"),
+            "objective_outcome": "speech_transcribed",
+        }
+        with patch("zh_asr.__main__.transcribe_audio", return_value=paths) as transcribe:
+            returncode = main(
+                [
+                    "transcribe",
+                    "not-read.wav",
+                    "--engine",
+                    "paraformer",
+                    "--preset-spk-num",
+                    "2",
+                    "--device",
+                    "cpu",
+                ]
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(transcribe.call_args.kwargs["engine"], "paraformer")
+        self.assertEqual(transcribe.call_args.kwargs["preset_spk_num"], 2)
+
+    def test_preset_speaker_count_is_not_accepted_by_default_engine(self):
+        result = self.run_cli(
+            "transcribe",
+            "not-read.wav",
+            "--preset-spk-num",
+            "2",
+            "--device",
+            "cpu",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("only by explicit paraformer", result.stderr)
+
     def test_strict_missing_audio_fails_clearly_before_model_load(self):
         result = self.run_cli("strict", "missing.wav", "--device", "cpu")
 
@@ -408,6 +448,7 @@ engines:
 
     def test_attribute_speakers_writes_projection_without_loading_a_model(self):
         fixture_root = PROJECT_ROOT / "tests" / "fixtures" / "speaker_attribution"
+        transcript = fixture_root / "mono_unknown_transcript.json"
         with tempfile.TemporaryDirectory() as tmp:
             context = Path(tmp) / "context.json"
             output = Path(tmp) / "attribution.json"
@@ -432,17 +473,27 @@ engines:
             )
             result = self.run_cli(
                 "attribute-speakers",
-                str(fixture_root / "mono_unknown_transcript.json"),
+                str(transcript),
                 "--context",
                 str(context),
                 "--out",
                 str(output),
             )
             payload = json.loads(output.read_text(encoding="utf-8"))
+            transcript_hash = hashlib.sha256(transcript.read_bytes()).hexdigest()
+            context_hash = hashlib.sha256(context.read_bytes()).hexdigest()
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Speaker attribution gap: False", result.stdout)
         self.assertEqual(payload["segments"][0]["candidate_role"], "self")
+        self.assertEqual(payload["input_binding"]["hash_kind"], "file_bytes")
+        self.assertEqual(payload["input_binding"]["transcript_json_sha256"], transcript_hash)
+        self.assertEqual(payload["input_binding"]["context_json_sha256"], context_hash)
+        self.assertEqual(payload["input_binding"]["voice_evidence_json_sha256"], [])
+        self.assertEqual(
+            payload["segments"][0]["raw_json_pointer"],
+            "$[0].sentence_info[0]",
+        )
 
     def test_speaker_commands_are_discoverable_without_loading_a_model(self):
         enroll = self.run_cli("speaker-enroll", "--help")

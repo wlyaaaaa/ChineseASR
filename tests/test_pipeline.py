@@ -126,6 +126,78 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(kwargs["punc_model"], str(cache / "iic/punc_ct-transformer_cn-en-common-vocab471067-large"))
             self.assertNotIn("spk_model", kwargs)
 
+    def test_paraformer_timeline_profile_forwards_revision_and_anonymous_speaker_model(self):
+        from zh_asr.config import get_engine_spec, load_model_config
+        from zh_asr.pipeline import _funasr_kwargs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            for relative in [
+                "iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+                "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+                "iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+                "iic/speech_campplus_sv_zh-cn_16k-common",
+            ]:
+                (cache / relative).mkdir(parents=True)
+
+            config = load_model_config()
+            kwargs = _funasr_kwargs(get_engine_spec("paraformer"), "cuda:0", cache, config.model_aliases)
+
+        self.assertEqual(
+            kwargs["model"],
+            str(cache / "iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch"),
+        )
+        self.assertEqual(kwargs["model_revision"], "v2.0.4")
+        self.assertEqual(kwargs["vad_model"], str(cache / "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"))
+        self.assertEqual(kwargs["punc_model"], str(cache / "iic/punc_ct-transformer_cn-en-common-vocab471067-large"))
+        self.assertEqual(kwargs["spk_model"], str(cache / "iic/speech_campplus_sv_zh-cn_16k-common"))
+
+    def test_explicit_paraformer_forwards_optional_preset_speaker_count(self):
+        from zh_asr.config import load_model_config
+        from zh_asr.pipeline import _generate_once_with_identity
+
+        class DummyModel:
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, **kwargs):
+                self.calls.append(kwargs)
+                return [{"text": "测试"}]
+
+        model = DummyModel()
+        with patch("zh_asr.pipeline.build_model", return_value=model), patch(
+            "zh_asr.pipeline._empty_cuda_cache"
+        ):
+            _generate_once_with_identity(
+                Path("not-read.wav"),
+                "paraformer",
+                "cpu",
+                None,
+                load_model_config(),
+                preset_spk_num=2,
+            )
+            _generate_once_with_identity(
+                Path("not-read.wav"),
+                "paraformer",
+                "cpu",
+                None,
+                load_model_config(),
+            )
+
+        self.assertEqual(
+            model.calls[0],
+            {"input": "not-read.wav", "batch_size_s": 300, "preset_spk_num": 2},
+        )
+        self.assertEqual(model.calls[1], {"input": "not-read.wav", "batch_size_s": 300})
+
+    def test_preset_speaker_count_is_rejected_for_non_paraformer_before_audio_read(self):
+        from zh_asr.pipeline import _validate_preset_speaker_count
+
+        with self.assertRaisesRegex(ValueError, "only by explicit paraformer"):
+            _validate_preset_speaker_count("sensevoice", 2)
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            _validate_preset_speaker_count("paraformer", 0)
+
     def test_funasr_kwargs_resolve_aliases_from_model_registry(self):
         from zh_asr.config import EngineSpec
         from zh_asr.pipeline import _funasr_kwargs

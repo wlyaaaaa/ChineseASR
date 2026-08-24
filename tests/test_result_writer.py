@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 class ResultWriterTests(unittest.TestCase):
@@ -41,6 +42,34 @@ class ResultWriterTests(unittest.TestCase):
         ]
 
         self.assertEqual(extract_text(result), "第一句\n第二句")
+
+    def test_write_transcript_bundle_records_auditable_diarization_request_without_reading_audio(self):
+        from zh_asr.result_writer import write_transcript_bundle
+
+        request_options = {
+            "speaker_diarization": {
+                "mode": "preset",
+                "preset_spk_num": 2,
+                "identity": "anonymous_only",
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "zh_asr.result_writer.build_objective_result",
+                return_value={"objective_outcome": "speech_transcribed"},
+            ) as build, patch("zh_asr.result_writer.write_objective_result"):
+                write_transcript_bundle(
+                    Path("not-read.wav"),
+                    [{"text": "测试"}],
+                    Path(tmp) / "outputs",
+                    "paraformer",
+                    request_options=request_options,
+                )
+
+        self.assertEqual(
+            build.call_args.kwargs["request"],
+            {**request_options, "engine": "paraformer"},
+        )
 
     def test_extract_text_removes_sensevoice_rich_tags(self):
         from zh_asr.result_writer import extract_text

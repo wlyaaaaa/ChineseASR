@@ -68,12 +68,14 @@ def transcribe_audio(
     out_dir: Path | None = None,
     cache_dir: Path | None = None,
     config: ModelConfig | None = None,
+    preset_spk_num: int | None = None,
     caller_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if not audio_path.exists():
-        raise FileNotFoundError(f"Audio file not found: {audio_path}")
     model_config = config or load_model_config()
     engine_name = engine or model_config.default_engine
+    preset_speaker_count = _validate_preset_speaker_count(engine_name, preset_spk_num)
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
     output_dir = out_dir or project_root() / "outputs"
     engine_audio, provenance = _prepare_engine_input(
         audio_path,
@@ -87,15 +89,20 @@ def transcribe_audio(
         device,
         cache_dir,
         model_config,
+        preset_spk_num=preset_speaker_count,
     )
     if runtime_identity:
         provenance["runtime_identity"] = runtime_identity
+    diarization_request = _speaker_diarization_request(engine_name, preset_speaker_count)
+    if diarization_request:
+        provenance["speaker_diarization"] = dict(diarization_request["speaker_diarization"])
     return write_transcript_bundle(
         audio_path,
         result,
         output_dir,
         engine_name,
         primary_provenance=provenance,
+        request_options=diarization_request,
         caller_binding=caller_binding,
     )
 
@@ -477,10 +484,18 @@ def _generate_once_with_identity(
     device: str,
     cache_dir: Path | None,
     config: ModelConfig,
+    *,
+    preset_spk_num: int | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     model = build_model(engine, device=device, cache_dir=cache_dir, config=config)
     try:
-        result = model.generate(input=str(audio_path), batch_size_s=300)
+        generate_kwargs: dict[str, Any] = {
+            "input": str(audio_path),
+            "batch_size_s": 300,
+        }
+        if preset_spk_num is not None:
+            generate_kwargs["preset_spk_num"] = preset_spk_num
+        result = model.generate(**generate_kwargs)
         result = _attach_speech_detection_if_empty(
             result,
             model,
@@ -493,6 +508,28 @@ def _generate_once_with_identity(
         del model
         gc.collect()
         _empty_cuda_cache()
+
+
+def _validate_preset_speaker_count(engine: str, value: int | None) -> int | None:
+    if value is None:
+        return None
+    if engine != "paraformer":
+        raise ValueError("preset_spk_num is supported only by explicit paraformer transcription.")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("preset_spk_num must be a positive integer when provided.")
+    return value
+
+
+def _speaker_diarization_request(engine: str, preset_spk_num: int | None) -> dict[str, Any]:
+    if engine != "paraformer":
+        return {}
+    return {
+        "speaker_diarization": {
+            "mode": "preset" if preset_spk_num is not None else "automatic",
+            "preset_spk_num": preset_spk_num,
+            "identity": "anonymous_only",
+        }
+    }
 
 
 def _model_runtime_identity(model: Any) -> dict[str, Any]:

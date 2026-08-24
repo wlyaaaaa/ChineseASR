@@ -74,6 +74,7 @@ def write_transcript_bundle(
     engine: str,
     caller_binding: Mapping[str, Any] | None = None,
     primary_provenance: Mapping[str, Any] | None = None,
+    request_options: Mapping[str, Any] | None = None,
 ) -> dict[str, Path | str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = audio_path.stem
@@ -103,7 +104,7 @@ def write_transcript_bundle(
                 "sha256": file_sha256(json_path),
             }
         ],
-        request={"engine": engine},
+        request={**dict(request_options or {}), "engine": engine},
         caller_binding=caller_binding,
         primary_provenance=primary_provenance,
     )

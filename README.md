@@ -48,7 +48,7 @@
 | 显式 GPU flagship | `fun-asr-nano` | `FunAudioLLM/Fun-ASR-Nano-2512`；需要 GPU，作为较重的 LLM-ASR 候选，不改变 quick 默认 |
 | 可选证据级词汇主引擎 | `fireredasr2-llm` | 隔离在 WSL 中运行；仅在显式选择时作为 strict 主引擎 |
 | 重要录音专业云入口 | `qwen-audio-3.0-asr-flash` | 仅由独立脚本显式调用；Key 经 Password Center SecretRef 注入，普通模式无法触发 |
-| baseline | `paraformer` | 保守普通话基线，可用于回归对照 |
+| 显式时间线/匿名说话人 baseline | `paraformer` | 固定 `speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4`，输出逐句 `sentence_info` 时间和 CAM++ 匿名聚类；已知两方通话的调用方可传 `--preset-spk-num 2`，省略时自动聚类；不改变 quick/strict 默认 |
 | fallback/comparison | `whisper-large-v3` | 已注册为备用/对照，不作为中文 strict 默认路径 |
 
 strict 模式即使一路模型失败，也会保留可用输出并生成审计包。正文会标记 `[疑似]`，`strict.audit.md` 会记录失败引擎、异常摘要和复核理由。两路都失败时输出 `[听不清]`。
@@ -221,7 +221,7 @@ strict 模式会把最终稿和证据拆开：
 
 ## 按需说话人归属
 
-默认转写不是声纹识别：模型给出的 `speaker` 编号只是匿名分段/聚类，不能直接等同“本人”。只有真实问题需要判断一句话是谁说的时，才对**已有的、带起止时间的转写 JSON**做一次小投影。普通 `attribute-speakers` 不读原始音频、不加载模型：
+默认转写不是声纹识别：模型给出的 `speaker` 编号只是匿名分段/聚类，不能直接等同“本人”。只有真实问题需要判断一句话是谁说的时，才对**已有的、带起止时间的转写 JSON**做一次小投影。普通 `attribute-speakers` 不读原始音频、不加载模型；结果只下发逐句文本、匿名说话人、状态、角色、单句中文依据和回到原转写的 JSON pointer：
 
 ```powershell
 python -m zh_asr attribute-speakers C:\private\call.raw.json `
@@ -264,7 +264,7 @@ python -m zh_asr speaker-profile-delete `
 
 `--channel mix` 会明确记录为 `mixed_not_channel_evidence`。`left`/`right` 只在**原始输入确为双声道**时由新入口精确提取；默认 quick/strict/long 的单声道准备产物不能倒推为左右声道证据。即使是小米录音，也只有同时满足已验证 cohort、原始右声道精确提取、源文件 SHA-256 和分段时间都匹配时，才有一个可撤销的“本人候选”声道线索。
 
-把一份或多份上述证据传给投影时，`context.recording_audio.sha256` 必须绑定同一原始音频：
+把一份或多份上述证据传给投影时，`context.recording_audio.sha256` 必须绑定同一原始音频。CLI 会把转写 JSON、context、每份 voice evidence 的实际文件 SHA-256，以及该原始音频 SHA-256 写进顶层 `input_binding`；库调用没有文件时使用同一 JSON 的 canonical SHA-256：
 
 ```json
 {
@@ -292,11 +292,11 @@ python -m zh_asr attribute-speakers C:\private\call.raw.json `
   --out C:\private\call.speaker-attribution.json
 ```
 
-`contact_role`、`dialogue_role`、`semantic_role`、`cross_recording_role` 与无权威引用的来源上下文都是软线索，可单独形成可撤销 `inferred`，也会相互融合。`source_identity` 只有带单行 `authority_ref` 的强来源事实才会产生 `confirmed`。输出逐段保留匿名 `speaker`、结论、中文依据和每项线索；不会写入目标 embedding。
+`contact_role`、`dialogue_role`、`semantic_role`、`cross_recording_role` 与来源上下文都是软线索，可单独形成可撤销 `inferred`，也会相互融合。当前项目没有独立可信 receipt adapter，因此即使 `source_identity` 带有 `authority_ref` 也只能形成 `inferred`，不能由 caller 自报升为 `confirmed`。输出逐段只保留匿名 `speaker`、结论、单句中文依据和原转写 JSON pointer；不会下发声纹分数、逐项内部线索或目标 embedding。
 
 - CAM++ 相似度、联系人、声道、对话角色、句义和跨录音相同声音都不能单独 `confirmed`；相似度本身只是 `person:self` 的正/负候选线索。
 - 归因器不做固定加权、合成分数或 high/medium/low 等级。单一清晰且无反证的线索、或多项同向线索，都可以直接产生可撤销 `inferred`；声纹/声道只组织注意力，不是低智力终裁。
-- 若声纹或声道与有具体理由的来源、联系人、对话或句义判断相反，投影会保留两边证据，并明确说明为何后者暂时压过前者；只有上下文判断本身冲突、或只剩无法解释的相反声学线索时，才输出 `unknown` 和 `speaker_attribution_gap=true`。
+- 若声纹或声道与有具体理由的来源、联系人、对话或句义判断相反，投影会在内部保留两边证据，并在对外单句依据中说明为何后者暂时压过前者；只有上下文判断本身冲突、或只剩无法解释的相反声学线索时，才输出 `unknown` 和 `speaker_attribution_gap=true`。
 - 这只归属“这段语音可能是谁说的”，**不证明**照片、视频、微信媒体或消息由用户发送、拥有或持有；媒体来源/Owner 必须另有明确来源事实。
 - Paraformer 的可选 CAM++ diarization 仍只是匿名聚类，可能过拆/合并，不能替代 `person:self` enrollment，也不能把 cluster ID 解释成用户。
 

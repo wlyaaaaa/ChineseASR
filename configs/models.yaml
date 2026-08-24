@@ -98,12 +98,14 @@ engines:
   paraformer:
     adapter: funasr
     role: baseline
-    model: iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
+    model: iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch
     vad_model: fsmn-vad
     punc_model: ct-punc
     spk_model: cam++
     language: zh
-    note: Conservative Mandarin/CN baseline for cross-checking.
+    options:
+      model_revision: v2.0.4
+    note: Explicit timestamped Mandarin baseline with anonymous CAM++ diarization; it does not change quick or strict defaults.
 
   whisper-large-v3:
     adapter: whisper
