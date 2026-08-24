@@ -221,7 +221,7 @@ strict 模式会把最终稿和证据拆开：
 
 ## 按需说话人归属
 
-这不是声纹库，也不是把模型给出的 `speaker` 编号当成“本人”。只有某个真实问题需要知道一句话是谁说的时，才对**已有的、带起止时间的转写 JSON**运行一次小投影：
+默认转写不是声纹识别：模型给出的 `speaker` 编号只是匿名分段/聚类，不能直接等同“本人”。只有真实问题需要判断一句话是谁说的时，才对**已有的、带起止时间的转写 JSON**做一次小投影。普通 `attribute-speakers` 不读原始音频、不加载模型：
 
 ```powershell
 python -m zh_asr attribute-speakers C:\private\call.raw.json `
@@ -229,12 +229,50 @@ python -m zh_asr attribute-speakers C:\private\call.raw.json `
   --out C:\private\call.speaker-attribution.json
 ```
 
-`context` 是一个很小的 JSON 对象：它声明录音类型，并只给需要判断的分段提供来源身份、对话角色、句义或声道依据。输出的每段只有起止时间、文字、匿名 `speaker`、`confirmed` / `inferred` / `unknown`、`self` / `other` / `unknown` 和一句依据；没有 embedding、声纹向量或跨录音 profile。
+### 私有 `person:self` 声纹锚
+
+在本机私有边界内，可以显式保存**唯一一个**用户本人的 `person:self` CAM++ profile。它不是通用声纹库：没有第二数据库、服务、队列、他人 profile 或全库重跑。profile 保存在 Git 忽略的 `outputs\private`（也可显式指定另一条私有路径），包含原始参考音频的路径/哈希/片段/声道、生成时间、CAM++ 配置 revision、runtime 和模型文件哈希，以及可重建、可替换、可删除的本人向量；不会复制原始参考音频。
+
+只对“本人候选”有清晰、无反证依据的有限片段建锚。每次必须写出一条 `--inference-basis`：profile 固定为可撤销的 `inferred`，不能冒充 `confirmed`，可以用更强或更新的参考显式替换。
+
+```powershell
+python -m zh_asr speaker-enroll C:\private\known-self.wav `
+  --start-ms 0 --end-ms 12000 --channel mix `
+  --inference-basis "该片段有可回查的本人候选依据，且可由更强参考替换。" `
+  --profile C:\private\person-self.voice-profile.json --device cpu
+```
+
+之后只在需要的一个目标片段上生成证据。目标向量只在内存中计算并丢弃；输出仅留下原始目标哈希、精确片段时间、声道提取方式、模型/文件哈希、profile 哈希和相似度/阈值：
+
+```powershell
+python -m zh_asr speaker-evidence C:\private\call.m4a `
+  --start-ms 18400 --end-ms 23100 --channel mix `
+  --profile C:\private\person-self.voice-profile.json `
+  --out C:\private\call.18400-23100.person-self-evidence.json --device cpu
+```
+
+显式替换或删除也只作用于这一份 `person:self` profile：
+
+```powershell
+python -m zh_asr speaker-enroll C:\private\new-known-self.wav `
+  --start-ms 0 --end-ms 12000 `
+  --inference-basis "新的可回查本人候选依据；替换旧锚。" `
+  --profile C:\private\person-self.voice-profile.json --replace
+python -m zh_asr speaker-profile-delete `
+  --profile C:\private\person-self.voice-profile.json --confirm-delete person:self
+```
+
+`--channel mix` 会明确记录为 `mixed_not_channel_evidence`。`left`/`right` 只在**原始输入确为双声道**时由新入口精确提取；默认 quick/strict/long 的单声道准备产物不能倒推为左右声道证据。即使是小米录音，也只有同时满足已验证 cohort、原始右声道精确提取、源文件 SHA-256 和分段时间都匹配时，才有一个可撤销的“本人候选”声道线索。
+
+把一份或多份上述证据传给投影时，`context.recording_audio.sha256` 必须绑定同一原始音频：
 
 ```json
 {
-  "schema": "chinese-asr.speaker-attribution-context.v1",
+  "schema": "chinese-asr.speaker-attribution-context.v2",
   "recording_kind": "mono_call",
+  "recording_audio": {
+    "sha256": "<原始音频 SHA-256>"
+  },
   "segment_evidence": [
     {
       "index": 0,
@@ -247,14 +285,22 @@ python -m zh_asr attribute-speakers C:\private\call.raw.json `
 }
 ```
 
-`source_identity` 与 `dialogue_role` 形状相同，但前者代表明确来源事实并输出 `confirmed`；`semantic_role` 也使用相同形状。小米立体声还需同时提供 `recording_kind=\"xiaomi_app_stereo\"`、`stereo_cohort_id=\"xiaomi-app-stereo-2026-08-verified\"` 和该分段的 `channel=\"right\"`。
+```powershell
+python -m zh_asr attribute-speakers C:\private\call.raw.json `
+  --context C:\private\call.speaker-context.json `
+  --voice-evidence C:\private\call.18400-23100.person-self-evidence.json `
+  --out C:\private\call.speaker-attribution.json
+```
 
-- `confirmed` 只能来自明确的来源身份事实。
-- 单声道通话必须先有时间戳分句，再由联系人、对话角色或句义得到 `inferred`；模型 speaker 编号只用于匿名分段，不能认人。
-- 仅 `xiaomi-app-stereo-2026-08-verified` 这个已验证的小米应用立体声 cohort 的右声道可以得到“本人候选”；来源事实或句义可否决它。这不是所有 AAC、手机或应用的左右声道规则。
-- 没有足够依据时输出 `unknown` 且顶层 `speaker_attribution_gap=true`。这不会妨碍读取不依赖说话人的录音事实，也不能借此把话归给用户。
+`contact_role`、`dialogue_role`、`semantic_role`、`cross_recording_role` 与无权威引用的来源上下文都是软线索，可单独形成可撤销 `inferred`，也会相互融合。`source_identity` 只有带单行 `authority_ref` 的强来源事实才会产生 `confirmed`。输出逐段保留匿名 `speaker`、结论、中文依据和每项线索；不会写入目标 embedding。
 
-这条入口不读取原始音频、不加载模型、不重跑历史录音；如果原转写没有可用时间戳，应只在真实问题需要时先补该一份录音的时间戳分句。
+- CAM++ 相似度、联系人、声道、对话角色、句义和跨录音相同声音都不能单独 `confirmed`；相似度本身只是 `person:self` 的正/负候选线索。
+- 归因器不做固定加权、合成分数或 high/medium/low 等级。单一清晰且无反证的线索、或多项同向线索，都可以直接产生可撤销 `inferred`；声纹/声道只组织注意力，不是低智力终裁。
+- 若声纹或声道与有具体理由的来源、联系人、对话或句义判断相反，投影会保留两边证据，并明确说明为何后者暂时压过前者；只有上下文判断本身冲突、或只剩无法解释的相反声学线索时，才输出 `unknown` 和 `speaker_attribution_gap=true`。
+- 这只归属“这段语音可能是谁说的”，**不证明**照片、视频、微信媒体或消息由用户发送、拥有或持有；媒体来源/Owner 必须另有明确来源事实。
+- Paraformer 的可选 CAM++ diarization 仍只是匿名聚类，可能过拆/合并，不能替代 `person:self` enrollment，也不能把 cluster ID 解释成用户。
+
+如果原转写没有可用时间戳，应只在真实问题需要时先补这一份录音的时间戳分句；不要批量把历史录音或每条消息转成“本人事件”。
 
 顶层 job 的 `succeeded` 只表示流程产出了结果；机器消费者必须同时读取 `evidence_status`：
 

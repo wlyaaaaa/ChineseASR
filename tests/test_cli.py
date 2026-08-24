@@ -409,12 +409,32 @@ engines:
     def test_attribute_speakers_writes_projection_without_loading_a_model(self):
         fixture_root = PROJECT_ROOT / "tests" / "fixtures" / "speaker_attribution"
         with tempfile.TemporaryDirectory() as tmp:
+            context = Path(tmp) / "context.json"
             output = Path(tmp) / "attribution.json"
+            context.write_text(
+                json.dumps(
+                    {
+                        "schema": "chinese-asr.speaker-attribution-context.v2",
+                        "recording_kind": "mono_call",
+                        "segment_evidence": [
+                            {
+                                "index": 0,
+                                "dialogue_role": {
+                                    "candidate_role": "self",
+                                    "reason": "该句回答了本人正在处理的设备故障。",
+                                },
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
             result = self.run_cli(
                 "attribute-speakers",
-                str(fixture_root / "stereo_transcript.json"),
+                str(fixture_root / "mono_unknown_transcript.json"),
                 "--context",
-                str(fixture_root / "stereo_context.json"),
+                str(context),
                 "--out",
                 str(output),
             )
@@ -423,6 +443,19 @@ engines:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Speaker attribution gap: False", result.stdout)
         self.assertEqual(payload["segments"][0]["candidate_role"], "self")
+
+    def test_speaker_commands_are_discoverable_without_loading_a_model(self):
+        enroll = self.run_cli("speaker-enroll", "--help")
+        evidence = self.run_cli("speaker-evidence", "--help")
+        delete = self.run_cli("speaker-profile-delete", "--help")
+
+        self.assertEqual(enroll.returncode, 0, enroll.stderr)
+        self.assertIn("person:self", enroll.stdout)
+        self.assertIn("--inference-basis", enroll.stdout)
+        self.assertEqual(evidence.returncode, 0, evidence.stderr)
+        self.assertIn("--channel", evidence.stdout)
+        self.assertEqual(delete.returncode, 0, delete.stderr)
+        self.assertIn("--confirm-delete", delete.stdout)
 
 
 if __name__ == "__main__":

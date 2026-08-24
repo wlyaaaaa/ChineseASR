@@ -21,6 +21,14 @@ aliases:
   ct-punc: iic/punc_ct-transformer_cn-en-common-vocab471067-large
   cam++: iic/speech_campplus_sv_zh-cn_16k-common
 
+# This is intentionally not part of default ASR or diarization. It is loaded
+# only by the on-demand, local ``person:self`` enrollment/evidence commands.
+speaker_verification:
+  model_alias: cam++
+  model_revision: v1.0.0
+  model_file: campplus_cn_common.bin
+  threshold: 0.31
+
 engines:
   fireredasr2-llm:
     adapter: firered-worker

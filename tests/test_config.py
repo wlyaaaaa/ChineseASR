@@ -62,6 +62,19 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.strict_secondary_engine, "sensevoice")
         self.assertIn("speech_fsmn_vad_zh-cn-16k-common-pytorch", config.model_aliases["fsmn-vad"])
 
+    def test_speaker_verification_is_explicit_and_not_a_default_engine_setting(self):
+        from zh_asr.config import load_model_config
+
+        config = load_model_config()
+
+        self.assertIsNotNone(config.speaker_verification)
+        assert config.speaker_verification is not None
+        self.assertEqual(config.speaker_verification.model_alias, "cam++")
+        self.assertEqual(config.speaker_verification.model_revision, "v1.0.0")
+        self.assertEqual(config.speaker_verification.model_file, "campplus_cn_common.bin")
+        self.assertEqual(config.speaker_verification.threshold, 0.31)
+        self.assertIsNone(config.engines["sensevoice"].spk_model)
+
     def test_core_requirements_pin_funasr_142(self):
         requirements = (PROJECT_ROOT / "requirements-core.txt").read_text(encoding="utf-8").splitlines()
 
@@ -151,6 +164,7 @@ engines:
         self.assertEqual(spec.model, "iic/CustomSenseVoice")
         self.assertEqual(spec.vad_model, "tiny-vad")
         self.assertEqual(spec.options["max_new_tokens"], 128)
+        self.assertIsNone(config.speaker_verification)
 
 
 if __name__ == "__main__":

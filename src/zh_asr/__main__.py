@@ -25,6 +25,13 @@ from .pipeline import MissingDependencyError, build_model, default_cache_dir, pr
 from .process_control import managed_popen_kwargs, terminate_process_tree
 from .proxy_guard import PROXY_ENV_NAMES, sanitize_current_process_env
 from .speaker_attribution import write_speaker_attribution
+from .speaker_evidence import (
+    SELF_PERSON_ID,
+    default_self_speaker_profile_path,
+    delete_self_speaker_profile,
+    enroll_self_speaker,
+    write_self_speaker_evidence,
+)
 from .service import CALLER_BINDING_ENV, serve_api
 
 
@@ -128,6 +135,54 @@ def main(argv: list[str] | None = None) -> int:
     attribution.add_argument("transcript_json", type=Path)
     attribution.add_argument("--context", type=Path, required=True)
     attribution.add_argument("--out", type=Path, required=True)
+    attribution.add_argument(
+        "--voice-evidence",
+        type=Path,
+        action="append",
+        default=[],
+        help="Hash-bound person:self evidence JSON; repeat for more than one segment.",
+    )
+
+    speaker_enroll = subparsers.add_parser(
+        "speaker-enroll",
+        help="Create the private local person:self CAM++ reference profile.",
+        description="Create the sole private local person:self CAM++ reference profile.",
+    )
+    speaker_enroll.add_argument("reference_audio", type=Path)
+    speaker_enroll.add_argument("--start-ms", type=float, required=True)
+    speaker_enroll.add_argument("--end-ms", type=float, required=True)
+    speaker_enroll.add_argument("--channel", choices=("mix", "left", "right"), default="mix")
+    speaker_enroll.add_argument(
+        "--inference-basis",
+        required=True,
+        help="One-sentence, reversible basis for this inferred person:self anchor; never a confirmed identity.",
+    )
+    speaker_enroll.add_argument("--profile", type=Path, default=default_self_speaker_profile_path())
+    speaker_enroll.add_argument("--replace", action="store_true")
+    speaker_enroll.add_argument("--device", default="cuda:0")
+    speaker_enroll.add_argument("--cache-dir", type=Path, default=default_cache_dir())
+
+    speaker_evidence = subparsers.add_parser(
+        "speaker-evidence",
+        help="Compare one bounded audio interval with the private person:self reference.",
+        description="Generate unconfirmed person:self evidence for one bounded audio interval.",
+    )
+    speaker_evidence.add_argument("target_audio", type=Path)
+    speaker_evidence.add_argument("--start-ms", type=float, required=True)
+    speaker_evidence.add_argument("--end-ms", type=float, required=True)
+    speaker_evidence.add_argument("--channel", choices=("mix", "left", "right"), default="mix")
+    speaker_evidence.add_argument("--profile", type=Path, default=default_self_speaker_profile_path())
+    speaker_evidence.add_argument("--out", type=Path, required=True)
+    speaker_evidence.add_argument("--device", default="cuda:0")
+    speaker_evidence.add_argument("--cache-dir", type=Path, default=default_cache_dir())
+
+    speaker_delete = subparsers.add_parser(
+        "speaker-profile-delete",
+        help="Delete the private person:self profile after an explicit confirmation.",
+        description="Delete only the private person:self profile after an explicit confirmation.",
+    )
+    speaker_delete.add_argument("--profile", type=Path, default=default_self_speaker_profile_path())
+    speaker_delete.add_argument("--confirm-delete", required=True)
 
     args = parser.parse_args(argv)
     try:
@@ -341,10 +396,65 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "attribute-speakers":
             transcript_result = json.loads(args.transcript_json.read_text(encoding="utf-8"))
             context = json.loads(args.context.read_text(encoding="utf-8"))
-            payload = write_speaker_attribution(args.out, transcript_result, context)
+            voice_evidence = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in args.voice_evidence
+            ]
+            payload = write_speaker_attribution(
+                args.out,
+                transcript_result,
+                context,
+                voice_evidence=voice_evidence,
+            )
             print(f"Speaker attribution: {args.out}")
             print(f"Segments: {len(payload['segments'])}")
             print(f"Speaker attribution gap: {payload['speaker_attribution_gap']}")
+            return 0
+        if args.command == "speaker-enroll":
+            profile = _run_with_gpu_lease(
+                args.device,
+                lambda: enroll_self_speaker(
+                    args.reference_audio,
+                    start_ms=args.start_ms,
+                    end_ms=args.end_ms,
+                    channel=args.channel,
+                    inference_basis=args.inference_basis,
+                    profile_path=args.profile,
+                    replace=args.replace,
+                    device=args.device,
+                    cache_dir=args.cache_dir,
+                    model_config=model_config,
+                ),
+            )
+            print(f"person:self profile: {args.profile}")
+            print(f"Reference SHA-256: {profile['enrollment_reference']['source']['sha256']}")
+            print("Identity status: inferred and reversible (profile is only a fusion anchor)")
+            return 0
+        if args.command == "speaker-evidence":
+            evidence = _run_with_gpu_lease(
+                args.device,
+                lambda: write_self_speaker_evidence(
+                    args.out,
+                    args.target_audio,
+                    start_ms=args.start_ms,
+                    end_ms=args.end_ms,
+                    channel=args.channel,
+                    profile_path=args.profile,
+                    device=args.device,
+                    cache_dir=args.cache_dir,
+                    model_config=model_config,
+                ),
+            )
+            print(f"person:self evidence: {args.out}")
+            print(f"Similarity: {evidence['score']['value']:.4f}")
+            print("Identity status: unconfirmed (fuse this evidence before attribution)")
+            return 0
+        if args.command == "speaker-profile-delete":
+            delete_self_speaker_profile(
+                args.profile,
+                confirmation=args.confirm_delete,
+            )
+            print(f"Deleted {SELF_PERSON_ID} profile: {args.profile}")
             return 0
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
@@ -392,6 +502,8 @@ def _command_requires_gpu_supervision(args: argparse.Namespace) -> bool:
         "batch",
         "eval",
         "benchmark",
+        "speaker-enroll",
+        "speaker-evidence",
     }:
         return False
     if args.command == "eval" and args.generate_only:

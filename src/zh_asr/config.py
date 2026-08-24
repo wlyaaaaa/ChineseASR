@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,16 @@ class EngineSpec:
 
 
 @dataclass(frozen=True)
+class SpeakerVerificationSpec:
+    """Narrow local configuration for the optional ``person:self`` anchor."""
+
+    model_alias: str
+    model_revision: str
+    model_file: str
+    threshold: float
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     path: Path
     default_engine: str
@@ -40,6 +51,7 @@ class ModelConfig:
     strict_secondary_engine: str
     model_aliases: dict[str, str]
     engines: dict[str, EngineSpec]
+    speaker_verification: SpeakerVerificationSpec | None = None
 
 
 def load_model_config(path: Path | str | None = None) -> ModelConfig:
@@ -52,6 +64,11 @@ def load_model_config(path: Path | str | None = None) -> ModelConfig:
     defaults = _mapping(data.get("defaults", {}), "defaults", config_path)
     strict = _mapping(data.get("strict", {}), "strict", config_path)
     aliases = {str(key): str(value) for key, value in _mapping(data.get("aliases", {}), "aliases", config_path).items()}
+    speaker_verification = _parse_speaker_verification(
+        data.get("speaker_verification"),
+        aliases,
+        config_path,
+    )
 
     default_engine = str(defaults.get("engine", "sensevoice")).strip()
     strict_primary = str(strict.get("primary_engine", default_engine)).strip()
@@ -69,6 +86,7 @@ def load_model_config(path: Path | str | None = None) -> ModelConfig:
         strict_secondary_engine=strict_secondary,
         model_aliases=aliases,
         engines=engines,
+        speaker_verification=speaker_verification,
     )
 
 
@@ -129,6 +147,40 @@ def _parse_engines(raw: Any, path: Path) -> dict[str, EngineSpec]:
             options=dict(_mapping(item.get("options", {}), f"engines.{name}.options", path)),
         )
     return engines
+
+
+def _parse_speaker_verification(
+    raw: Any,
+    aliases: dict[str, str],
+    path: Path,
+) -> SpeakerVerificationSpec | None:
+    """Parse an optional, deliberately self-only speaker-verification model."""
+
+    if raw is None:
+        return None
+    item = _mapping(raw, "speaker_verification", path)
+    model_alias = _required_str(item, "model_alias", "speaker_verification", path)
+    if model_alias not in aliases:
+        raise ValueError(
+            f"speaker_verification.model_alias '{model_alias}' is not defined in aliases of {path}"
+        )
+    model_revision = _required_str(item, "model_revision", "speaker_verification", path)
+    model_file = _required_str(item, "model_file", "speaker_verification", path)
+    model_file_path = Path(model_file)
+    if model_file_path.is_absolute() or len(model_file_path.parts) != 1:
+        raise ValueError("speaker_verification.model_file must name one file in the model directory")
+    try:
+        threshold = float(item.get("threshold"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("speaker_verification.threshold must be a finite number in [-1, 1]") from exc
+    if not math.isfinite(threshold) or threshold < -1 or threshold > 1:
+        raise ValueError("speaker_verification.threshold must be a finite number in [-1, 1]")
+    return SpeakerVerificationSpec(
+        model_alias=model_alias,
+        model_revision=model_revision,
+        model_file=model_file,
+        threshold=threshold,
+    )
 
 
 def _mapping(value: Any, label: str, path: Path) -> dict[Any, Any]:

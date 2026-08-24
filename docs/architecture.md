@@ -10,16 +10,18 @@
 
 1. `defaults.engine` 决定 quick 模式默认模型。
 2. `strict.primary_engine` / `strict.secondary_engine` 决定严格模式双模型组合。
-3. `aliases` 记录 VAD、标点、说话人等可复用模型别名。
+3. `aliases` 记录 VAD、标点、说话人等可复用模型别名；`speaker_verification` 只配置按需的本地 `person:self` CAM++ 锚，不进入默认转写。
 4. `engines.*.adapter` 决定运行时适配器；当前已实现 `funasr`、`qwen-asr` 和 `firered-worker`。
 
 当前默认策略仍然是：
 
 1. `qwen3-asr-1.7b`：strict 准确率优先主线。基于 Qwen3-ASR 官方开源权重和 `qwen-asr` runtime。
-2. `sensevoice`：quick 默认和 strict 低幻觉锚点。组合 `iic/SenseVoiceSmall`、`fsmn-vad`、`ct-punc`、`cam++`。
+2. `sensevoice`：quick 默认和 strict 低幻觉锚点。组合 `iic/SenseVoiceSmall`、`fsmn-vad`、`ct-punc`；默认明确**不**加载 `cam++`。
 3. `fireredasr2-llm`：可选的证据级词汇主引擎，仅在显式选择时进入 strict；安装或下载不会改变默认组合。
-4. `paraformer`：中文保守备用线。适合普通话生产基线、时间戳、热词和回归对照。
+4. `paraformer`：中文保守备用线。可产出时间戳；显式 `cam++` 输出是 diarization/匿名聚类而非用户身份确认，可能过拆或合并。
 5. `whisper-large-v3`：只记录为 fallback/comparison，不自动作为主输出。
+
+`speaker-enroll` / `speaker-evidence` 在真实问题需要时才按需读取一个有限音频片段。enroll 只允许创建一个带单句可回查依据、可替换且永远为 `inferred` 的本机私有 `person:self` 向量；目标片段只输出源哈希、时间、模型哈希和相似度。它不建设通用声纹平台，也不让分数、匿名 cluster 或默认下混音频单独产生 `confirmed`。归属投影保留来源、联系人、声道、对话角色、句义、跨录音与声纹的各项理由，但不计算固定权重、合成分数或长期置信等级：具体的来源/语义判断可以解释性地压过相反的弱声学线索，无法合理消解的实质冲突才是 `unknown`；`confirmed` 仍要求权威来源引用。
 
 FireRed 通过 Windows adapter 调用隔离的 WSL worker。默认 WSL Python 为 `/opt/chineseasr/firered/.venv/bin/python`；源码和权重位于 Git 忽略的 `models/firered/FireRedASR2S` 与 `models/firered/FireRedASR2-LLM`。固定来源是：
 
