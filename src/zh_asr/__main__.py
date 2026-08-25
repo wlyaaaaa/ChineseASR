@@ -24,13 +24,14 @@ from .long_audio import run_long_transcription
 from .pipeline import MissingDependencyError, build_model, default_cache_dir, project_root, strict_transcribe_audio, transcribe_audio
 from .process_control import managed_popen_kwargs, terminate_process_tree
 from .proxy_guard import PROXY_ENV_NAMES, sanitize_current_process_env
-from .result_writer import file_sha256
+from .result_writer import canonical_json_sha256, file_sha256
 from .speaker_attribution import write_speaker_attribution
 from .speaker_evidence import (
     SELF_PERSON_ID,
     default_self_speaker_profile_path,
     delete_self_speaker_profile,
     enroll_self_speaker,
+    load_self_speaker_profile,
     write_self_speaker_evidence,
 )
 from .service import CALLER_BINDING_ENV, serve_api
@@ -150,6 +151,12 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         help="Hash-bound person:self evidence JSON; repeat for more than one segment.",
+    )
+    attribution.add_argument(
+        "--voice-profile",
+        type=Path,
+        default=default_self_speaker_profile_path(),
+        help="Current private person:self profile; old evidence is inactive when this file is absent or has been replaced.",
     )
 
     speaker_enroll = subparsers.add_parser(
@@ -410,11 +417,17 @@ def main(argv: list[str] | None = None) -> int:
                 json.loads(path.read_text(encoding="utf-8"))
                 for path in args.voice_evidence
             ]
+            active_voice_profile_sha256 = None
+            if voice_evidence and args.voice_profile.is_file():
+                active_voice_profile_sha256 = canonical_json_sha256(
+                    load_self_speaker_profile(args.voice_profile)
+                )
             payload = write_speaker_attribution(
                 args.out,
                 transcript_result,
                 context,
                 voice_evidence=voice_evidence,
+                active_voice_profile_sha256=active_voice_profile_sha256,
                 input_hashes={
                     "transcript_json_sha256": file_sha256(args.transcript_json),
                     "context_json_sha256": file_sha256(args.context),

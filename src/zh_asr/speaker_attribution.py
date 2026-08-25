@@ -27,9 +27,9 @@ from .speaker_evidence import (
 )
 
 
-SPEAKER_ATTRIBUTION_SCHEMA = "chinese-asr.speaker-attribution.v4"
+SPEAKER_ATTRIBUTION_SCHEMA = "chinese-asr.speaker-attribution.v5"
 SPEAKER_ATTRIBUTION_INPUT_BINDING_SCHEMA = (
-    "chinese-asr.speaker-attribution-input-binding.v1"
+    "chinese-asr.speaker-attribution-input-binding.v2"
 )
 SPEAKER_ATTRIBUTION_CONTEXT_SCHEMA = "chinese-asr.speaker-attribution-context.v2"
 _LEGACY_CONTEXT_SCHEMA = "chinese-asr.speaker-attribution-context.v1"
@@ -68,6 +68,7 @@ def attribute_transcript_result(
     context: Mapping[str, Any],
     *,
     voice_evidence: Sequence[Mapping[str, Any]] = (),
+    active_voice_profile_sha256: str | None = None,
     input_hashes: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Attribute timestamped existing transcript segments without loading audio/models."""
@@ -76,6 +77,7 @@ def attribute_transcript_result(
         extract_segments(transcript_result),
         context,
         voice_evidence=voice_evidence,
+        active_voice_profile_sha256=active_voice_profile_sha256,
         transcript_value=transcript_result,
         input_hashes=input_hashes,
     )
@@ -86,6 +88,7 @@ def attribute_segments(
     context: Mapping[str, Any],
     *,
     voice_evidence: Sequence[Mapping[str, Any]] = (),
+    active_voice_profile_sha256: str | None = None,
     transcript_value: Any | None = None,
     input_hashes: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -93,6 +96,9 @@ def attribute_segments(
 
     parsed = _parse_context(context, len(segments))
     parsed_voice_evidence = _parse_voice_evidence(voice_evidence)
+    if active_voice_profile_sha256 is not None:
+        _validate_sha256(active_voice_profile_sha256, "active voice profile")
+        active_voice_profile_sha256 = active_voice_profile_sha256.lower()
     if parsed_voice_evidence and parsed.recording_source_sha256 is None:
         raise SpeakerAttributionError(
             "recording_audio.sha256 is required before voice evidence can bind to transcript segments."
@@ -102,6 +108,7 @@ def attribute_segments(
         context,
         voice_evidence,
         parsed.recording_source_sha256,
+        active_voice_profile_sha256,
         input_hashes=input_hashes,
     )
 
@@ -114,6 +121,7 @@ def attribute_segments(
             parsed,
             parsed.evidence_by_index.get(segment.index, {}),
             parsed_voice_evidence,
+            active_voice_profile_sha256,
         )
         if status == "unknown":
             has_gap = True
@@ -143,6 +151,7 @@ def write_speaker_attribution(
     context: Mapping[str, Any],
     *,
     voice_evidence: Sequence[Mapping[str, Any]] = (),
+    active_voice_profile_sha256: str | None = None,
     input_hashes: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write one JSON projection and return the same in-memory result."""
@@ -151,6 +160,7 @@ def write_speaker_attribution(
         transcript_result,
         context,
         voice_evidence=voice_evidence,
+        active_voice_profile_sha256=active_voice_profile_sha256,
         input_hashes=input_hashes,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,6 +176,7 @@ def _attribute_segment(
     context: _Context,
     evidence: Mapping[str, Any],
     voice_evidence: Sequence[Mapping[str, Any]],
+    active_voice_profile_sha256: str | None,
 ) -> tuple[str, str, str]:
     if not _has_complete_time_range(segment):
         return (
@@ -175,7 +186,14 @@ def _attribute_segment(
         )
 
     signals = _context_signals(evidence)
-    signals.extend(_voice_signals(segment, context, voice_evidence))
+    signals.extend(
+        _voice_signals(
+            segment,
+            context,
+            voice_evidence,
+            active_voice_profile_sha256,
+        )
+    )
     signals.extend(_xiaomi_channel_signals(segment, context, voice_evidence))
 
     directional = [item for item in signals if item["candidate_role"] in _ROLES]
@@ -297,13 +315,28 @@ def _voice_signals(
     segment: TranscriptSegment,
     context: _Context,
     documents: Sequence[Mapping[str, Any]],
+    active_voice_profile_sha256: str | None,
 ) -> list[dict[str, Any]]:
     signals: list[dict[str, Any]] = []
     for document in _matching_voice_evidence(segment, context, documents):
+        evidence_ref = canonical_json_sha256(document)
+        evidence_profile_sha256 = str(document["profile"]["sha256"]).lower()
+        if (
+            active_voice_profile_sha256 is None
+            or evidence_profile_sha256 != active_voice_profile_sha256
+        ):
+            signals.append(
+                _signal(
+                    "voice_profile_inactive",
+                    "unknown",
+                    "生成该声纹证据的 person:self profile 已删除或替换，旧分数不再作为方向性身份线索。",
+                    evidence_sha256=evidence_ref,
+                )
+            )
+            continue
         score = document["score"]
         value = float(score["value"])
         threshold = float(score["threshold"])
-        evidence_ref = canonical_json_sha256(document)
         target_segment = document["target"]["segment"]
         mono_call_mix = (
             context.recording_kind == "mono_call"
@@ -538,6 +571,7 @@ def _build_input_binding(
     context: Mapping[str, Any],
     voice_evidence: Sequence[Mapping[str, Any]],
     recording_audio_sha256: str | None,
+    active_voice_profile_sha256: str | None,
     *,
     input_hashes: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -568,6 +602,7 @@ def _build_input_binding(
         "transcript_json_sha256": str(transcript_hash).lower(),
         "context_json_sha256": str(context_hash).lower(),
         "voice_evidence_json_sha256": [str(item).lower() for item in evidence_hashes],
+        "active_voice_profile_sha256": active_voice_profile_sha256,
         "recording_audio_sha256": recording_audio_sha256,
     }
 
@@ -654,6 +689,8 @@ def _one_sentence_chinese(value: str) -> str:
 
 
 def _unknown_reason(context: _Context, signals: Sequence[Mapping[str, Any]]) -> str:
+    if any(item["kind"] == "voice_profile_inactive" for item in signals):
+        return "生成该声纹证据的 person:self profile 已删除或替换，旧分数已失效，且没有其他可用线索，保留为 unknown。"
     if any(item["kind"] == "voice_similarity_near_threshold" for item in signals):
         if context.recording_kind == "mono_call":
             return "该段来自单声道通话的混合声道，声纹相似度接近风险边界，且没有其他可用线索，保留为 unknown。"

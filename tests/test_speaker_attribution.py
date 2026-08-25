@@ -9,6 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = PROJECT_ROOT / "tests" / "fixtures" / "speaker_attribution"
 HASH_A = "a" * 64
 HASH_B = "b" * 64
+PROFILE_HASH = "c" * 64
 
 
 def load_fixture(name: str):
@@ -57,7 +58,7 @@ def voice_document(*, source_hash=HASH_A, start_ms=0, end_ms=980, score=0.75, th
         },
         "profile": {
             "schema": SELF_SPEAKER_PROFILE_SCHEMA,
-            "sha256": "c" * 64,
+            "sha256": PROFILE_HASH,
             "enrollment_source_sha256": "d" * 64,
             "identity_status": "inferred",
             "enrollment_basis": "这条有限参考仅作为可替换的本人推定锚。",
@@ -172,6 +173,7 @@ class SpeakerAttributionTests(unittest.TestCase):
         result = attribute_transcript_result(
             load_fixture("stereo_transcript.json"),
             context(recording_kind="other", source_hash=HASH_A),
+            active_voice_profile_sha256=PROFILE_HASH,
             voice_evidence=[voice_document()],
         )
 
@@ -181,6 +183,37 @@ class SpeakerAttributionTests(unittest.TestCase):
         self.assertNotEqual(segment["attribution_status"], "confirmed")
         self.assertNotIn("evidence", segment)
         self.assertNotIn("0.7500", segment["basis"])
+
+    def test_deleted_profile_makes_old_voice_score_inactive(self):
+        from zh_asr.speaker_attribution import attribute_transcript_result
+
+        result = attribute_transcript_result(
+            load_fixture("stereo_transcript.json"),
+            context(recording_kind="other", source_hash=HASH_A),
+            voice_evidence=[voice_document()],
+        )
+
+        segment = result["segments"][0]
+        self.assertEqual(segment["attribution_status"], "unknown")
+        self.assertEqual(segment["candidate_role"], "unknown")
+        self.assertIn("已删除或替换", segment["basis"])
+        self.assertIsNone(
+            result["input_binding"]["active_voice_profile_sha256"]
+        )
+
+    def test_replaced_profile_makes_old_voice_score_inactive(self):
+        from zh_asr.speaker_attribution import attribute_transcript_result
+
+        result = attribute_transcript_result(
+            load_fixture("stereo_transcript.json"),
+            context(recording_kind="other", source_hash=HASH_A),
+            active_voice_profile_sha256=HASH_B,
+            voice_evidence=[voice_document()],
+        )
+
+        segment = result["segments"][0]
+        self.assertEqual(segment["attribution_status"], "unknown")
+        self.assertIn("已删除或替换", segment["basis"])
 
     def test_voice_and_contact_soft_fuse_with_all_reasons_visible(self):
         from zh_asr.speaker_attribution import attribute_transcript_result
@@ -200,6 +233,7 @@ class SpeakerAttributionTests(unittest.TestCase):
                     }
                 ],
             ),
+            active_voice_profile_sha256=PROFILE_HASH,
             voice_evidence=[voice_document()],
         )
 
@@ -228,6 +262,7 @@ class SpeakerAttributionTests(unittest.TestCase):
                     }
                 ],
             ),
+            active_voice_profile_sha256=PROFILE_HASH,
             voice_evidence=[voice_document(score=0.10)],
         )
 
@@ -269,6 +304,7 @@ class SpeakerAttributionTests(unittest.TestCase):
         result = attribute_transcript_result(
             load_fixture("stereo_transcript.json"),
             context(recording_kind="other", source_hash=HASH_A),
+            active_voice_profile_sha256=PROFILE_HASH,
             voice_evidence=[voice_document(score=0.32)],
         )
 
@@ -283,6 +319,7 @@ class SpeakerAttributionTests(unittest.TestCase):
         result = attribute_transcript_result(
             load_fixture("stereo_transcript.json"),
             context(recording_kind="mono_call", source_hash=HASH_A),
+            active_voice_profile_sha256=PROFILE_HASH,
             voice_evidence=[voice_document(score=0.340904866570855)],
         )
 
@@ -298,6 +335,7 @@ class SpeakerAttributionTests(unittest.TestCase):
         result = attribute_transcript_result(
             load_fixture("stereo_transcript.json"),
             context(recording_kind="mono_call", source_hash=HASH_A),
+            active_voice_profile_sha256=PROFILE_HASH,
             voice_evidence=[voice_document(score=0.478369409902273)],
         )
 
@@ -311,6 +349,7 @@ class SpeakerAttributionTests(unittest.TestCase):
         result = attribute_transcript_result(
             load_fixture("stereo_transcript.json"),
             context(recording_kind="other", source_hash=HASH_A),
+            active_voice_profile_sha256=PROFILE_HASH,
             voice_evidence=[voice_document(score=0.340904866570855)],
         )
 
@@ -336,6 +375,7 @@ class SpeakerAttributionTests(unittest.TestCase):
                     }
                 ],
             ),
+            active_voice_profile_sha256=PROFILE_HASH,
             voice_evidence=[voice_document(score=0.340904866570855)],
         )
 
@@ -357,6 +397,7 @@ class SpeakerAttributionTests(unittest.TestCase):
                 source_hash=HASH_A,
                 cohort_id=XIAOMI_APP_STEREO_COHORT_ID,
             ),
+            active_voice_profile_sha256=PROFILE_HASH,
             voice_evidence=[
                 voice_document(
                     channel="right",
@@ -376,6 +417,7 @@ class SpeakerAttributionTests(unittest.TestCase):
         result = attribute_transcript_result(
             load_fixture("stereo_transcript.json"),
             context(recording_kind="other", source_hash=HASH_A),
+            active_voice_profile_sha256=PROFILE_HASH,
             voice_evidence=[voice_document(source_hash=HASH_B)],
         )
 
@@ -388,6 +430,7 @@ class SpeakerAttributionTests(unittest.TestCase):
             attribute_transcript_result(
                 load_fixture("stereo_transcript.json"),
                 context(recording_kind="other"),
+                active_voice_profile_sha256=PROFILE_HASH,
                 voice_evidence=[voice_document()],
             )
 
@@ -502,6 +545,7 @@ class SpeakerAttributionTests(unittest.TestCase):
             attribute_transcript_result(
                 load_fixture("stereo_transcript.json"),
                 context(recording_kind="other", source_hash=HASH_A),
+                active_voice_profile_sha256=PROFILE_HASH,
                 voice_evidence=[partial],
             )
 

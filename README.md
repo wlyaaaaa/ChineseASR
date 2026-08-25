@@ -295,6 +295,7 @@ python -m zh_asr attribute-speakers C:\private\call.raw.json `
 `contact_role`、`dialogue_role`、`semantic_role`、`cross_recording_role` 与来源上下文都是软线索，可单独形成可撤销 `inferred`，也会相互融合。当前项目没有独立可信 receipt adapter，因此即使 `source_identity` 带有 `authority_ref` 也只能形成 `inferred`，不能由 caller 自报升为 `confirmed`。输出逐段只保留匿名 `speaker`、结论、单句中文依据和原转写 JSON pointer；不会下发声纹分数、逐项内部线索或目标 embedding。
 
 - CAM++ 相似度、联系人、声道、对话角色、句义和跨录音相同声音都不能单独 `confirmed`；相似度本身只是 `person:self` 的正/负候选线索。
+- `attribute-speakers` 只让与当前唯一私有 `person:self` profile 哈希一致的声纹分数参与方向判断；profile 被删除或替换后，旧 evidence 自动失效并保留为 `unknown` 声纹线索，独立的声道、联系人、对话角色和句义依据不受影响。
 - 归因器不做固定加权、合成分数或 high/medium/low 等级。单一清晰且无反证的线索、或多项同向线索，都可以直接产生可撤销 `inferred`；声纹/声道只组织注意力，不是低智力终裁。
 - 若声纹或声道与有具体理由的来源、联系人、对话或句义判断相反，投影会在内部保留两边证据，并在对外单句依据中说明为何后者暂时压过前者；只有上下文判断本身冲突、或只剩无法解释的相反声学线索时，才输出 `unknown` 和 `speaker_attribution_gap=true`。
 - `recording_kind=mono_call` 且目标来自 `mix`/`mixed_not_channel_evidence` 时，投影使用更保守的 `±0.04` 声纹风险带；模型阈值仍固定为 `0.31`，不会拿单通电话重调模型。风险带内的分数只记为 `unknown` 声学线索，仍可由具体联系人、对话角色或句义依据作可撤销判断。其他录音类型继续使用模型证据的 `±0.02` 常规歧义带。
