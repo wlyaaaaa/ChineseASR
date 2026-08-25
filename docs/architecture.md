@@ -21,7 +21,7 @@
 4. `paraformer`：显式时间线/匿名说话人备用线，固定 `iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4`，通过现有 FunASR adapter 传入 VAD、PUNC 与 `cam++`，输出逐句 `sentence_info` 时间和匿名 diarization/聚类。单文件 `transcribe --engine paraformer --preset-spk-num N` 只在调用方已知人数时把 `N` 传给 FunASR，并把 `automatic`/`preset` 与人数写入 objective-result 的 `request.speaker_diarization`；省略则保留自动聚类，其他引擎、quick、strict 和批量路径不会接受或传播该参数。它不改变 quick/strict 默认，且 cluster 仍不是用户身份确认，可能过拆或合并。
 5. `whisper-large-v3`：只记录为 fallback/comparison，不自动作为主输出。
 
-`speaker-enroll` / `speaker-evidence` 在真实问题需要时才按需读取一个有限音频片段。enroll 只允许创建一个带单句可回查依据、可替换且永远为 `inferred` 的本机私有 `person:self` 向量；目标片段只输出源哈希、时间、模型哈希和相似度。它不建设通用声纹平台，也不让分数、匿名 cluster 或默认下混音频单独产生 `confirmed`。归属投影内部可融合来源、联系人、声道、对话角色、句义、跨录音与声纹，但对外只交付匿名说话人、状态、角色、单句依据、原转写 JSON pointer 与输入哈希绑定，不下发声纹分数或逐项内部线索。当前没有独立可信 receipt adapter，`authority_ref` 仅是 caller 提供的来源指针，不能使结果变为 `confirmed`；具体的来源/语义判断可以解释性地压过相反的弱声学线索，无法合理消解的实质冲突才是 `unknown`。
+`speaker-enroll` / `speaker-evidence` 在真实问题需要时才按需读取有限音频片段。enroll 只允许创建一个可替换、永远为 `inferred` 的本机私有 `person:self` 向量；跨录音域模式限定 2–3 个不同来源，逐向量 L2 归一化后只保存一个再次归一化的质心、源哈希/大小、片段和证据选择绑定，不保存各参考向量、源路径或原音。held-out 模式禁止用任一 enrollment 原件回测；普通模式也会按源哈希标出同原件关系，归属投影将这种分数降为非方向性 `unknown`，防止设备、声道或背景底色泄漏。目标片段只输出源哈希、时间、模型哈希和相似度。它不建设通用声纹平台，也不让分数、匿名 cluster 或默认下混音频单独产生 `confirmed`，并且不为样本调模型固定阈值。归属投影内部可融合来源、联系人、声道、对话角色、句义、跨录音与声纹，但对外只交付匿名说话人、状态、角色、单句依据、原转写 JSON pointer 与输入哈希绑定，不下发声纹分数或逐项内部线索。当前没有独立可信 receipt adapter，`authority_ref` 仅是 caller 提供的来源指针，不能使结果变为 `confirmed`；具体的来源/语义判断可以解释性地压过相反的弱声学线索，无法合理消解的实质冲突才是 `unknown`。
 
 FireRed 通过 Windows adapter 调用隔离的 WSL worker。默认 WSL Python 为 `/opt/chineseasr/firered/.venv/bin/python`；源码和权重位于 Git 忽略的 `models/firered/FireRedASR2S` 与 `models/firered/FireRedASR2-LLM`。固定来源是：
 

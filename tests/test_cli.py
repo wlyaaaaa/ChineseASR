@@ -503,8 +503,10 @@ engines:
         self.assertEqual(enroll.returncode, 0, enroll.stderr)
         self.assertIn("person:self", enroll.stdout)
         self.assertIn("--inference-basis", enroll.stdout)
+        self.assertIn("--references", enroll.stdout)
         self.assertEqual(evidence.returncode, 0, evidence.stderr)
         self.assertIn("--channel", evidence.stdout)
+        self.assertIn("--require-held-out", evidence.stdout)
         self.assertEqual(delete.returncode, 0, delete.stderr)
         self.assertIn("--confirm-delete", delete.stdout)
 

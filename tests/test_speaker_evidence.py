@@ -40,7 +40,217 @@ def write_stereo_wav(path: Path) -> None:
         handle.writeframes(b"\x00\x00\x00\x00" * 1600)
 
 
+def write_reference_set(root: Path, names: list[str], *, duplicate_first: bool = False) -> Path:
+    references = []
+    for index, name in enumerate(names):
+        source = root / name
+        source.write_bytes(b"same" if duplicate_first and index < 2 else name.encode("utf-8"))
+        references.append(
+            {
+                "source_path": str(source),
+                "start_ms": index * 100,
+                "end_ms": 1000 + index * 100,
+                "channel": "mix",
+                "inference_basis": f"第{index + 1}条有限参考有可回查的本人候选依据。",
+                "selection_binding": {
+                    "kind": "dialogue_role",
+                    "evidence_json_sha256": f"{index + 1:x}" * 64,
+                    "raw_json_pointer": f"$.sentence_info[{index}]",
+                },
+            }
+        )
+    manifest = root / f"references-{len(names)}.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": "chinese-asr.person-self-voice-reference-set.v1",
+                "inference_basis": "这些有限参考各有可回查依据，只作为可替换的本人推定锚。",
+                "references": references,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
 class SpeakerEvidenceTests(unittest.TestCase):
+    def test_multi_reference_enrollment_persists_one_normalized_centroid_without_paths(self):
+        from zh_asr.result_writer import canonical_json_sha256
+        from zh_asr.speaker_evidence import (
+            CENTROID_AGGREGATION_METHOD,
+            SELF_SPEAKER_MULTI_PROFILE_SCHEMA,
+            SELF_SPEAKER_REFERENCE_SET_SCHEMA,
+            enroll_self_speaker_reference_set,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = write_reference_set(root, ["z.raw", "a.raw", "m.raw"])
+            profile_path = root / "private" / "person-self.json"
+            with patch("zh_asr.speaker_evidence.speaker_model_evidence", return_value=model_evidence()), patch(
+                "zh_asr.speaker_evidence._prepare_segment_wav",
+                return_value="mixed_not_channel_evidence",
+            ), patch(
+                "zh_asr.speaker_evidence._extract_embedding",
+                side_effect=[[1.0, 0.0], [0.0, 2.0], [3.0, 3.0]],
+            ):
+                profile = enroll_self_speaker_reference_set(
+                    manifest,
+                    profile_path=profile_path,
+                    cache_dir=root / "cache",
+                    device="cpu",
+                )
+            persisted_text = profile_path.read_text(encoding="utf-8")
+            persisted = json.loads(persisted_text)
+
+        expected = [
+            (1.0 + 0.0 + 2 ** -0.5) / 3,
+            (0.0 + 1.0 + 2 ** -0.5) / 3,
+        ]
+        expected_norm = math.sqrt(sum(item * item for item in expected))
+        self.assertEqual(profile["schema"], SELF_SPEAKER_MULTI_PROFILE_SCHEMA)
+        self.assertEqual(profile["aggregation"]["method"], CENTROID_AGGREGATION_METHOD)
+        self.assertEqual(profile["reference_set"]["reference_count"], 3)
+        self.assertAlmostEqual(profile["embedding"][0], expected[0] / expected_norm)
+        self.assertAlmostEqual(profile["embedding"][1], expected[1] / expected_norm)
+        self.assertAlmostEqual(sum(item * item for item in profile["embedding"]), 1.0)
+        self.assertNotIn("source_path", persisted_text)
+        self.assertNotIn(str(root), persisted_text)
+        self.assertEqual(persisted_text.count('"embedding"'), 1)
+        reference_payload = {
+            "schema": SELF_SPEAKER_REFERENCE_SET_SCHEMA,
+            "references": persisted["reference_set"]["references"],
+        }
+        self.assertEqual(
+            persisted["reference_set"]["sha256"],
+            canonical_json_sha256(reference_payload),
+        )
+        hashes = [item["source"]["sha256"] for item in persisted["reference_set"]["references"]]
+        self.assertEqual(hashes, sorted(hashes))
+
+    def test_multi_reference_enrollment_requires_two_or_three_distinct_sources(self):
+        from zh_asr.speaker_evidence import SpeakerEvidenceError, enroll_self_speaker_reference_set
+
+        for count in (1, 4):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = write_reference_set(root, [f"source-{index}.raw" for index in range(count)])
+                with self.assertRaisesRegex(SpeakerEvidenceError, "2 to 3"):
+                    enroll_self_speaker_reference_set(
+                        manifest,
+                        profile_path=root / "profile.json",
+                        cache_dir=root / "cache",
+                        device="cpu",
+                    )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = write_reference_set(root, ["first.raw", "second.raw"], duplicate_first=True)
+            with self.assertRaisesRegex(SpeakerEvidenceError, "distinct source hash"):
+                enroll_self_speaker_reference_set(
+                    manifest,
+                    profile_path=root / "profile.json",
+                    cache_dir=root / "cache",
+                    device="cpu",
+                )
+
+    def test_multi_reference_order_and_reference_set_hash_are_deterministic(self):
+        from zh_asr.speaker_evidence import enroll_self_speaker_reference_set
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_manifest = write_reference_set(root, ["one.raw", "two.raw", "three.raw"])
+            first_payload = json.loads(first_manifest.read_text(encoding="utf-8"))
+            second_manifest = root / "reversed.json"
+            first_payload["references"].reverse()
+            second_manifest.write_text(json.dumps(first_payload, ensure_ascii=False), encoding="utf-8")
+            common_patches = (
+                patch("zh_asr.speaker_evidence.speaker_model_evidence", return_value=model_evidence()),
+                patch("zh_asr.speaker_evidence._prepare_segment_wav", return_value="mixed_not_channel_evidence"),
+                patch("zh_asr.speaker_evidence._extract_embedding", return_value=[1.0, 0.0]),
+            )
+            with common_patches[0], common_patches[1], common_patches[2]:
+                first = enroll_self_speaker_reference_set(
+                    first_manifest,
+                    profile_path=root / "first.json",
+                    cache_dir=root / "cache",
+                    device="cpu",
+                )
+            with patch("zh_asr.speaker_evidence.speaker_model_evidence", return_value=model_evidence()), patch(
+                "zh_asr.speaker_evidence._prepare_segment_wav",
+                return_value="mixed_not_channel_evidence",
+            ), patch("zh_asr.speaker_evidence._extract_embedding", return_value=[1.0, 0.0]):
+                second = enroll_self_speaker_reference_set(
+                    second_manifest,
+                    profile_path=root / "second.json",
+                    cache_dir=root / "cache",
+                    device="cpu",
+                )
+
+        self.assertEqual(first["reference_set"], second["reference_set"])
+        self.assertEqual(first["embedding"], second["embedding"])
+
+    def test_multi_reference_evidence_can_require_a_held_out_source(self):
+        from zh_asr.speaker_evidence import (
+            SELF_SPEAKER_MULTI_EVIDENCE_SCHEMA,
+            SpeakerEvidenceError,
+            create_self_speaker_evidence,
+            enroll_self_speaker_reference_set,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = write_reference_set(root, ["one.raw", "two.raw"])
+            target = root / "held-out.raw"
+            target.write_bytes(b"held-out")
+            profile_path = root / "profile.json"
+            with patch("zh_asr.speaker_evidence.speaker_model_evidence", return_value=model_evidence()), patch(
+                "zh_asr.speaker_evidence._prepare_segment_wav",
+                return_value="mixed_not_channel_evidence",
+            ), patch("zh_asr.speaker_evidence._extract_embedding", return_value=[1.0, 0.0]):
+                enroll_self_speaker_reference_set(
+                    manifest,
+                    profile_path=profile_path,
+                    cache_dir=root / "cache",
+                    device="cpu",
+                )
+                with self.assertRaisesRegex(SpeakerEvidenceError, "Held-out"):
+                    create_self_speaker_evidence(
+                        root / "one.raw",
+                        start_ms=0,
+                        end_ms=500,
+                        profile_path=profile_path,
+                        cache_dir=root / "cache",
+                        device="cpu",
+                        require_held_out=True,
+                    )
+                same_source = create_self_speaker_evidence(
+                    root / "one.raw",
+                    start_ms=0,
+                    end_ms=500,
+                    profile_path=profile_path,
+                    cache_dir=root / "cache",
+                    device="cpu",
+                )
+                evidence = create_self_speaker_evidence(
+                    target,
+                    start_ms=0,
+                    end_ms=500,
+                    profile_path=profile_path,
+                    cache_dir=root / "cache",
+                    device="cpu",
+                    require_held_out=True,
+                )
+
+        self.assertEqual(evidence["schema"], SELF_SPEAKER_MULTI_EVIDENCE_SCHEMA)
+        self.assertEqual(evidence["source_relation"], "held_out_source")
+        self.assertEqual(same_source["source_relation"], "enrollment_source")
+        self.assertIn("不作为方向性身份线索", same_source["meaning"])
+        self.assertEqual(evidence["profile"]["reference_count"], 2)
+        self.assertEqual(len(evidence["profile"]["enrollment_source_sha256s"]), 2)
+        self.assertNotIn("embedding", json.dumps(evidence))
+
     def test_enrollment_persists_only_person_self_vector_and_reference_provenance(self):
         from zh_asr.speaker_evidence import (
             SELF_PERSON_ID,

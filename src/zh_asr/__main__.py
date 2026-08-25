@@ -31,6 +31,7 @@ from .speaker_evidence import (
     default_self_speaker_profile_path,
     delete_self_speaker_profile,
     enroll_self_speaker,
+    enroll_self_speaker_reference_set,
     load_self_speaker_profile,
     write_self_speaker_evidence,
 )
@@ -164,13 +165,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Create the private local person:self CAM++ reference profile.",
         description="Create the sole private local person:self CAM++ reference profile.",
     )
-    speaker_enroll.add_argument("reference_audio", type=Path)
-    speaker_enroll.add_argument("--start-ms", type=float, required=True)
-    speaker_enroll.add_argument("--end-ms", type=float, required=True)
-    speaker_enroll.add_argument("--channel", choices=("mix", "left", "right"), default="mix")
+    speaker_enroll.add_argument("reference_audio", type=Path, nargs="?")
+    speaker_enroll.add_argument(
+        "--references",
+        type=Path,
+        help="Private manifest containing exactly two or three distinct, source-bound person:self references.",
+    )
+    speaker_enroll.add_argument("--start-ms", type=float)
+    speaker_enroll.add_argument("--end-ms", type=float)
+    speaker_enroll.add_argument("--channel", choices=("mix", "left", "right"))
     speaker_enroll.add_argument(
         "--inference-basis",
-        required=True,
         help="One-sentence, reversible basis for this inferred person:self anchor; never a confirmed identity.",
     )
     speaker_enroll.add_argument("--profile", type=Path, default=default_self_speaker_profile_path())
@@ -191,6 +196,11 @@ def main(argv: list[str] | None = None) -> int:
     speaker_evidence.add_argument("--out", type=Path, required=True)
     speaker_evidence.add_argument("--device", default="cuda:0")
     speaker_evidence.add_argument("--cache-dir", type=Path, default=default_cache_dir())
+    speaker_evidence.add_argument(
+        "--require-held-out",
+        action="store_true",
+        help="Fail closed if the target source contributed to the active profile.",
+    )
 
     speaker_delete = subparsers.add_parser(
         "speaker-profile-delete",
@@ -441,23 +451,59 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Speaker attribution gap: {payload['speaker_attribution_gap']}")
             return 0
         if args.command == "speaker-enroll":
+            if args.references is not None:
+                if any(
+                    value is not None
+                    for value in (
+                        args.reference_audio,
+                        args.start_ms,
+                        args.end_ms,
+                        args.channel,
+                        args.inference_basis,
+                    )
+                ):
+                    raise ValueError(
+                        "--references cannot be combined with the single-reference audio/interval options."
+                    )
+                def operation():
+                    return enroll_self_speaker_reference_set(
+                        args.references,
+                        profile_path=args.profile,
+                        replace=args.replace,
+                        device=args.device,
+                        cache_dir=args.cache_dir,
+                        model_config=model_config,
+                    )
+            else:
+                if args.reference_audio is None:
+                    raise ValueError("reference_audio or --references is required.")
+                if args.start_ms is None or args.end_ms is None or args.inference_basis is None:
+                    raise ValueError(
+                        "Single-reference enrollment requires --start-ms, --end-ms, and --inference-basis."
+                    )
+                def operation():
+                    return enroll_self_speaker(
+                        args.reference_audio,
+                        start_ms=args.start_ms,
+                        end_ms=args.end_ms,
+                        channel=args.channel or "mix",
+                        inference_basis=args.inference_basis,
+                        profile_path=args.profile,
+                        replace=args.replace,
+                        device=args.device,
+                        cache_dir=args.cache_dir,
+                        model_config=model_config,
+                    )
             profile = _run_with_gpu_lease(
                 args.device,
-                lambda: enroll_self_speaker(
-                    args.reference_audio,
-                    start_ms=args.start_ms,
-                    end_ms=args.end_ms,
-                    channel=args.channel,
-                    inference_basis=args.inference_basis,
-                    profile_path=args.profile,
-                    replace=args.replace,
-                    device=args.device,
-                    cache_dir=args.cache_dir,
-                    model_config=model_config,
-                ),
+                operation,
             )
             print(f"person:self profile: {args.profile}")
-            print(f"Reference SHA-256: {profile['enrollment_reference']['source']['sha256']}")
+            if "reference_set" in profile:
+                print(f"Reference count: {profile['reference_set']['reference_count']}")
+                print(f"Reference-set SHA-256: {profile['reference_set']['sha256']}")
+            else:
+                print(f"Reference SHA-256: {profile['enrollment_reference']['source']['sha256']}")
             print("Identity status: inferred and reversible (profile is only a fusion anchor)")
             return 0
         if args.command == "speaker-evidence":
@@ -473,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
                     device=args.device,
                     cache_dir=args.cache_dir,
                     model_config=model_config,
+                    require_held_out=args.require_held_out,
                 ),
             )
             print(f"person:self evidence: {args.out}")

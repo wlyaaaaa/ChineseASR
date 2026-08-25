@@ -1,17 +1,17 @@
 """On-demand local speaker-verification evidence for the single ``person:self`` anchor.
 
 This module deliberately does not provide a speaker directory, service, queue, or
-cross-user database.  A user can enroll one private local reference and later
-compare one bounded audio interval against it.  The persistent vector is only the
-user's own ``person:self`` profile; target embeddings stay in process memory and
-are discarded after a hash-bound score is written.
+cross-user database.  A user can enroll one private local reference, or a bounded
+set of two or three independently source-bound references, and later compare one
+audio interval against the sole resulting profile.  The persistent vector is only
+the user's own ``person:self`` profile; per-reference and target embeddings stay in
+process memory and are discarded after a centroid or hash-bound score is written.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 import gc
-import hashlib
 import importlib.metadata
 import json
 import math
@@ -19,7 +19,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import wave
 
 from .adapters.funasr import ensure_funasr_available
@@ -31,11 +31,25 @@ from .result_writer import canonical_json_sha256, file_sha256
 SELF_PERSON_ID = "person:self"
 SELF_SPEAKER_PROFILE_SCHEMA = "chinese-asr.person-self-voice-profile.v2"
 SELF_SPEAKER_EVIDENCE_SCHEMA = "chinese-asr.person-self-voice-evidence.v1"
+SELF_SPEAKER_MULTI_PROFILE_SCHEMA = "chinese-asr.person-self-voice-profile.v3"
+SELF_SPEAKER_MULTI_EVIDENCE_SCHEMA = "chinese-asr.person-self-voice-evidence.v2"
+SELF_SPEAKER_REFERENCE_SET_SCHEMA = "chinese-asr.person-self-voice-reference-set.v1"
 SPEAKER_MODEL_EVIDENCE_SCHEMA = "chinese-asr.speaker-model-evidence.v1"
 MAX_SPEAKER_EVIDENCE_DURATION_MS = 120_000
 VOICE_SCORE_AMBIGUITY_MARGIN = 0.02
+MIN_SELF_SPEAKER_REFERENCES = 2
+MAX_SELF_SPEAKER_REFERENCES = 3
+CENTROID_AGGREGATION_METHOD = "l2_normalized_centroid.v1"
 
 _CHANNELS = frozenset({"mix", "left", "right"})
+_SELECTION_BINDING_KINDS = frozenset(
+    {
+        "verified_xiaomi_right_channel",
+        "dialogue_role",
+        "semantic_role",
+        "cross_recording_role",
+    }
+)
 
 
 class SpeakerEvidenceError(ValueError):
@@ -114,6 +128,95 @@ def enroll_self_speaker(
     return profile
 
 
+def enroll_self_speaker_reference_set(
+    reference_set_path: Path,
+    *,
+    profile_path: Path | None = None,
+    replace: bool = False,
+    device: str = "cuda:0",
+    cache_dir: Path | None = None,
+    model_config: ModelConfig | None = None,
+) -> dict[str, Any]:
+    """Create one private profile from exactly two or three distinct sources.
+
+    The private input manifest may contain source paths so the original files can
+    be opened.  Those paths and the individual embeddings are deliberately absent
+    from the persisted profile.  Only source hashes/sizes, exact intervals,
+    selection bindings, and one normalized centroid remain.
+    """
+
+    destination = (profile_path or default_self_speaker_profile_path()).resolve()
+    if destination.exists() and not replace:
+        raise FileExistsError(
+            f"A {SELF_PERSON_ID} profile already exists at {destination}. Use --replace to replace it."
+        )
+    manifest = _load_reference_set_manifest(reference_set_path)
+    references = _resolve_reference_set(manifest)
+    config = model_config or load_model_config()
+    cache = _resolve_cache_dir(cache_dir)
+    model_evidence = speaker_model_evidence(config, cache)
+
+    persisted_references: list[dict[str, Any]] = []
+    normalized_embeddings: list[list[float]] = []
+    with tempfile.TemporaryDirectory(prefix="zh-asr-self-speaker-") as temp_dir:
+        temp_root = Path(temp_dir)
+        for index, reference in enumerate(references):
+            clip = temp_root / f"reference-{index}.16k-mono.wav"
+            channel_binding = _prepare_segment_wav(
+                Path(reference["source_path"]),
+                clip,
+                start_ms=reference["start_ms"],
+                end_ms=reference["end_ms"],
+                channel=reference["channel"],
+            )
+            normalized_embeddings.append(
+                _l2_normalize(
+                    _extract_embedding(clip, model_evidence["local_model_dir"], device)
+                )
+            )
+            persisted_references.append(
+                {
+                    "source": {
+                        "bytes": reference["source_bytes"],
+                        "sha256": reference["source_sha256"],
+                    },
+                    "segment": {
+                        "start_ms": reference["start_ms"],
+                        "end_ms": reference["end_ms"],
+                        "channel": reference["channel"],
+                        "channel_binding": channel_binding,
+                    },
+                    "inference_basis": reference["inference_basis"],
+                    "selection_binding": reference["selection_binding"],
+                }
+            )
+
+    reference_set_payload = {
+        "schema": SELF_SPEAKER_REFERENCE_SET_SCHEMA,
+        "references": persisted_references,
+    }
+    reference_set_sha256 = canonical_json_sha256(reference_set_payload)
+    profile = {
+        "schema": SELF_SPEAKER_MULTI_PROFILE_SCHEMA,
+        "person_id": SELF_PERSON_ID,
+        "created_utc": _utc_now(),
+        "identity": _inferred_identity(manifest["inference_basis"]),
+        "reference_set": {
+            **reference_set_payload,
+            "sha256": reference_set_sha256,
+            "reference_count": len(persisted_references),
+        },
+        "aggregation": {
+            "method": CENTROID_AGGREGATION_METHOD,
+            "reference_count": len(persisted_references),
+        },
+        "model": model_evidence,
+        "embedding": _centroid(normalized_embeddings),
+    }
+    _write_json_atomic(destination, profile)
+    return profile
+
+
 def create_self_speaker_evidence(
     target_audio: Path,
     *,
@@ -124,6 +227,7 @@ def create_self_speaker_evidence(
     device: str = "cuda:0",
     cache_dir: Path | None = None,
     model_config: ModelConfig | None = None,
+    require_held_out: bool = False,
 ) -> dict[str, Any]:
     """Compare one bounded target interval with the private ``person:self`` vector.
 
@@ -139,6 +243,15 @@ def create_self_speaker_evidence(
     current_model = speaker_model_evidence(config, cache)
     _validate_profile_for_model(profile, current_model)
     target = _source_reference(target_audio)
+    source_relation = (
+        "enrollment_source"
+        if target["sha256"] in _profile_enrollment_source_hashes(profile)
+        else "held_out_source"
+    )
+    if require_held_out and source_relation == "enrollment_source":
+        raise SpeakerEvidenceError(
+            "Held-out speaker evidence cannot use any source that contributed to the active profile."
+        )
     start, end = _bounded_interval(start_ms, end_ms)
     selected_channel = _channel(channel)
 
@@ -158,7 +271,11 @@ def create_self_speaker_evidence(
     comparison = "above_threshold" if similarity >= threshold else "below_threshold"
     profile_hash = canonical_json_sha256(profile)
     return {
-        "schema": SELF_SPEAKER_EVIDENCE_SCHEMA,
+        "schema": (
+            SELF_SPEAKER_MULTI_EVIDENCE_SCHEMA
+            if profile["schema"] == SELF_SPEAKER_MULTI_PROFILE_SCHEMA
+            else SELF_SPEAKER_EVIDENCE_SCHEMA
+        ),
         "person_id": SELF_PERSON_ID,
         "generated_utc": _utc_now(),
         "target": {
@@ -170,13 +287,8 @@ def create_self_speaker_evidence(
                 "channel_binding": channel_binding,
             },
         },
-        "profile": {
-            "schema": SELF_SPEAKER_PROFILE_SCHEMA,
-            "sha256": profile_hash,
-            "enrollment_source_sha256": profile["enrollment_reference"]["source"]["sha256"],
-            "identity_status": profile["identity"]["status"],
-            "enrollment_basis": profile["identity"]["basis"],
-        },
+        "profile": _evidence_profile_binding(profile, profile_hash),
+        "source_relation": source_relation,
         "model": current_model,
         "score": {
             "metric": "cosine_similarity",
@@ -186,6 +298,9 @@ def create_self_speaker_evidence(
         },
         "identity_status": "unconfirmed",
         "meaning": (
+            "目标片段与 enrollment 来自同一原件，保留分数供审计但不作为方向性身份线索。"
+            if source_relation == "enrollment_source"
+            else
             "相似度接近当前阈值，单独不作为方向性身份线索。"
             if abs(similarity - threshold) <= VOICE_SCORE_AMBIGUITY_MARGIN
             else "相似度高于当前阈值，只是支持本人候选，不能单独确认身份。"
@@ -303,6 +418,97 @@ def _source_reference(path: Path) -> dict[str, Any]:
         "bytes": source.stat().st_size,
         "sha256": file_sha256(source),
     }
+
+
+def _load_reference_set_manifest(path: Path) -> dict[str, Any]:
+    source = path.resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"person:self reference-set manifest not found: {source}")
+    try:
+        value = json.loads(source.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SpeakerEvidenceError(f"Invalid person:self reference-set JSON: {source}") from exc
+    if not isinstance(value, dict):
+        raise SpeakerEvidenceError("person:self reference-set manifest must be a JSON object.")
+    if value.get("schema") != SELF_SPEAKER_REFERENCE_SET_SCHEMA:
+        raise SpeakerEvidenceError(
+            f"Reference-set schema must be {SELF_SPEAKER_REFERENCE_SET_SCHEMA!r}."
+        )
+    return value
+
+
+def _resolve_reference_set(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    _single_sentence(manifest.get("inference_basis"), "reference-set inference_basis")
+    items = manifest.get("references")
+    if not isinstance(items, list) or not (
+        MIN_SELF_SPEAKER_REFERENCES <= len(items) <= MAX_SELF_SPEAKER_REFERENCES
+    ):
+        raise SpeakerEvidenceError(
+            f"person:self reference set must contain {MIN_SELF_SPEAKER_REFERENCES} to "
+            f"{MAX_SELF_SPEAKER_REFERENCES} references."
+        )
+    resolved: list[dict[str, Any]] = []
+    source_hashes: set[str] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            raise SpeakerEvidenceError(f"Reference {index} must be a JSON object.")
+        source_path = item.get("source_path")
+        if not isinstance(source_path, str) or not source_path.strip():
+            raise SpeakerEvidenceError(f"Reference {index} source_path is invalid.")
+        source = _source_reference(Path(source_path))
+        if source["sha256"] in source_hashes:
+            raise SpeakerEvidenceError("Each person:self enrollment reference must use a distinct source hash.")
+        source_hashes.add(source["sha256"])
+        start, end = _bounded_interval(item.get("start_ms"), item.get("end_ms"))
+        selection_binding = _selection_binding(item.get("selection_binding"), index=index)
+        resolved.append(
+            {
+                "source_path": source["path"],
+                "source_bytes": source["bytes"],
+                "source_sha256": source["sha256"],
+                "start_ms": start,
+                "end_ms": end,
+                "channel": _channel(item.get("channel", "mix")),
+                "inference_basis": _single_sentence(
+                    item.get("inference_basis"), f"reference {index} inference_basis"
+                ),
+                "selection_binding": selection_binding,
+            }
+        )
+    return sorted(resolved, key=_reference_sort_key)
+
+
+def _selection_binding(value: Any, *, index: int | None = None) -> dict[str, str]:
+    label = f"Reference {index} selection_binding" if index is not None else "selection_binding"
+    if not isinstance(value, Mapping):
+        raise SpeakerEvidenceError(f"{label} must be a JSON object.")
+    kind = value.get("kind")
+    if kind not in _SELECTION_BINDING_KINDS:
+        raise SpeakerEvidenceError(f"{label} kind is invalid.")
+    evidence_hash = value.get("evidence_json_sha256")
+    _validate_sha256(evidence_hash, f"{label} evidence JSON")
+    raw_json_pointer = value.get("raw_json_pointer")
+    if (
+        not isinstance(raw_json_pointer, str)
+        or not raw_json_pointer.strip()
+        or "\n" in raw_json_pointer
+        or len(raw_json_pointer) > 512
+    ):
+        raise SpeakerEvidenceError(f"{label} raw_json_pointer is invalid.")
+    return {
+        "kind": str(kind),
+        "evidence_json_sha256": str(evidence_hash).lower(),
+        "raw_json_pointer": raw_json_pointer.strip(),
+    }
+
+
+def _reference_sort_key(reference: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        reference["source_sha256"],
+        float(reference["start_ms"]),
+        float(reference["end_ms"]),
+        reference["channel"],
+    )
 
 
 def _bounded_interval(
@@ -538,20 +744,41 @@ def _profile_embedding(value: Any) -> list[float]:
     return values
 
 
+def _l2_normalize(value: Any) -> list[float]:
+    values = _profile_embedding(value)
+    norm = math.sqrt(sum(item * item for item in values))
+    if norm == 0:
+        raise SpeakerEvidenceError("Speaker embeddings must not be zero vectors.")
+    return [item / norm for item in values]
+
+
+def _centroid(embeddings: Sequence[Sequence[float]]) -> list[float]:
+    if not embeddings:
+        raise SpeakerEvidenceError("Cannot create a person:self centroid without embeddings.")
+    dimension = len(embeddings[0])
+    if dimension == 0 or any(len(item) != dimension for item in embeddings):
+        raise SpeakerEvidenceError("Enrollment speaker embeddings have different dimensions.")
+    mean = [
+        sum(float(embedding[index]) for embedding in embeddings) / len(embeddings)
+        for index in range(dimension)
+    ]
+    return _l2_normalize(mean)
+
+
 def _inferred_identity(basis: str) -> dict[str, Any]:
-    if not isinstance(basis, str) or not basis.strip() or "\n" in basis:
-        raise SpeakerEvidenceError("inference_basis must be one non-empty sentence.")
+    normalized_basis = _single_sentence(basis, "inference_basis")
     return {
         "status": "inferred",
-        "basis": basis.strip(),
+        "basis": normalized_basis,
         "reversible": True,
         "replacement": "可由更强、更新或用户明确确认的本人参考替换；替换后不保留旧向量。",
     }
 
 
 def _validate_profile_shape(profile: Mapping[str, Any]) -> None:
-    if profile.get("schema") != SELF_SPEAKER_PROFILE_SCHEMA:
-        raise SpeakerEvidenceError(f"Profile schema must be {SELF_SPEAKER_PROFILE_SCHEMA!r}.")
+    schema = profile.get("schema")
+    if schema not in {SELF_SPEAKER_PROFILE_SCHEMA, SELF_SPEAKER_MULTI_PROFILE_SCHEMA}:
+        raise SpeakerEvidenceError("Profile schema is unsupported.")
     if profile.get("person_id") != SELF_PERSON_ID:
         raise SpeakerEvidenceError("This command only accepts a person:self profile.")
     _validate_created_utc(profile.get("created_utc"))
@@ -564,6 +791,22 @@ def _validate_profile_shape(profile: Mapping[str, Any]) -> None:
         value = identity.get(field)
         if not isinstance(value, str) or not value.strip() or "\n" in value:
             raise SpeakerEvidenceError(f"person:self profile identity {field} must be one non-empty sentence.")
+    if schema == SELF_SPEAKER_PROFILE_SCHEMA:
+        _validate_single_reference_profile(profile)
+    else:
+        _validate_multi_reference_profile(profile)
+    model = profile.get("model")
+    if not isinstance(model, Mapping):
+        raise SpeakerEvidenceError("person:self profile has no model evidence.")
+    _validate_model_evidence(model)
+    embedding = _profile_embedding(profile.get("embedding"))
+    if schema == SELF_SPEAKER_MULTI_PROFILE_SCHEMA:
+        norm = math.sqrt(sum(item * item for item in embedding))
+        if not math.isclose(norm, 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise SpeakerEvidenceError("person:self centroid embedding must be L2-normalized.")
+
+
+def _validate_single_reference_profile(profile: Mapping[str, Any]) -> None:
     reference = profile.get("enrollment_reference")
     if not isinstance(reference, Mapping):
         raise SpeakerEvidenceError("person:self profile has no enrollment_reference.")
@@ -572,15 +815,70 @@ def _validate_profile_shape(profile: Mapping[str, Any]) -> None:
     if not isinstance(source, Mapping) or not isinstance(segment, Mapping):
         raise SpeakerEvidenceError("person:self profile enrollment_reference is malformed.")
     _validate_source_hash(source, "profile enrollment source")
+    _validate_segment(segment, "profile enrollment segment")
+
+
+def _validate_multi_reference_profile(profile: Mapping[str, Any]) -> None:
+    reference_set = profile.get("reference_set")
+    if not isinstance(reference_set, Mapping):
+        raise SpeakerEvidenceError("person:self profile has no reference_set.")
+    if reference_set.get("schema") != SELF_SPEAKER_REFERENCE_SET_SCHEMA:
+        raise SpeakerEvidenceError("person:self profile reference_set schema is invalid.")
+    references = reference_set.get("references")
+    if not isinstance(references, list) or not (
+        MIN_SELF_SPEAKER_REFERENCES <= len(references) <= MAX_SELF_SPEAKER_REFERENCES
+    ):
+        raise SpeakerEvidenceError("person:self profile reference count is invalid.")
+    if reference_set.get("reference_count") != len(references):
+        raise SpeakerEvidenceError("person:self profile reference_count is inconsistent.")
+    hashes: list[str] = []
+    sort_keys: list[tuple[Any, ...]] = []
+    for index, reference in enumerate(references):
+        if not isinstance(reference, Mapping):
+            raise SpeakerEvidenceError("person:self profile reference is malformed.")
+        source = reference.get("source")
+        segment = reference.get("segment")
+        if not isinstance(source, Mapping) or not isinstance(segment, Mapping):
+            raise SpeakerEvidenceError("person:self profile reference source/segment is malformed.")
+        _validate_private_source_hash(source, "profile reference source")
+        _validate_segment(segment, "profile reference segment")
+        _single_sentence(reference.get("inference_basis"), f"profile reference {index} inference_basis")
+        _selection_binding(reference.get("selection_binding"))
+        hashes.append(str(source["sha256"]).lower())
+        sort_keys.append(
+            (
+                str(source["sha256"]).lower(),
+                float(segment["start_ms"]),
+                float(segment["end_ms"]),
+                segment["channel"],
+            )
+        )
+    if len(set(hashes)) != len(hashes):
+        raise SpeakerEvidenceError("person:self profile references must use distinct source hashes.")
+    if sort_keys != sorted(sort_keys):
+        raise SpeakerEvidenceError("person:self profile references are not in deterministic order.")
+    expected_set_hash = canonical_json_sha256(
+        {"schema": SELF_SPEAKER_REFERENCE_SET_SCHEMA, "references": references}
+    )
+    _validate_sha256(reference_set.get("sha256"), "profile reference set")
+    if reference_set["sha256"].lower() != expected_set_hash:
+        raise SpeakerEvidenceError("person:self profile reference_set hash is inconsistent.")
+    aggregation = profile.get("aggregation")
+    if not isinstance(aggregation, Mapping):
+        raise SpeakerEvidenceError("person:self profile aggregation is missing.")
+    if aggregation.get("method") != CENTROID_AGGREGATION_METHOD:
+        raise SpeakerEvidenceError("person:self profile aggregation method is invalid.")
+    if aggregation.get("reference_count") != len(references):
+        raise SpeakerEvidenceError("person:self profile aggregation count is inconsistent.")
+
+
+def _validate_segment(segment: Mapping[str, Any], label: str) -> None:
     _bounded_interval(segment.get("start_ms"), segment.get("end_ms"))
-    _channel(segment.get("channel"))
-    if segment.get("channel_binding") not in {"mixed_not_channel_evidence", "exact_stereo_channel"}:
-        raise SpeakerEvidenceError("person:self profile has an invalid channel binding.")
-    model = profile.get("model")
-    if not isinstance(model, Mapping):
-        raise SpeakerEvidenceError("person:self profile has no model evidence.")
-    _validate_model_evidence(model)
-    _profile_embedding(profile.get("embedding"))
+    channel = _channel(segment.get("channel"))
+    binding = segment.get("channel_binding")
+    expected = "mixed_not_channel_evidence" if channel == "mix" else "exact_stereo_channel"
+    if binding != expected:
+        raise SpeakerEvidenceError(f"{label} channel binding is invalid.")
 
 
 def _validate_profile_for_model(profile: Mapping[str, Any], current_model: Mapping[str, Any]) -> None:
@@ -615,6 +913,52 @@ def _validate_source_hash(source: Mapping[str, Any], label: str) -> None:
     _validate_sha256(source.get("sha256"), label)
     if isinstance(source.get("bytes"), bool) or not isinstance(source.get("bytes"), int) or source["bytes"] < 0:
         raise SpeakerEvidenceError(f"{label} bytes are invalid.")
+
+
+def _validate_private_source_hash(source: Mapping[str, Any], label: str) -> None:
+    if "path" in source:
+        raise SpeakerEvidenceError(f"{label} must not persist a source path.")
+    _validate_sha256(source.get("sha256"), label)
+    if isinstance(source.get("bytes"), bool) or not isinstance(source.get("bytes"), int) or source["bytes"] < 0:
+        raise SpeakerEvidenceError(f"{label} bytes are invalid.")
+
+
+def _profile_enrollment_source_hashes(profile: Mapping[str, Any]) -> set[str]:
+    if profile["schema"] == SELF_SPEAKER_PROFILE_SCHEMA:
+        return {str(profile["enrollment_reference"]["source"]["sha256"]).lower()}
+    return {
+        str(reference["source"]["sha256"]).lower()
+        for reference in profile["reference_set"]["references"]
+    }
+
+
+def _evidence_profile_binding(profile: Mapping[str, Any], profile_hash: str) -> dict[str, Any]:
+    common = {
+        "schema": profile["schema"],
+        "sha256": profile_hash,
+        "identity_status": profile["identity"]["status"],
+        "enrollment_basis": profile["identity"]["basis"],
+    }
+    if profile["schema"] == SELF_SPEAKER_PROFILE_SCHEMA:
+        return {
+            **common,
+            "enrollment_source_sha256": profile["enrollment_reference"]["source"]["sha256"],
+        }
+    reference_set = profile["reference_set"]
+    return {
+        **common,
+        "reference_set_sha256": reference_set["sha256"],
+        "reference_count": reference_set["reference_count"],
+        "enrollment_source_sha256s": [
+            reference["source"]["sha256"] for reference in reference_set["references"]
+        ],
+    }
+
+
+def _single_sentence(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip() or "\n" in value:
+        raise SpeakerEvidenceError(f"{label} must be one non-empty sentence.")
+    return value.strip()
 
 
 def _validate_created_utc(value: Any) -> None:

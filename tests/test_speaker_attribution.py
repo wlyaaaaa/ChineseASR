@@ -86,6 +86,26 @@ def voice_document(*, source_hash=HASH_A, start_ms=0, end_ms=980, score=0.75, th
     }
 
 
+def multi_reference_voice_document(**kwargs):
+    from zh_asr.speaker_evidence import (
+        SELF_SPEAKER_MULTI_EVIDENCE_SCHEMA,
+        SELF_SPEAKER_MULTI_PROFILE_SCHEMA,
+    )
+
+    document = voice_document(**kwargs)
+    document["schema"] = SELF_SPEAKER_MULTI_EVIDENCE_SCHEMA
+    document["profile"] = {
+        "schema": SELF_SPEAKER_MULTI_PROFILE_SCHEMA,
+        "sha256": PROFILE_HASH,
+        "reference_set_sha256": "1" * 64,
+        "reference_count": 3,
+        "enrollment_source_sha256s": ["2" * 64, "3" * 64, "4" * 64],
+        "identity_status": "inferred",
+        "enrollment_basis": "三条跨来源有限参考只作为可替换的本人推定锚。",
+    }
+    return document
+
+
 class SpeakerAttributionTests(unittest.TestCase):
     def test_unbound_legacy_right_channel_is_not_evidence(self):
         from zh_asr.speaker_attribution import attribute_transcript_result
@@ -183,6 +203,56 @@ class SpeakerAttributionTests(unittest.TestCase):
         self.assertNotEqual(segment["attribution_status"], "confirmed")
         self.assertNotIn("evidence", segment)
         self.assertNotIn("0.7500", segment["basis"])
+
+    def test_multi_reference_voice_evidence_is_reversible_fusion_input(self):
+        from zh_asr.speaker_attribution import attribute_transcript_result
+
+        result = attribute_transcript_result(
+            load_fixture("stereo_transcript.json"),
+            context(recording_kind="other", source_hash=HASH_A),
+            active_voice_profile_sha256=PROFILE_HASH,
+            voice_evidence=[multi_reference_voice_document(score=0.75)],
+        )
+
+        segment = result["segments"][0]
+        self.assertEqual(segment["attribution_status"], "inferred")
+        self.assertEqual(segment["candidate_role"], "self")
+        self.assertNotEqual(segment["attribution_status"], "confirmed")
+
+    def test_multi_reference_same_source_score_is_non_directional(self):
+        from zh_asr.speaker_attribution import attribute_transcript_result
+
+        evidence = multi_reference_voice_document(score=0.75)
+        evidence["profile"]["enrollment_source_sha256s"][0] = HASH_A
+        evidence["source_relation"] = "enrollment_source"
+        result = attribute_transcript_result(
+            load_fixture("stereo_transcript.json"),
+            context(recording_kind="other", source_hash=HASH_A),
+            active_voice_profile_sha256=PROFILE_HASH,
+            voice_evidence=[evidence],
+        )
+
+        segment = result["segments"][0]
+        self.assertEqual(segment["attribution_status"], "unknown")
+        self.assertEqual(segment["candidate_role"], "unknown")
+        self.assertIn("同一原件", segment["basis"])
+
+    def test_legacy_same_source_score_is_also_non_directional(self):
+        from zh_asr.speaker_attribution import attribute_transcript_result
+
+        evidence = voice_document(score=0.75)
+        evidence["profile"]["enrollment_source_sha256"] = HASH_A
+        result = attribute_transcript_result(
+            load_fixture("stereo_transcript.json"),
+            context(recording_kind="other", source_hash=HASH_A),
+            active_voice_profile_sha256=PROFILE_HASH,
+            voice_evidence=[evidence],
+        )
+
+        segment = result["segments"][0]
+        self.assertEqual(segment["attribution_status"], "unknown")
+        self.assertEqual(segment["candidate_role"], "unknown")
+        self.assertIn("同一原件", segment["basis"])
 
     def test_deleted_profile_makes_old_voice_score_inactive(self):
         from zh_asr.speaker_attribution import attribute_transcript_result

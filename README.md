@@ -231,7 +231,7 @@ python -m zh_asr attribute-speakers C:\private\call.raw.json `
 
 ### 私有 `person:self` 声纹锚
 
-在本机私有边界内，可以显式保存**唯一一个**用户本人的 `person:self` CAM++ profile。它不是通用声纹库：没有第二数据库、服务、队列、他人 profile 或全库重跑。profile 保存在 Git 忽略的 `outputs\private`（也可显式指定另一条私有路径），包含原始参考音频的路径/哈希/片段/声道、生成时间、CAM++ 配置 revision、runtime 和模型文件哈希，以及可重建、可替换、可删除的本人向量；不会复制原始参考音频。
+在本机私有边界内，可以显式保存**唯一一个**用户本人的 `person:self` CAM++ profile。它不是通用声纹库：没有第二数据库、服务、队列、他人 profile 或全库重跑。单参考兼容 profile 保存在 Git 忽略的 `outputs\private`（也可显式指定另一条私有路径），包含参考路径/哈希/片段/声道和一个可撤销向量。跨录音域 profile 只接收恰好 2–3 条不同源参考，将每条向量 L2 归一化后求质心并再次归一化；持久化文件只有一个质心、来源哈希/大小、精确片段与可回查选择绑定，不保存源路径、原音或各参考向量。
 
 只对“本人候选”有清晰、无反证依据的有限片段建锚。每次必须写出一条 `--inference-basis`：profile 固定为可撤销的 `inferred`，不能冒充 `confirmed`，可以用更强或更新的参考显式替换。
 
@@ -242,14 +242,27 @@ python -m zh_asr speaker-enroll C:\private\known-self.wav `
   --profile C:\private\person-self.voice-profile.json --device cpu
 ```
 
+需要兼顾应用双声道与普通通话时，可用一个私有 manifest 指定 2–3 条来源天然明确、互不重复的有限参考；manifest 本身不进入 Git，profile 中也不保留其中的源路径。每条必须绑定现有证据 JSON 的 SHA-256 和 JSON pointer，不能只写“我觉得是本人”：
+
+```powershell
+python -m zh_asr speaker-enroll `
+  --references C:\private\person-self.reference-set.json `
+  --profile C:\private\person-self.voice-profile.json --replace --device cpu
+```
+
 之后只在需要的一个目标片段上生成证据。目标向量只在内存中计算并丢弃；输出仅留下原始目标哈希、精确片段时间、声道提取方式、模型/文件哈希、profile 哈希和相似度/阈值：
 
 ```powershell
 python -m zh_asr speaker-evidence C:\private\call.m4a `
   --start-ms 18400 --end-ms 23100 --channel mix `
   --profile C:\private\person-self.voice-profile.json `
-  --out C:\private\call.18400-23100.person-self-evidence.json --device cpu
+  --out C:\private\call.18400-23100.person-self-evidence.json `
+  --require-held-out --device cpu
 ```
+
+`--require-held-out` 会在目标原件曾参与当前 profile 时失败关闭，避免把 enrollment 片段回测成“验证”。模型固定阈值不会因质心或单次样本被调到刚好通过；相似度仍须与声道、联系人、对话角色和内容融合。
+
+即使调用方没有要求 held-out，evidence 也会按源哈希标记 `enrollment_source` 或 `held_out_source`。单参考兼容 profile 与跨来源质心 profile 的同原件分数都只留作本地审计；归属投影会把它降为 `unknown` 声学线索，防止录音设备、声道或背景底色泄漏成身份判断。
 
 显式替换或删除也只作用于这一份 `person:self` profile：
 

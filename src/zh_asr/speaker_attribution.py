@@ -22,6 +22,8 @@ from .speaker_evidence import (
     SELF_PERSON_ID,
     SELF_SPEAKER_PROFILE_SCHEMA,
     SELF_SPEAKER_EVIDENCE_SCHEMA,
+    SELF_SPEAKER_MULTI_PROFILE_SCHEMA,
+    SELF_SPEAKER_MULTI_EVIDENCE_SCHEMA,
     SPEAKER_MODEL_EVIDENCE_SCHEMA,
     VOICE_SCORE_AMBIGUITY_MARGIN,
 )
@@ -334,6 +336,16 @@ def _voice_signals(
                 )
             )
             continue
+        if _voice_source_relation(document) == "enrollment_source":
+            signals.append(
+                _signal(
+                    "voice_enrollment_source",
+                    "unknown",
+                    "本段与 person:self enrollment 来自同一原件，声学底色可能泄漏，分数不作为方向性身份线索。",
+                    evidence_sha256=evidence_ref,
+                )
+            )
+            continue
         score = document["score"]
         value = float(score["value"])
         threshold = float(score["threshold"])
@@ -440,9 +452,12 @@ def _parse_voice_evidence(value: Sequence[Mapping[str, Any]]) -> tuple[Mapping[s
     for document in value:
         if not isinstance(document, Mapping):
             raise SpeakerAttributionError("Each voice_evidence document must be a JSON object.")
-        if document.get("schema") != SELF_SPEAKER_EVIDENCE_SCHEMA:
+        if document.get("schema") not in {
+            SELF_SPEAKER_EVIDENCE_SCHEMA,
+            SELF_SPEAKER_MULTI_EVIDENCE_SCHEMA,
+        }:
             raise SpeakerAttributionError(
-                f"voice_evidence schema must be {SELF_SPEAKER_EVIDENCE_SCHEMA!r}."
+                "voice_evidence schema is unsupported."
             )
         if document.get("person_id") != SELF_PERSON_ID:
             raise SpeakerAttributionError("voice_evidence may only refer to person:self.")
@@ -456,6 +471,7 @@ def _parse_voice_evidence(value: Sequence[Mapping[str, Any]]) -> tuple[Mapping[s
             raise SpeakerAttributionError("voice_evidence target source/segment is malformed.")
         _validate_source_reference(source, "voice_evidence target source")
         _validate_sha256(source.get("sha256"), "voice_evidence target source")
+        _voice_source_relation(document)
         _finite_time(segment.get("start_ms"), "voice_evidence start_ms")
         _finite_time(segment.get("end_ms"), "voice_evidence end_ms")
         if segment["end_ms"] <= segment["start_ms"]:
@@ -489,6 +505,24 @@ def _parse_voice_evidence(value: Sequence[Mapping[str, Any]]) -> tuple[Mapping[s
     return tuple(documents)
 
 
+def _voice_source_relation(document: Mapping[str, Any]) -> str:
+    if document.get("schema") == SELF_SPEAKER_EVIDENCE_SCHEMA:
+        enrollment_hashes = {
+            str(document["profile"]["enrollment_source_sha256"]).lower()
+        }
+    else:
+        enrollment_hashes = {
+            str(item).lower()
+            for item in document["profile"]["enrollment_source_sha256s"]
+        }
+    target_hash = str(document["target"]["source"]["sha256"]).lower()
+    expected = "enrollment_source" if target_hash in enrollment_hashes else "held_out_source"
+    declared = document.get("source_relation")
+    if declared is not None and declared != expected:
+        raise SpeakerAttributionError("voice_evidence source_relation is inconsistent with source hashes.")
+    return expected
+
+
 def _validate_voice_evidence_identity(document: Mapping[str, Any]) -> None:
     generated_utc = document.get("generated_utc")
     if not isinstance(generated_utc, str) or not generated_utc.strip() or not generated_utc.endswith("Z"):
@@ -502,13 +536,36 @@ def _validate_voice_evidence_identity(document: Mapping[str, Any]) -> None:
     profile = document.get("profile")
     if not isinstance(profile, Mapping):
         raise SpeakerAttributionError("voice_evidence must bind the person:self profile.")
-    if profile.get("schema") != SELF_SPEAKER_PROFILE_SCHEMA:
-        raise SpeakerAttributionError("voice_evidence profile schema is invalid.")
+    profile_schema = profile.get("schema")
+    evidence_schema = document.get("schema")
+    if evidence_schema == SELF_SPEAKER_EVIDENCE_SCHEMA:
+        if profile_schema != SELF_SPEAKER_PROFILE_SCHEMA:
+            raise SpeakerAttributionError("legacy voice_evidence must bind a v2 profile.")
+        _validate_sha256(
+            profile.get("enrollment_source_sha256"),
+            "voice_evidence profile enrollment source",
+        )
+    elif evidence_schema == SELF_SPEAKER_MULTI_EVIDENCE_SCHEMA:
+        if profile_schema != SELF_SPEAKER_MULTI_PROFILE_SCHEMA:
+            raise SpeakerAttributionError("multi-reference voice_evidence must bind a v3 profile.")
+        _validate_sha256(profile.get("reference_set_sha256"), "voice_evidence reference set")
+        reference_count = profile.get("reference_count")
+        source_hashes = profile.get("enrollment_source_sha256s")
+        if (
+            isinstance(reference_count, bool)
+            or not isinstance(reference_count, int)
+            or reference_count not in {2, 3}
+            or not isinstance(source_hashes, list)
+            or len(source_hashes) != reference_count
+        ):
+            raise SpeakerAttributionError("voice_evidence profile reference metadata is invalid.")
+        for source_hash in source_hashes:
+            _validate_sha256(source_hash, "voice_evidence profile enrollment source")
+        if len({str(item).lower() for item in source_hashes}) != len(source_hashes):
+            raise SpeakerAttributionError("voice_evidence profile enrollment sources must be distinct.")
+    else:  # The caller is always reached through _parse_voice_evidence.
+        raise SpeakerAttributionError("voice_evidence schema is unsupported.")
     _validate_sha256(profile.get("sha256"), "voice_evidence profile")
-    _validate_sha256(
-        profile.get("enrollment_source_sha256"),
-        "voice_evidence profile enrollment source",
-    )
     if profile.get("identity_status") != "inferred":
         raise SpeakerAttributionError("voice_evidence profile identity_status must be inferred.")
     enrollment_basis = profile.get("enrollment_basis")
@@ -691,6 +748,8 @@ def _one_sentence_chinese(value: str) -> str:
 def _unknown_reason(context: _Context, signals: Sequence[Mapping[str, Any]]) -> str:
     if any(item["kind"] == "voice_profile_inactive" for item in signals):
         return "生成该声纹证据的 person:self profile 已删除或替换，旧分数已失效，且没有其他可用线索，保留为 unknown。"
+    if any(item["kind"] == "voice_enrollment_source" for item in signals):
+        return "该段与 person:self enrollment 来自同一原件，声学底色可能泄漏，分数不作为方向性线索，且没有其他可用依据。"
     if any(item["kind"] == "voice_similarity_near_threshold" for item in signals):
         if context.recording_kind == "mono_call":
             return "该段来自单声道通话的混合声道，声纹相似度接近风险边界，且没有其他可用线索，保留为 unknown。"
