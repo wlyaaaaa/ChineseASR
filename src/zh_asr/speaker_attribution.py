@@ -27,13 +27,14 @@ from .speaker_evidence import (
 )
 
 
-SPEAKER_ATTRIBUTION_SCHEMA = "chinese-asr.speaker-attribution.v3"
+SPEAKER_ATTRIBUTION_SCHEMA = "chinese-asr.speaker-attribution.v4"
 SPEAKER_ATTRIBUTION_INPUT_BINDING_SCHEMA = (
     "chinese-asr.speaker-attribution-input-binding.v1"
 )
 SPEAKER_ATTRIBUTION_CONTEXT_SCHEMA = "chinese-asr.speaker-attribution-context.v2"
 _LEGACY_CONTEXT_SCHEMA = "chinese-asr.speaker-attribution-context.v1"
 XIAOMI_APP_STEREO_COHORT_ID = "xiaomi-app-stereo-2026-08-verified"
+MONO_CALL_MIX_VOICE_SCORE_AMBIGUITY_MARGIN = 0.04
 
 _RECORDING_KINDS = frozenset({"mono_call", "xiaomi_app_stereo", "other"})
 _ROLES = frozenset({"self", "other"})
@@ -303,12 +304,27 @@ def _voice_signals(
         value = float(score["value"])
         threshold = float(score["threshold"])
         evidence_ref = canonical_json_sha256(document)
-        if abs(value - threshold) <= VOICE_SCORE_AMBIGUITY_MARGIN:
+        target_segment = document["target"]["segment"]
+        mono_call_mix = (
+            context.recording_kind == "mono_call"
+            and target_segment["channel"] == "mix"
+            and target_segment["channel_binding"] == "mixed_not_channel_evidence"
+        )
+        ambiguity_margin = (
+            MONO_CALL_MIX_VOICE_SCORE_AMBIGUITY_MARGIN
+            if mono_call_mix
+            else VOICE_SCORE_AMBIGUITY_MARGIN
+        )
+        if abs(value - threshold) <= ambiguity_margin:
             signals.append(
                 _signal(
                     "voice_similarity_near_threshold",
                     "unknown",
-                    "本段本地声纹比对接近阈值，单独不作为方向性身份线索。",
+                    (
+                        "本段来自单声道通话的混合声道，声纹比对接近风险边界，单独不作为方向性身份线索。"
+                        if mono_call_mix
+                        else "本段本地声纹比对接近阈值，单独不作为方向性身份线索。"
+                    ),
                     evidence_sha256=evidence_ref,
                 )
             )
@@ -639,6 +655,8 @@ def _one_sentence_chinese(value: str) -> str:
 
 def _unknown_reason(context: _Context, signals: Sequence[Mapping[str, Any]]) -> str:
     if any(item["kind"] == "voice_similarity_near_threshold" for item in signals):
+        if context.recording_kind == "mono_call":
+            return "该段来自单声道通话的混合声道，声纹相似度接近风险边界，且没有其他可用线索，保留为 unknown。"
         return "现有声纹相似度接近阈值，且没有其他可用线索，保留为 unknown。"
     if context.recording_kind == "xiaomi_app_stereo" and context.cohort_id != XIAOMI_APP_STEREO_COHORT_ID:
         return "该录音不属于已验证的小米立体声 cohort，声道不能用于判断本人。"

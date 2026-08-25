@@ -277,6 +277,73 @@ class SpeakerAttributionTests(unittest.TestCase):
         self.assertNotIn("evidence", segment)
         self.assertNotIn("0.3200", segment["basis"])
 
+    def test_mono_call_mix_uses_wider_fail_closed_voice_margin(self):
+        from zh_asr.speaker_attribution import attribute_transcript_result
+
+        result = attribute_transcript_result(
+            load_fixture("stereo_transcript.json"),
+            context(recording_kind="mono_call", source_hash=HASH_A),
+            voice_evidence=[voice_document(score=0.340904866570855)],
+        )
+
+        segment = result["segments"][0]
+        self.assertEqual(segment["attribution_status"], "unknown")
+        self.assertEqual(segment["candidate_role"], "unknown")
+        self.assertIn("单声道通话的混合声道", segment["basis"])
+        self.assertNotIn("0.3409", segment["basis"])
+
+    def test_mono_call_mix_keeps_clearly_separated_self_voice_direction(self):
+        from zh_asr.speaker_attribution import attribute_transcript_result
+
+        result = attribute_transcript_result(
+            load_fixture("stereo_transcript.json"),
+            context(recording_kind="mono_call", source_hash=HASH_A),
+            voice_evidence=[voice_document(score=0.478369409902273)],
+        )
+
+        segment = result["segments"][0]
+        self.assertEqual(segment["attribution_status"], "inferred")
+        self.assertEqual(segment["candidate_role"], "self")
+
+    def test_wider_mono_call_margin_does_not_change_other_recording_kinds(self):
+        from zh_asr.speaker_attribution import attribute_transcript_result
+
+        result = attribute_transcript_result(
+            load_fixture("stereo_transcript.json"),
+            context(recording_kind="other", source_hash=HASH_A),
+            voice_evidence=[voice_document(score=0.340904866570855)],
+        )
+
+        segment = result["segments"][0]
+        self.assertEqual(segment["attribution_status"], "inferred")
+        self.assertEqual(segment["candidate_role"], "self")
+
+    def test_mono_call_context_still_identifies_other_when_voice_is_risk_ambiguous(self):
+        from zh_asr.speaker_attribution import attribute_transcript_result
+
+        result = attribute_transcript_result(
+            load_fixture("stereo_transcript.json"),
+            context(
+                recording_kind="mono_call",
+                source_hash=HASH_A,
+                evidence=[
+                    {
+                        "index": 0,
+                        "dialogue_role": {
+                            "candidate_role": "other",
+                            "reason": "该句由业务人员询问用户要办理的事项。",
+                        },
+                    }
+                ],
+            ),
+            voice_evidence=[voice_document(score=0.340904866570855)],
+        )
+
+        segment = result["segments"][0]
+        self.assertEqual(segment["attribution_status"], "inferred")
+        self.assertEqual(segment["candidate_role"], "other")
+        self.assertIn("业务人员", segment["basis"])
+
     def test_xiaomi_right_channel_requires_hash_bound_exact_extraction(self):
         from zh_asr.speaker_attribution import (
             XIAOMI_APP_STEREO_COHORT_ID,
