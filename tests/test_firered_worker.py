@@ -241,7 +241,6 @@ class FireRedAdapterTests(unittest.TestCase):
     def test_worker_invocation_uses_json_protocol_and_normalizes_text(self):
         from zh_asr.adapters.firered_worker import (
             FireRedWorkerAdapter,
-            FireRedWorkerTimeout,
         )
 
         with tempfile.TemporaryDirectory() as tmp:

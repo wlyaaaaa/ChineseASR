@@ -7,7 +7,7 @@ import os
 import re
 import uuid
 import wave
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Any, Mapping
