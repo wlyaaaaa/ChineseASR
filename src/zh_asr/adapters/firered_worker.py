@@ -9,10 +9,11 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import wave
 
 from zh_asr.config import EngineSpec
+from zh_asr.process_control import PROCESS_TOKEN_ENV, terminate_wsl_processes
 from zh_asr.text_normalizer import to_simplified
 
 
@@ -237,6 +238,7 @@ class FireRedWorkerModel:
         try:
             completed = runner(self.command, **kwargs)
         except subprocess.TimeoutExpired as exc:
+            _cleanup_timed_out_worker(self.command, env, path_style=self.path_style)
             label = (
                 audio_paths[0].name
                 if len(audio_paths) == 1
@@ -272,6 +274,36 @@ class FireRedWorkerModel:
                 detail = str(error or "Unknown FireRed worker error")
             raise FireRedWorkerError(f"FireRed worker reported failure: {detail}")
         return _normalize_worker_result(response.get("result"))
+
+
+def _cleanup_timed_out_worker(
+    command: Sequence[str],
+    env: Mapping[str, str],
+    *,
+    path_style: str,
+) -> None:
+    """Clean token-bound WSL descendants after the launcher times out."""
+
+    if path_style != "wsl":
+        return
+    token = str(env.get(PROCESS_TOKEN_ENV) or "").strip()
+    distribution = _wsl_distribution(command)
+    if not token or not distribution:
+        return
+    try:
+        terminate_wsl_processes((distribution,), token)
+    except (OSError, ValueError):
+        # The timeout itself remains authoritative; cleanup is best effort and
+        # the outer service/supervisor will perform its own bounded cleanup.
+        return
+
+
+def _wsl_distribution(command: Sequence[str]) -> str | None:
+    for index, value in enumerate(command[:-1]):
+        if str(value).lower() in {"-d", "--distribution"}:
+            distribution = str(command[index + 1]).strip()
+            return distribution or None
+    return None
 
 
 def _worker_command(options: dict[str, Any], path_style: str) -> list[str]:

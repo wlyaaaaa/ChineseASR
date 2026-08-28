@@ -337,8 +337,12 @@ def _generate_many_for_strict(
                 for index in valid_indices:
                     provenance[index]["runtime_identity"] = runtime_identity
             generate_many = getattr(model, "generate_many", None)
+            generation_kwargs = _engine_generation_kwargs(engine, config)
             if callable(generate_many):
-                generated = generate_many([str(prepared[index]) for index in valid_indices])
+                generated = generate_many(
+                    [str(prepared[index]) for index in valid_indices],
+                    **generation_kwargs,
+                )
                 if not isinstance(generated, list) or len(generated) != len(valid_indices):
                     raise RuntimeError(
                         f"Engine '{engine}' generate_many returned "
@@ -360,6 +364,7 @@ def _generate_many_for_strict(
                         generated = model.generate(
                             input=str(prepared[index]),
                             batch_size_s=300,
+                            **generation_kwargs,
                         )
                         results[index] = _attach_speech_detection_if_empty(
                             generated,
@@ -493,6 +498,7 @@ def _generate_once_with_identity(
             "input": str(audio_path),
             "batch_size_s": 300,
         }
+        generate_kwargs.update(_engine_generation_kwargs(engine, config))
         if preset_spk_num is not None:
             generate_kwargs["preset_spk_num"] = preset_spk_num
         result = model.generate(**generate_kwargs)
@@ -535,6 +541,27 @@ def _speaker_diarization_request(engine: str, preset_spk_num: int | None) -> dic
 def _model_runtime_identity(model: Any) -> dict[str, Any]:
     identity = getattr(model, "runtime_identity", None)
     return dict(identity) if isinstance(identity, dict) else {}
+
+
+def _engine_generation_kwargs(engine: str, config: ModelConfig) -> dict[str, Any]:
+    """Return explicit inference hints owned by the model registry.
+
+    FunASR's ``AutoModel`` does not inherit ``EngineSpec.language`` from its
+    loader configuration.  Supplying the configured hint at generation time is
+    especially important for Fun-ASR-Nano, whose official Chinese route uses
+    the explicit ``中文`` prompt.  Qwen and FireRed adapters own their language
+    handling, so they are intentionally left unchanged here.
+    """
+
+    spec = get_engine_spec(engine, config=config)
+    if spec.adapter != "funasr":
+        return {}
+    language = str(spec.language or "").strip()
+    if not language or language.lower() == "auto":
+        return {}
+    if engine == "fun-asr-nano" and language.lower() in {"chinese", "zh", "zh-cn"}:
+        language = "中文"
+    return {"language": language}
 
 
 def _attach_speech_detection_if_empty(

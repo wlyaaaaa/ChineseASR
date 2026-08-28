@@ -45,6 +45,7 @@ class CliTests(unittest.TestCase):
     def test_gpu_cli_supervisor_passes_live_token_to_worker(self):
         from zh_asr.__main__ import _supervise_gpu_cli
         from zh_asr.gpu_broker import GPU_BROKER_CHILD_TOKEN_ENV
+        from zh_asr.process_control import PROCESS_TOKEN_ENV
 
         captured = {}
 
@@ -94,6 +95,8 @@ class CliTests(unittest.TestCase):
             "live-asr-token",
         )
         self.assertNotIn("ZH_ASR_GPU_BROKER_LEASE_HELD", captured["env"])
+        self.assertTrue(captured["env"][PROCESS_TOKEN_ENV].startswith("chineseasr-cli-"))
+        self.assertIn(PROCESS_TOKEN_ENV, captured["env"]["WSLENV"].split(":"))
         self.assertEqual(
             captured["command"][:3],
             [sys.executable, "-m", "zh_asr"],
@@ -146,11 +149,18 @@ class CliTests(unittest.TestCase):
         ), patch(
             "zh_asr.__main__.terminate_process_tree",
             side_effect=lambda process: terminated.append(process.pid),
-        ):
+        ), patch("zh_asr.__main__.terminate_wsl_processes") as cleanup_wsl:
             with self.assertRaises(GpuBrokerLeaseLost):
-                _supervise_gpu_cli(["transcribe", "note.wav"])
+                with patch(
+                    "zh_asr.__main__._cli_wsl_distributions",
+                    return_value=("Ubuntu",),
+                ):
+                    _supervise_gpu_cli(["transcribe", "note.wav"])
 
         self.assertEqual(terminated, [1234])
+        self.assertEqual(cleanup_wsl.call_count, 2)
+        self.assertEqual(cleanup_wsl.call_args.args[0], ("Ubuntu",))
+        self.assertTrue(cleanup_wsl.call_args.args[1].startswith("chineseasr-cli-"))
 
     def test_gpu_cli_supervisor_terminates_worker_before_releasing_on_interrupt(self):
         from zh_asr.__main__ import _supervise_gpu_cli
@@ -200,6 +210,36 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             events,
             ["lease_enter", "wait", "terminate", "lease_release"],
+        )
+
+    def test_cli_wsl_cleanup_scope_follows_selected_engine_runtime(self):
+        from zh_asr.__main__ import _cli_wsl_distributions
+
+        self.assertEqual(
+            ("Ubuntu",),
+            _cli_wsl_distributions(
+                [
+                    "strict",
+                    "sample.wav",
+                    "--primary-engine",
+                    "fireredasr2-llm",
+                    "--secondary-engine",
+                    "qwen3-asr-1.7b",
+                ]
+            ),
+        )
+        self.assertEqual(
+            (),
+            _cli_wsl_distributions(
+                [
+                    "strict",
+                    "sample.wav",
+                    "--primary-engine",
+                    "qwen3-asr-1.7b",
+                    "--secondary-engine",
+                    "sensevoice",
+                ]
+            ),
         )
 
     def run_cli(self, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

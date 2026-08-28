@@ -131,7 +131,7 @@ API Key 只由 Secret Broker 注入固定、哈希绑定的子进程环境，不
 .\scripts\setup-core.ps1
 ```
 
-核心依赖文件 `requirements-core.txt` 固定 `funasr==1.4.2`。Fun-ASR-Nano 是面向 GPU 的较重模型，先完成 CUDA/PyTorch 与核心依赖安装，再按需下载；不需要 Nano 的机器无需额外安装模型。
+核心依赖文件 `requirements-core.txt` 固定 `funasr==1.4.5`。Fun-ASR-Nano 是面向 GPU 的较重模型，先完成 CUDA/PyTorch 与核心依赖安装，再按需下载；不需要 Nano 的机器无需额外安装模型。
 
 下载 quick / secondary 默认需要的 SenseVoice：
 
@@ -359,6 +359,13 @@ sidecar 的正式正交字段是 `execution.status ∈ {completed, failed, unsup
 `/observer/*` 是只读安全投影，供本机统一观察台读取。它只返回任务状态、模式、逻辑模型名、时间、可用的长音频 chunk 计数与终态 RTF；ASR 不产生通用 LLM token 指标，因此 token 状态固定为 `not_applicable`。投影不返回音频/输出路径、PID、命令、stdout/stderr、识别正文、证据完整性状态或 GPU Broker 信息。证据消费者必须读取 `/jobs` 或 `/jobs/{job_id}` 中的 `evidence_status` 与 `evidence_failures`，不能用 observer 投影替代证据验收。
 
 `asr-smart.ps1` 会在需要时启动本地 API，提交 job，并在 `WaitSec` 内等待结果。如果任务仍在运行，它会返回 job id 和下一步查询命令，而不是无限等待。
+
+API 会在 `outputs\api\jobs.json` 中以原子替换保存任务历史：服务重启不会自动重跑任务，
+重启前仍处于 `queued` 或 `running` 的 job 会保留为可查询的 `service_restarted` 失败终态。
+持久化快照最多保留最近 200 条终态记录，同时保留活动/排队任务；裁剪历史不会删除原有转写输出文件。
+若任务历史落盘失败，`GET /health` 会报告 `persistence.status=degraded`、`ready=false`，
+后续新任务会被拒绝，直到一次后续状态写入成功恢复；命令已完成但终态历史不可持久时，
+job 不报告为成功，且转写输出文件可能已经存在。
 
 为了避免和受管 Ollama、LocalOCR 或其他 ChineseASR 任务抢 GPU，所有公开 CLI 和
 smart/API 路径都必须先取得 LocalGpuBroker 租约；Broker 不可用时任务失败关闭，不会

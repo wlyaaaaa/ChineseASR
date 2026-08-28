@@ -3,6 +3,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import wave
 from http.server import ThreadingHTTPServer
@@ -15,7 +16,9 @@ from zh_asr.service import (
     CALLER_BINDING_ENV,
     GpuProcess,
     JobRequest,
+    PersistenceNotReadyError,
     ProcessResult,
+    TERMINAL_STATUSES,
     TranscriptionService,
     create_handler,
     detect_gpu_processes,
@@ -73,6 +76,46 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(request.caller_binding, binding)
         self.assertEqual(request.to_dict()["caller_binding"], binding)
         self.assertNotEqual(request.fingerprint(), other.fingerprint())
+
+    def test_persisted_snapshot_preserves_caller_binding_passthrough(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            state_dir = root / "state"
+            binding = {"opaque_ref": "caller-owned", "source": "caller"}
+            request = JobRequest.from_payload(
+                {
+                    "audio": str(audio),
+                    "mode": "quick",
+                    "device": "cpu",
+                    "caller_binding": binding,
+                },
+                root=root,
+            )
+            service = TranscriptionService(
+                root=root,
+                default_out_root=state_dir,
+                gpu_process_detector=lambda: [],
+                autostart=False,
+            )
+            job, _ = service.submit(request)
+            snapshot = json.loads(
+                (state_dir / "jobs.json").read_text(encoding="utf-8")
+            )
+            restarted = TranscriptionService(
+                root=root,
+                default_out_root=state_dir,
+                gpu_process_detector=lambda: [],
+                autostart=False,
+            )
+            restored = restarted.get_job(job.job_id)
+
+        self.assertEqual(
+            binding,
+            snapshot["jobs"][0]["request"]["caller_binding"],
+        )
+        self.assertIsNotNone(restored)
+        self.assertEqual(binding, restored.request.caller_binding)
 
     def test_service_rejects_tampered_objective_sidecar_before_reporting(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -142,6 +185,263 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(running.status, "canceled")
         self.assertEqual(queued.status, "canceled")
         self.assertEqual(terminated, [(running.job_id, process)])
+
+    def test_cancel_still_terminates_when_history_persistence_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                autostart=False,
+            )
+            request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "quick", "device": "cpu"},
+                root=root,
+            )
+            job, _ = service.submit(request)
+            job.status = "running"
+            process = SimpleNamespace(pid=1234)
+            service._processes[job.job_id] = process
+
+            with (
+                patch(
+                    "zh_asr.service._write_json_atomic",
+                    side_effect=OSError("read-only state directory"),
+                ),
+                patch("zh_asr.service._terminate_job_process") as terminate,
+            ):
+                canceled = service.cancel(job.job_id)
+                health = service.health()
+
+        self.assertEqual("canceled", canceled.status)
+        terminate.assert_called_once_with(job, process)
+        self.assertEqual("degraded", health["persistence"]["status"])
+        self.assertFalse(health["persistence"]["ready"])
+        self.assertIn("memory-only", canceled.message)
+
+    def test_lease_loss_still_terminates_when_history_persistence_fails(self):
+        from zh_asr.gpu_broker import GpuBrokerLeaseLost
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                autostart=False,
+            )
+            request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "quick", "device": "cuda:0"},
+                root=root,
+            )
+            job, _ = service.submit(request)
+            job.status = "running"
+            process = SimpleNamespace(pid=1234)
+            service._processes[job.job_id] = process
+            error = GpuBrokerLeaseLost("lease expired")
+
+            with (
+                patch(
+                    "zh_asr.service._write_json_atomic",
+                    side_effect=OSError("read-only state directory"),
+                ),
+                patch("zh_asr.service._terminate_job_process") as terminate,
+            ):
+                service._terminate_job_after_lease_loss(job.job_id, error)
+                health = service.health()
+
+        terminate.assert_called_once_with(job, process)
+        self.assertEqual("lease expired", job.gpu_broker_loss_error)
+        self.assertIn("lease expired", job.message)
+        self.assertEqual("degraded", health["persistence"]["status"])
+
+    def test_run_next_job_marks_persistence_failure_and_rejects_new_work(self):
+        runner_calls = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_audio = _write_audio(root / "first.wav")
+            second_audio = _write_audio(root / "second.wav")
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                process_runner=lambda _job: runner_calls.append(True)
+                or ProcessResult(returncode=0),
+                autostart=False,
+            )
+            first_request = JobRequest.from_payload(
+                {"audio": str(first_audio), "mode": "quick", "device": "cpu"},
+                root=root,
+            )
+            second_request = JobRequest.from_payload(
+                {"audio": str(second_audio), "mode": "quick", "device": "cpu"},
+                root=root,
+            )
+            first, _ = service.submit(first_request)
+
+            with patch(
+                "zh_asr.service._write_json_atomic",
+                side_effect=OSError("read-only state directory"),
+            ):
+                self.assertTrue(service.run_next_job())
+                health = service.health()
+                with self.assertRaises(PersistenceNotReadyError):
+                    service.submit(second_request)
+
+        self.assertEqual([], runner_calls)
+        self.assertEqual("failed", first.status)
+        self.assertEqual("persistence_degraded", first.stage)
+        self.assertEqual("not_applicable", first.evidence_status)
+        self.assertEqual("degraded", health["persistence"]["status"])
+        self.assertIs(service.get_job(first.job_id), first)
+
+    def test_successful_command_is_not_reported_success_when_terminal_history_fails(self):
+        runner_calls = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                process_runner=lambda _job: runner_calls.append(True)
+                or ProcessResult(returncode=0),
+                autostart=False,
+            )
+            request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "quick", "device": "cpu"},
+                root=root,
+            )
+            job, _ = service.submit(request)
+
+            with patch(
+                "zh_asr.service._write_json_atomic",
+                side_effect=[None, OSError("read-only state directory")],
+            ):
+                self.assertTrue(service.run_next_job())
+
+        self.assertEqual([True], runner_calls)
+        self.assertEqual("failed", job.status)
+        self.assertEqual("persistence_degraded", job.stage)
+        self.assertIn("terminal job history is not durable", job.message)
+        self.assertIn("transcription output files may already exist", job.message)
+
+    def test_service_restart_resets_stop_event_and_runs_new_jobs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            service = TranscriptionService(
+                root=root,
+                default_out_root=root / "state",
+                gpu_process_detector=lambda: [],
+                process_runner=lambda _job: ProcessResult(returncode=0),
+                autostart=False,
+            )
+            service.start()
+            service.stop()
+            service.start()
+            try:
+                job, _ = service.submit(
+                    JobRequest.from_payload(
+                        {"audio": str(audio), "mode": "quick", "device": "cpu"},
+                        root=root,
+                    )
+                )
+                deadline = time.monotonic() + 2
+                while job.status not in TERMINAL_STATUSES and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            finally:
+                service.stop()
+
+        self.assertEqual("succeeded", job.status)
+
+    def test_service_persists_terminal_jobs_and_marks_interrupted_jobs_without_rerun(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_dir = root / "state"
+            completed_audio = _write_audio(root / "completed.wav")
+            queued_audio = _write_audio(root / "queued.wav")
+            service = TranscriptionService(
+                root=root,
+                default_out_root=state_dir,
+                gpu_process_detector=lambda: [],
+                process_runner=lambda _job: ProcessResult(returncode=0),
+                autostart=False,
+            )
+            completed_request = JobRequest.from_payload(
+                {"audio": str(completed_audio), "mode": "quick", "device": "cpu"},
+                root=root,
+            )
+            queued_request = JobRequest.from_payload(
+                {"audio": str(queued_audio), "mode": "quick", "device": "cpu"},
+                root=root,
+            )
+            completed, _ = service.submit(completed_request)
+            service.run_next_job()
+            queued, _ = service.submit(queued_request)
+            state_path = state_dir / "jobs.json"
+            self.assertTrue(state_path.is_file())
+            self.assertEqual("succeeded", completed.status)
+            self.assertEqual("queued", queued.status)
+
+            restarted = TranscriptionService(
+                root=root,
+                default_out_root=state_dir,
+                gpu_process_detector=lambda: [],
+                process_runner=lambda _job: (_ for _ in ()).throw(
+                    AssertionError("restarted service must not auto-rerun")
+                ),
+                autostart=False,
+            )
+            restored_completed = restarted.get_job(completed.job_id)
+            restored_queued = restarted.get_job(queued.job_id)
+            self.assertIsNotNone(restored_completed)
+            self.assertIsNotNone(restored_queued)
+            self.assertEqual("succeeded", restored_completed.status)
+            self.assertEqual("failed", restored_queued.status)
+            self.assertEqual("service_restarted", restored_queued.stage)
+            self.assertFalse(restarted.run_next_job())
+            replacement, deduplicated = restarted.submit(completed_request)
+            self.assertFalse(deduplicated)
+            self.assertNotEqual(completed.job_id, replacement.job_id)
+
+    def test_service_bounds_terminal_snapshot_without_deleting_old_outputs(self):
+        from zh_asr import service as service_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = TranscriptionService(
+                root=root,
+                default_out_root=root / "state",
+                gpu_process_detector=lambda: [],
+                process_runner=lambda _job: ProcessResult(returncode=0),
+                autostart=False,
+            )
+            first_audio = _write_audio(root / "first.wav")
+            second_audio = _write_audio(root / "second.wav")
+            first, _ = service.submit(
+                JobRequest.from_payload(
+                    {"audio": str(first_audio), "mode": "quick", "device": "cpu"},
+                    root=root,
+                )
+            )
+            service.run_next_job()
+            first.out_dir.mkdir(parents=True, exist_ok=True)
+            marker = first.out_dir / "keep.marker"
+            marker.write_text("outputs remain", encoding="utf-8")
+            second, _ = service.submit(
+                JobRequest.from_payload(
+                    {"audio": str(second_audio), "mode": "quick", "device": "cpu"},
+                    root=root,
+                )
+            )
+            service.run_next_job()
+
+            with patch.object(service_module, "MAX_PERSISTED_TERMINAL_JOBS", 1):
+                service._persist_jobs_locked()
+            state = json.loads((root / "state" / "jobs.json").read_text(encoding="utf-8"))
+            self.assertTrue(marker.is_file())
+
+        self.assertEqual([second.job_id], [item["job_id"] for item in state["jobs"]])
 
     def test_submit_deduplicates_identical_queued_jobs(self):
         with tempfile.TemporaryDirectory() as temp_dir:

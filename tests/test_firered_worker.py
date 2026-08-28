@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -238,7 +239,10 @@ class FireRedAdapterTests(unittest.TestCase):
         self.assertEqual(get_adapter("firered-worker").name, "firered-worker")
 
     def test_worker_invocation_uses_json_protocol_and_normalizes_text(self):
-        from zh_asr.adapters.firered_worker import FireRedWorkerAdapter
+        from zh_asr.adapters.firered_worker import (
+            FireRedWorkerAdapter,
+            FireRedWorkerTimeout,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -400,6 +404,43 @@ class FireRedAdapterTests(unittest.TestCase):
             with patch("zh_asr.adapters.firered_worker.subprocess.run", return_value=failed):
                 with self.assertRaisesRegex(FireRedWorkerError, "exit code 3.*CUDA out of memory"):
                     wrapper.generate(input=str(audio))
+
+    def test_wsl_timeout_cleans_token_bound_descendants(self):
+        from zh_asr.adapters.firered_worker import FireRedWorkerAdapter, FireRedWorkerTimeout
+        from zh_asr.process_control import PROCESS_TOKEN_ENV
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "model"
+            model_dir.mkdir()
+            audio = root / "sample.wav"
+            _write_wav(audio)
+            spec = _engine_spec(
+                model_dir,
+                worker_command=["wsl.exe", "-d", "Ubuntu-22.04", "--", "python3"],
+                path_style="wsl",
+                timeout_sec=7,
+            )
+            wrapper = FireRedWorkerAdapter().build_model(
+                spec,
+                "cuda:0",
+                root / "cache",
+                {},
+            )
+            with (
+                patch.dict(os.environ, {PROCESS_TOKEN_ENV: "chineseasr-timeout-test"}),
+                patch(
+                    "zh_asr.adapters.firered_worker.subprocess.run",
+                    side_effect=subprocess.TimeoutExpired(cmd=["wsl.exe"], timeout=7),
+                ),
+                patch(
+                    "zh_asr.adapters.firered_worker.terminate_wsl_processes"
+                ) as cleanup,
+            ):
+                with self.assertRaisesRegex(FireRedWorkerTimeout, "7.*sample.wav"):
+                    wrapper.generate(input=str(audio))
+
+        cleanup.assert_called_once_with(("Ubuntu-22.04",), "chineseasr-timeout-test")
 
     def test_generate_many_uses_one_worker_process_for_multiple_batch_one_inputs(self):
         from zh_asr.adapters.firered_worker import FireRedWorkerAdapter

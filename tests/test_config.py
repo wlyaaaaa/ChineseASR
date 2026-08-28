@@ -32,7 +32,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(spec.role, "gpu_flagship")
         self.assertEqual(spec.model, "FunAudioLLM/Fun-ASR-Nano-2512")
         self.assertEqual(spec.vad_model, "fsmn-vad")
-        self.assertEqual(spec.language, "Chinese")
+        self.assertEqual(spec.language, "中文")
         self.assertTrue(spec.options["requires_gpu"])
         self.assertEqual(spec.options["runtime"], "funasr-automodel")
         self.assertEqual(spec.options["model_revision"], "05201c46f1c38592b1567f857c0d56eab3d0d8ef")
@@ -91,10 +91,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.speaker_verification.threshold, 0.31)
         self.assertIsNone(config.engines["sensevoice"].spk_model)
 
-    def test_core_requirements_pin_funasr_142(self):
+    def test_core_requirements_pin_funasr_145(self):
         requirements = (PROJECT_ROOT / "requirements-core.txt").read_text(encoding="utf-8").splitlines()
 
-        self.assertIn("funasr==1.4.2", requirements)
+        self.assertIn("funasr==1.4.5", requirements)
         self.assertTrue(any(line.startswith("more-itertools>=") for line in requirements))
         self.assertTrue(any(line.startswith("rapidfuzz>=") for line in requirements))
         self.assertTrue(any(line.startswith("websockets>=") for line in requirements))

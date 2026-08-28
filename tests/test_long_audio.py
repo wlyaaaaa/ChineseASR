@@ -32,6 +32,37 @@ class LongAudioTests(unittest.TestCase):
         self.assertEqual(2, first["file_count"])
         self.assertNotEqual(first["sha256"], second["sha256"])
 
+    def test_run_fingerprint_changes_when_runtime_version_changes(self):
+        from zh_asr.long_audio import _run_fingerprint
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "sample.wav"
+            audio.write_bytes(b"audio")
+            first = _run_fingerprint(
+                audio,
+                {"runtime_versions": {"funasr": "1.4.2"}},
+            )
+            second = _run_fingerprint(
+                audio,
+                {"runtime_versions": {"funasr": "1.4.5"}},
+            )
+
+        self.assertNotEqual(first, second)
+
+    def test_manifest_writes_are_atomic_and_corrupt_state_is_a_cache_miss(self):
+        from zh_asr.long_audio import _load_manifest, _write_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+            _write_manifest(path, {"schema_version": 2, "chunks": []})
+            self.assertEqual(
+                {"schema_version": 2, "chunks": []},
+                json.loads(path.read_text(encoding="utf-8")),
+            )
+            self.assertEqual([], list(path.parent.glob("*.tmp")))
+            path.write_text("{", encoding="utf-8")
+            self.assertIsNone(_load_manifest(path))
+
     def test_runtime_artifact_identity_uses_qwen_fail_closed_verifier(self):
         from zh_asr.long_audio import _runtime_artifact_identity
 

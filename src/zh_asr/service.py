@@ -38,6 +38,9 @@ from .process_control import (
 
 
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "blocked"}
+JOB_STATE_SCHEMA = "zh_asr.jobs.v1"
+JOB_STATE_FILENAME = "jobs.json"
+MAX_PERSISTED_TERMINAL_JOBS = 200
 OBSERVER_LIST_SCHEMA = "local-ai-observer.jobs.v1"
 OBSERVER_JOB_SCHEMA = "local-ai-observer.job.v1"
 OBSERVER_SERVICE = "chinese-asr"
@@ -57,6 +60,8 @@ OBSERVER_STAGES = {
     "failed",
     "gpu_broker_conflict",
     "gpu_broker_lost",
+    "persistence_degraded",
+    "service_restarted",
     "canceled",
 }
 
@@ -84,6 +89,14 @@ class ProcessResult:
 
 class ProcessExecutionTimeout(TimeoutError):
     """The service command exceeded its finite total deadline."""
+
+
+class PersistenceNotReadyError(RuntimeError):
+    """The service cannot accept new work without durable job history."""
+
+    def __init__(self, message: str, *, job_id: str | None = None) -> None:
+        super().__init__(message)
+        self.job_id = job_id
 
 
 CALLER_BINDING_ENV = "ZH_ASR_CALLER_BINDING_JSON"
@@ -293,6 +306,7 @@ class TranscriptionService:
         current_process_ids: CurrentProcessIds = None,
         process_runner: ProcessRunner = None,
         gpu_lease_factory: GpuLeaseFactory = None,
+        job_state_path: Path | None = None,
         autostart: bool = True,
     ) -> None:
         self.root = root.resolve()
@@ -317,14 +331,289 @@ class TranscriptionService:
         self._processes: dict[str, subprocess.Popen] = {}
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
+        self._persistence_status = "ready"
+        self._persistence_error = ""
+        self._persistence_failed_at: float | None = None
+        self._job_state_path = (
+            Path(job_state_path).expanduser().resolve()
+            if job_state_path is not None
+            else self.default_out_root / JOB_STATE_FILENAME
+        )
+        self._load_persisted_jobs()
         if autostart:
             self.start()
 
     def start(self) -> None:
-        if self._worker and self._worker.is_alive():
+        with self._lock:
+            if self._worker and self._worker.is_alive():
+                return
+            # ``stop`` is a lifecycle boundary, not a permanent poison pill.
+            # Clearing the event here makes an explicitly restarted service
+            # able to consume newly submitted jobs without creating another
+            # queue or an automatic retry path.
+            self._stop_event.clear()
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="zh-asr-worker",
+                daemon=True,
+            )
+            self._worker.start()
+
+    def _load_persisted_jobs(self) -> None:
+        """Restore queryable job history without restoring executable work.
+
+        The API queue remains deliberately in-memory.  A queued/running record
+        left by a previous service process is converted to a terminal failure
+        so callers can inspect the interruption and a restart never reruns work
+        implicitly.
+        """
+
+        try:
+            payload = json.loads(self._job_state_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
             return
-        self._worker = threading.Thread(target=self._worker_loop, name="zh-asr-worker", daemon=True)
-        self._worker.start()
+        if not isinstance(payload, dict) or payload.get("schema") != JOB_STATE_SCHEMA:
+            return
+        records = payload.get("jobs")
+        if not isinstance(records, list):
+            return
+
+        changed = False
+        for record in records:
+            try:
+                job = self._restore_job(record)
+            except (TypeError, ValueError, KeyError, OSError):
+                continue
+            if job is None:
+                continue
+            if job.status not in TERMINAL_STATUSES:
+                now = time.time()
+                job.status = "failed"
+                _mark_job_evidence_unavailable(
+                    job,
+                    "Service restarted before this job completed; automatic rerun is disabled.",
+                )
+                job.stage = "service_restarted"
+                job.message = (
+                    "Service restarted before this job completed; "
+                    "automatic rerun is disabled."
+                )
+                job.finished_at = now
+                job.updated_at = now
+                job.process_id = None
+                changed = True
+            self._jobs[job.job_id] = job
+
+        if changed:
+            self._persist_jobs_locked()
+
+    def _restore_job(self, record: object) -> Job | None:
+        if not isinstance(record, dict):
+            return None
+        request_data = record.get("request")
+        if not isinstance(request_data, dict):
+            return None
+        audio_value = request_data.get("audio")
+        if audio_value is None:
+            return None
+        mode = str(request_data.get("mode") or "").strip().lower()
+        if mode not in {"strict", "quick", "long-strict"}:
+            return None
+
+        cache_value = request_data.get("cache_dir")
+        caller_value = request_data.get("caller_binding")
+        caller_binding = (
+            dict(caller_value) if isinstance(caller_value, Mapping) else None
+        )
+        raw_wsl = request_data.get("wsl_distributions")
+        wsl_distributions = (
+            tuple(str(value) for value in raw_wsl if str(value).strip())
+            if isinstance(raw_wsl, (list, tuple))
+            else ()
+        )
+        request = JobRequest(
+            audio=Path(str(audio_value)).expanduser().resolve(),
+            mode=mode,
+            engine=_optional_str(request_data.get("engine")),
+            primary_engine=_optional_str(request_data.get("primary_engine")),
+            secondary_engine=_optional_str(request_data.get("secondary_engine")),
+            device=str(request_data.get("device") or "cuda:0"),
+            out_root=Path(
+                str(request_data.get("out_root") or self.default_out_root)
+            ).expanduser().resolve(),
+            cache_dir=(
+                Path(str(cache_value)).expanduser().resolve()
+                if cache_value
+                else None
+            ),
+            chunk_sec=int(request_data.get("chunk_sec", 300)),
+            overlap_sec=int(request_data.get("overlap_sec", 1)),
+            force=bool(request_data.get("force", False)),
+            allow_gpu_conflicts=bool(request_data.get("allow_gpu_conflicts", False)),
+            timeout_sec=_positive_timeout(request_data.get("timeout_sec", DEFAULT_PROCESS_TIMEOUT_SEC)),
+            resolved_engine=_optional_str(request_data.get("resolved_engine")),
+            resolved_primary_engine=_optional_str(
+                request_data.get("resolved_primary_engine")
+            ),
+            resolved_secondary_engine=_optional_str(
+                request_data.get("resolved_secondary_engine")
+            ),
+            model_config_sha256=str(request_data.get("model_config_sha256") or ""),
+            audio_sha256=str(request_data.get("audio_sha256") or ""),
+            wsl_distributions=wsl_distributions,
+            caller_binding=caller_binding,
+        )
+        raw_out_dir = record.get("out_dir")
+        out_dir = (
+            Path(str(raw_out_dir)).expanduser()
+            if raw_out_dir is not None and str(raw_out_dir).strip()
+            else request.out_root
+        )
+        command_value = record.get("command")
+        command = (
+            [str(value) for value in command_value]
+            if isinstance(command_value, list)
+            else self._build_command(request, out_dir)
+        )
+        job_id = str(record.get("job_id") or "").strip()
+        if not job_id:
+            return None
+
+        conflicts: list[GpuProcess] = []
+        raw_conflicts = record.get("conflicts")
+        if isinstance(raw_conflicts, list):
+            for value in raw_conflicts:
+                if not isinstance(value, dict):
+                    continue
+                try:
+                    conflicts.append(
+                        GpuProcess(
+                            pid=int(value.get("pid")),
+                            process_name=str(value.get("process_name") or "unknown"),
+                            used_memory_mib=int(value.get("used_memory_mib", 0)),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+        def optional_float(value: object) -> float | None:
+            if value is None:
+                return None
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if math.isfinite(parsed) else None
+
+        return Job(
+            job_id=job_id,
+            request=request,
+            out_dir=out_dir.resolve(),
+            command=command,
+            status=str(record.get("status") or "failed"),
+            stage=str(record.get("stage") or "failed"),
+            message=str(record.get("message") or ""),
+            created_at=optional_float(record.get("created_at")) or time.time(),
+            updated_at=optional_float(record.get("updated_at")) or time.time(),
+            started_at=optional_float(record.get("started_at")),
+            finished_at=optional_float(record.get("finished_at")),
+            returncode=(
+                int(record["returncode"])
+                if record.get("returncode") is not None
+                else None
+            ),
+            process_id=None,
+            stdout_tail=str(record.get("stdout_tail") or ""),
+            stderr_tail=str(record.get("stderr_tail") or ""),
+            outputs={
+                str(key): str(value)
+                for key, value in (record.get("outputs") or {}).items()
+            }
+            if isinstance(record.get("outputs"), dict)
+            else {},
+            evidence_status=str(record.get("evidence_status") or "pending"),
+            evidence_failures=_coerce_failure_list(record.get("evidence_failures")),
+            objective_outcome=str(record.get("objective_outcome") or "indeterminate"),
+            objective_execution_status=str(
+                record.get("objective_execution_status") or "pending"
+            ),
+            conflicts=conflicts,
+        )
+
+    def _persist_jobs_locked(self) -> bool:
+        terminal = sorted(
+            (
+                job
+                for job in self._jobs.values()
+                if job.status in TERMINAL_STATUSES
+            ),
+            key=lambda job: (job.updated_at, job.created_at),
+            reverse=True,
+        )
+        keep_ids = {
+            job.job_id
+            for job in self._jobs.values()
+            if job.status not in TERMINAL_STATUSES
+        }
+        keep_ids.update(
+            job.job_id for job in terminal[:MAX_PERSISTED_TERMINAL_JOBS]
+        )
+        try:
+            payload = {
+                "schema": JOB_STATE_SCHEMA,
+                "version": 1,
+                "updated_at": time.time(),
+                "jobs": [
+                    job.to_dict()
+                    for job in self._jobs.values()
+                    if job.job_id in keep_ids
+                ],
+            }
+            _write_json_atomic(self._job_state_path, payload)
+        except Exception as exc:
+            # Job history is useful but must never prevent process cleanup or
+            # terminate the worker thread. Keep every in-memory job when the
+            # replacement did not make it to disk; callers can still query the
+            # real job/id/terminal state in this service process.
+            self._persistence_status = "degraded"
+            self._persistence_error = f"{type(exc).__name__}: {exc}"
+            self._persistence_failed_at = time.time()
+            return False
+
+        # Only trim the in-memory history after the replacement succeeded.
+        # A failed write must not make old terminal jobs disappear from the
+        # live query surface.
+        for job_id in tuple(self._jobs):
+            if job_id in keep_ids:
+                continue
+            self._jobs.pop(job_id, None)
+            for fingerprint, mapped_id in tuple(self._fingerprints.items()):
+                if mapped_id == job_id:
+                    self._fingerprints.pop(fingerprint, None)
+        self._persistence_status = "ready"
+        self._persistence_error = ""
+        self._persistence_failed_at = None
+        return True
+
+    def _persistence_message_locked(self) -> str:
+        detail = self._persistence_error or "job history could not be written"
+        return f"Job history persistence is not ready ({detail})."
+
+    def _mark_job_persistence_degraded_locked(
+        self,
+        job: Job,
+        message: str,
+    ) -> None:
+        now = time.time()
+        job.status = "failed"
+        job.stage = "persistence_degraded"
+        job.message = f"{message} {self._persistence_message_locked()}"
+        job.finished_at = now
+        job.updated_at = now
+
+    def _append_persistence_warning_locked(self, job: Job, message: str) -> None:
+        warning = self._persistence_message_locked()
+        job.message = f"{message} {warning}"
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -351,6 +640,9 @@ class TranscriptionService:
                 if existing and existing.status in {"queued", "running", "succeeded"}:
                     return existing, True
 
+            if self._persistence_status != "ready":
+                raise PersistenceNotReadyError(self._persistence_message_locked())
+
             broker_will_serialize = (
                 self._gpu_broker_managed
                 and request.device.lower().startswith(("cuda", "gpu"))
@@ -372,7 +664,20 @@ class TranscriptionService:
                 job.message = _format_conflict_message(conflicts)
                 job.finished_at = time.time()
                 job.updated_at = job.finished_at
-            else:
+            if not self._persist_jobs_locked():
+                _mark_job_evidence_unavailable(
+                    job,
+                    "Job was not queued because durable job history is unavailable.",
+                )
+                self._mark_job_persistence_degraded_locked(
+                    job,
+                    "Job was not queued because durable job history is unavailable.",
+                )
+                raise PersistenceNotReadyError(
+                    job.message,
+                    job_id=job.job_id,
+                )
+            if not conflicts:
                 self._queue.put(job.job_id)
             return job, False
 
@@ -438,6 +743,11 @@ class TranscriptionService:
             job.finished_at = time.time()
             job.updated_at = job.finished_at
             process = self._processes.get(job_id)
+            if not self._persist_jobs_locked():
+                self._append_persistence_warning_locked(
+                    job,
+                    "Canceled by request; terminal state is currently memory-only.",
+                )
         if process:
             _terminate_job_process(job, process)
         return job
@@ -446,6 +756,12 @@ class TranscriptionService:
         with self._lock:
             queued = sum(1 for job in self._jobs.values() if job.status == "queued")
             active_job = self._jobs.get(self._active_job_id or "")
+            persistence = {
+                "status": self._persistence_status,
+                "ready": self._persistence_status == "ready",
+                "error": self._persistence_error or None,
+                "failed_at": self._persistence_failed_at,
+            }
         conflicts = self._foreign_gpu_processes()
         return {
             "status": "ok",
@@ -453,6 +769,7 @@ class TranscriptionService:
             "active_job_status": active_job.status if active_job else None,
             "queue_length": queued,
             "gpu_conflicts": [conflict.to_dict() for conflict in conflicts],
+            "persistence": persistence,
         }
 
     def run_next_job(self) -> bool:
@@ -478,20 +795,30 @@ class TranscriptionService:
                 self._queue.task_done()
 
     def _process_job(self, job_id: str) -> None:
-        with self._lock:
-            job = self._jobs[job_id]
-            if job.status == "canceled":
-                return
-            job.status = "running"
-            if job.request.mode != "quick":
-                job.evidence_status = "pending"
-                job.evidence_failures = []
-            job.stage = "running_command"
-            job.started_at = time.time()
-            job.updated_at = job.started_at
-            self._active_job_id = job_id
-
         try:
+            with self._lock:
+                job = self._jobs[job_id]
+                if job.status == "canceled":
+                    return
+                job.status = "running"
+                if job.request.mode != "quick":
+                    job.evidence_status = "pending"
+                    job.evidence_failures = []
+                job.stage = "running_command"
+                job.started_at = time.time()
+                job.updated_at = job.started_at
+                self._active_job_id = job_id
+                if not self._persist_jobs_locked():
+                    _mark_job_evidence_unavailable(
+                        job,
+                        "Job was not started because durable job history is unavailable.",
+                    )
+                    self._mark_job_persistence_degraded_locked(
+                        job,
+                        "Job was not started because durable job history is unavailable.",
+                    )
+                    return
+
             use_gpu_broker = (
                 self._gpu_broker_managed
                 and job.request.device.lower().startswith(("cuda", "gpu"))
@@ -544,6 +871,11 @@ class TranscriptionService:
                 job.message = "Completed." if result.returncode == 0 else "Transcription command failed."
                 job.finished_at = time.time()
                 job.updated_at = job.finished_at
+                if not self._persist_jobs_locked() and result.returncode == 0:
+                    self._mark_job_persistence_degraded_locked(
+                        job,
+                        "Transcription completed, but terminal job history is not durable; transcription output files may already exist.",
+                    )
         except GpuBrokerConflict as exc:
             with self._lock:
                 if job.status != "canceled":
@@ -553,6 +885,7 @@ class TranscriptionService:
                     job.message = str(exc)
                     job.finished_at = time.time()
                     job.updated_at = job.finished_at
+                    self._persist_jobs_locked()
         except GpuBrokerLeaseLost as exc:
             with self._lock:
                 if job.status != "canceled":
@@ -562,6 +895,7 @@ class TranscriptionService:
                     job.message = str(exc)
                     job.finished_at = time.time()
                     job.updated_at = job.finished_at
+                    self._persist_jobs_locked()
         except Exception as exc:
             with self._lock:
                 if job.status != "canceled":
@@ -574,6 +908,7 @@ class TranscriptionService:
                     job.message = f"{type(exc).__name__}: {exc}"
                     job.finished_at = time.time()
                     job.updated_at = job.finished_at
+                    self._persist_jobs_locked()
         finally:
             with self._lock:
                 self._processes.pop(job_id, None)
@@ -593,6 +928,8 @@ class TranscriptionService:
             job.gpu_broker_loss_error = str(error)
             job.message = str(error)
             job.updated_at = time.time()
+            if not self._persist_jobs_locked():
+                self._append_persistence_warning_locked(job, str(error))
         if process is not None:
             _terminate_job_process(job, process)
 
@@ -1088,6 +1425,24 @@ def _coerce_failure_list(value) -> list[dict[str, str]]:
     return failures
 
 
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    """Write one JSON document by replacement, never by partial overwrite."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(dict(payload), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _strict_engine_names(primary_engine: str | None, secondary_engine: str | None) -> tuple[str | None, str | None]:
     if primary_engine and secondary_engine:
         return primary_engine, secondary_engine
@@ -1467,6 +1822,14 @@ def create_handler(service: TranscriptionService) -> type[BaseHTTPRequestHandler
                     self._send_json(200, {"job": job.to_dict()})
                     return
                 self._send_json(404, {"error": f"Unknown endpoint: {path}"})
+            except PersistenceNotReadyError as exc:
+                payload = {
+                    "error": str(exc),
+                    "persistence_status": "degraded",
+                }
+                if exc.job_id:
+                    payload["job_id"] = exc.job_id
+                self._send_json(503, payload)
             except (FileNotFoundError, ValueError) as exc:
                 self._send_json(400, {"error": str(exc)})
             except KeyError as exc:

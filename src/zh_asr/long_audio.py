@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata as importlib_metadata
 import json
+import os
 import re
+import uuid
 import wave
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -204,6 +207,10 @@ def run_long_transcription(
         "model_config_sha256": sha256_file(model_config.path) if model_config.path.exists() else "",
         "device": device,
         "cache_dir": str(resolved_cache_dir),
+        "runtime_versions": _runtime_versions(
+            model_config,
+            (resolved_primary_engine, resolved_secondary_engine),
+        ),
         "runtime_artifact_identity": runtime_artifact_identity,
         "runtime_code_identity": _runtime_code_identity(),
         "recommended_chunk_sec": recommended_chunk_sec,
@@ -551,6 +558,11 @@ def _runtime_artifact_identity(
                 "engine": engine_name,
                 "adapter": str(getattr(spec, "adapter", "") or ""),
                 "model": str(getattr(spec, "model", "") or ""),
+                "runtime_version": (
+                    _installed_package_version("funasr")
+                    if str(getattr(spec, "adapter", "") or "") == "funasr"
+                    else ""
+                ),
                 "model_revision": str(options.get("model_revision") or ""),
                 "source_revision": str(options.get("source_revision") or ""),
                 "model_receipt_path": str(receipt_path) if receipt_path else "",
@@ -567,6 +579,30 @@ def _runtime_artifact_identity(
             }
         )
     return identities
+
+
+def _runtime_versions(model_config, engine_names: tuple[str, ...]) -> dict[str, str]:
+    """Bind cache identity to installed runtimes used by this run."""
+
+    packages = {"modelscope", "torch", "torchaudio"}
+    for engine_name in engine_names:
+        spec = model_config.engines.get(engine_name)
+        adapter = str(getattr(spec, "adapter", "") or "")
+        if adapter == "funasr":
+            packages.add("funasr")
+        elif adapter == "qwen-asr":
+            packages.add("qwen-asr")
+    return {
+        package: _installed_package_version(package)
+        for package in sorted(packages)
+    }
+
+
+def _installed_package_version(package: str) -> str:
+    try:
+        return importlib_metadata.version(package)
+    except importlib_metadata.PackageNotFoundError:
+        return "unavailable"
 
 
 def _runtime_code_identity(root: Path | None = None) -> dict[str, Any]:
@@ -638,7 +674,13 @@ def _run_fingerprint(audio_path: Path, run_identity: dict[str, Any]) -> str:
 def _load_manifest(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        # A torn/legacy manifest is a cache miss.  The explicit caller may
+        # safely rebuild it; never treat a partial document as resumable state.
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _build_states(
@@ -852,7 +894,23 @@ def _new_manifest(
 
 
 def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(path, manifest)
+
+
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(dict(payload), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _can_skip(

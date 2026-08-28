@@ -85,7 +85,7 @@ engines:
     role: gpu_flagship
     model: FunAudioLLM/Fun-ASR-Nano-2512
     vad_model: fsmn-vad
-    language: Chinese
+    language: 中文
     options:
       requires_gpu: true
       runtime: funasr-automodel

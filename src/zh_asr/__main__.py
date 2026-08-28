@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from .batch import run_batch
@@ -22,7 +23,12 @@ from .gpu_broker import (
 )
 from .long_audio import run_long_transcription
 from .pipeline import MissingDependencyError, build_model, default_cache_dir, project_root, strict_transcribe_audio, transcribe_audio
-from .process_control import managed_popen_kwargs, terminate_process_tree
+from .process_control import (
+    managed_popen_kwargs,
+    tagged_process_env,
+    terminate_process_tree,
+    terminate_wsl_processes,
+)
 from .proxy_guard import PROXY_ENV_NAMES, sanitize_current_process_env
 from .result_writer import canonical_json_sha256, file_sha256
 from .speaker_attribution import write_speaker_attribution
@@ -591,16 +597,21 @@ def _command_requires_gpu_supervision(args: argparse.Namespace) -> bool:
 def _supervise_gpu_cli(argv: list[str]) -> int:
     """Run one public GPU CLI invocation in a killable supervised worker."""
     process_holder: dict[str, subprocess.Popen] = {}
+    process_token = f"chineseasr-cli-{uuid.uuid4().hex}"
+    wsl_distributions = _cli_wsl_distributions(argv)
 
     def terminate_on_loss(_error) -> None:
         process = process_holder.get("process")
         if process is not None:
             terminate_process_tree(process)
+        # ``wsl.exe`` is only the Windows-side launcher.  A Linux worker can
+        # outlive it, so also signal descendants carrying this exact token.
+        terminate_wsl_processes(wsl_distributions, process_token)
 
     lease = GpuBrokerLease("chineseasr-cli")
     lease.set_on_lost(terminate_on_loss)
     with lease:
-        env = os.environ.copy()
+        env = tagged_process_env(process_token)
         env.pop("ZH_ASR_GPU_BROKER_LEASE_HELD", None)
         env[GPU_BROKER_CHILD_TOKEN_ENV] = lease.token
         process = subprocess.Popen(
@@ -618,6 +629,59 @@ def _supervise_gpu_cli(argv: list[str]) -> int:
         finally:
             if process.poll() is None:
                 terminate_process_tree(process)
+            terminate_wsl_processes(wsl_distributions, process_token)
+
+
+def _cli_wsl_distributions(argv: list[str]) -> tuple[str, ...]:
+    """Resolve WSL distributions for a supervised CLI invocation."""
+
+    try:
+        config = load_model_config()
+    except Exception:
+        return ()
+    command = argv[0] if argv else ""
+
+    def option(name: str) -> str | None:
+        try:
+            index = argv.index(name)
+        except ValueError:
+            return None
+        if index + 1 >= len(argv):
+            return None
+        value = str(argv[index + 1]).strip()
+        return value or None
+
+    selected: list[str] = []
+    if command in {"strict", "long", "eval", "benchmark"}:
+        selected.extend(
+            [
+                option("--primary-engine") or config.strict_primary_engine,
+                option("--secondary-engine") or config.strict_secondary_engine,
+            ]
+        )
+    elif command == "batch":
+        if (option("--mode") or "strict").lower() == "quick":
+            selected.append(option("--engine") or config.default_engine)
+        else:
+            selected.extend(
+                [
+                    option("--primary-engine") or config.strict_primary_engine,
+                    option("--secondary-engine") or config.strict_secondary_engine,
+                ]
+            )
+    elif command in {"transcribe", "warmup"}:
+        selected.append(option("--engine") or config.default_engine)
+
+    distributions: list[str] = []
+    for engine_name in selected:
+        spec = config.engines.get(engine_name)
+        options = getattr(spec, "options", None) or {}
+        if str(options.get("runtime", "")).strip().lower() != "wsl":
+            continue
+        distribution = str(options.get("wsl_distribution", "Ubuntu")).strip()
+        if distribution and distribution not in distributions:
+            distributions.append(distribution)
+    return tuple(distributions)
 
 
 def _doctor(model_config) -> int:

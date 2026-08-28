@@ -186,9 +186,43 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(
             model.calls[0],
-            {"input": "not-read.wav", "batch_size_s": 300, "preset_spk_num": 2},
+            {
+                "input": "not-read.wav",
+                "batch_size_s": 300,
+                "language": "zh",
+                "preset_spk_num": 2,
+            },
         )
-        self.assertEqual(model.calls[1], {"input": "not-read.wav", "batch_size_s": 300})
+        self.assertEqual(
+            model.calls[1],
+            {"input": "not-read.wav", "batch_size_s": 300, "language": "zh"},
+        )
+
+    def test_fun_asr_nano_forwards_explicit_chinese_language_hint(self):
+        from zh_asr.config import load_model_config
+        from zh_asr.pipeline import _generate_once_with_identity
+
+        class DummyModel:
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, **kwargs):
+                self.calls.append(kwargs)
+                return [{"text": "测试"}]
+
+        model = DummyModel()
+        with patch("zh_asr.pipeline.build_model", return_value=model), patch(
+            "zh_asr.pipeline._empty_cuda_cache"
+        ):
+            _generate_once_with_identity(
+                Path("not-read.wav"),
+                "fun-asr-nano",
+                "cpu",
+                None,
+                load_model_config(),
+            )
+
+        self.assertEqual(model.calls[0]["language"], "中文")
 
     def test_preset_speaker_count_is_rejected_for_non_paraformer_before_audio_read(self):
         from zh_asr.pipeline import _validate_preset_speaker_count
