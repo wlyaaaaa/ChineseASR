@@ -47,6 +47,8 @@ function Write-BoundedReceipt {
         cloud_upload_performed = $false
         plaintext_returned = $false
         secret_returned = $false
+        cloud_retry_policy = 'do_not_retry'
+        local_fallback_recommendation = 'none'
     }
     if ($Json) {
         $receipt | ConvertTo-Json -Depth 8 -Compress | Write-Output
@@ -55,6 +57,47 @@ function Write-BoundedReceipt {
         $receipt
     }
     exit $ExitCode
+}
+
+function Get-SafeBrokerErrorCode {
+    param([AllowEmptyString()][string] $Raw)
+    if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
+    try { $value = $Raw | ConvertFrom-Json -Depth 20 }
+    catch { return $null }
+    if (
+        [string]$value.schema -cne 'pcconfig.secret-broker-result.v1' -or
+        [string]$value.status -cne 'error'
+    ) { return $null }
+    $code = [string]$value.error
+    if ($code -cmatch '^[a-z][a-z0-9_:-]{0,95}$') { return $code }
+    return $null
+}
+
+function Get-CloudFailureAdvice {
+    param(
+        [AllowEmptyString()][string] $Status,
+        [AllowEmptyString()][string] $ErrorCode,
+        [AllowEmptyString()][string] $CredentialResult
+    )
+    if ($Status -ceq 'succeeded') {
+        return [ordered]@{ cloud_retry_policy = 'not_needed'; local_fallback_recommendation = 'none' }
+    }
+    if ($ErrorCode -ceq 'runtime_rebind_required') {
+        return [ordered]@{
+            cloud_retry_policy = 'retry_once_after_runtime_rebind'
+            local_fallback_recommendation = 'use_asr_smart_local_until_rebound'
+        }
+    }
+    if ($CredentialResult -cin @('Timeout', 'Rate-Limited', 'Provider-5xx', 'Network-Failure')) {
+        return [ordered]@{
+            cloud_retry_policy = 'retry_cloud_once_if_still_authorized'
+            local_fallback_recommendation = 'use_asr_smart_local'
+        }
+    }
+    return [ordered]@{
+        cloud_retry_policy = 'do_not_retry_cloud'
+        local_fallback_recommendation = 'use_asr_smart_local'
+    }
 }
 
 if (-not $Important) {
@@ -125,21 +168,29 @@ finally {
 }
 
 if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+    $brokerErrorCode = Get-SafeBrokerErrorCode -Raw $brokerOutput
+    $errorCode = if ($brokerErrorCode) {
+        $brokerErrorCode
+    }
+    elseif ($brokerExitCode -eq 0) {
+        'cloud_worker_result_missing'
+    }
+    else {
+        'secret_broker_target_failed'
+    }
+    $advice = Get-CloudFailureAdvice -Status 'failed' -ErrorCode $errorCode -CredentialResult ''
     $receipt = [ordered]@{
         schema = 'chineseasr.qwen-audio3-important-result.v1'
         job_id = $jobId
         status = 'failed'
-        error_code = if ($brokerExitCode -eq 0) {
-            'cloud_worker_result_missing'
-        }
-        else {
-            'secret_broker_target_failed'
-        }
+        error_code = $errorCode
         important_only = $true
         cloud_upload_performed = $false
         broker_exit_code = $brokerExitCode
         plaintext_returned = $false
         secret_returned = $false
+        cloud_retry_policy = $advice.cloud_retry_policy
+        local_fallback_recommendation = $advice.local_fallback_recommendation
     }
     if ($Json) {
         $receipt | ConvertTo-Json -Depth 8 -Compress | Write-Output
@@ -203,6 +254,18 @@ $result | Add-Member `
     -Force
 $result | Add-Member -NotePropertyName plaintext_returned -NotePropertyValue $false -Force
 $result | Add-Member -NotePropertyName secret_returned -NotePropertyValue $false -Force
+$advice = Get-CloudFailureAdvice `
+    -Status ([string]$result.status) `
+    -ErrorCode ([string]$result.error_code) `
+    -CredentialResult ([string]$result.credential_result)
+$result | Add-Member `
+    -NotePropertyName cloud_retry_policy `
+    -NotePropertyValue $advice.cloud_retry_policy `
+    -Force
+$result | Add-Member `
+    -NotePropertyName local_fallback_recommendation `
+    -NotePropertyValue $advice.local_fallback_recommendation `
+    -Force
 if ($Json) {
     $result | ConvertTo-Json -Depth 30 -Compress | Write-Output
 }

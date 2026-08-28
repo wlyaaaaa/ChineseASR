@@ -21,6 +21,15 @@ def _write_wav(path: Path) -> None:
 
 
 class ProfessionalCloudScriptTests(unittest.TestCase):
+    def test_cloud_failure_contract_is_bounded_and_recommends_local_smart(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("Get-SafeBrokerErrorCode", source)
+        self.assertIn("runtime_rebind_required", source)
+        self.assertIn("retry_once_after_runtime_rebind", source)
+        self.assertIn("retry_cloud_once_if_still_authorized", source)
+        self.assertIn("use_asr_smart_local", source)
+        self.assertNotIn("Start-Sleep", source)
+
     def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
@@ -51,6 +60,8 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
             self.assertEqual("blocked", payload["status"])
             self.assertEqual("importance_required", payload["error_code"])
             self.assertFalse(payload["cloud_upload_performed"])
+            self.assertEqual("do_not_retry", payload["cloud_retry_policy"])
+            self.assertEqual("none", payload["local_fallback_recommendation"])
             self.assertFalse(queue.exists())
 
     def test_cloud_authorization_is_separate_from_importance(self) -> None:
@@ -73,6 +84,8 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
                 "cloud_upload_authorization_required", payload["error_code"]
             )
             self.assertFalse(payload["cloud_upload_performed"])
+            self.assertEqual("do_not_retry", payload["cloud_retry_policy"])
+            self.assertEqual("none", payload["local_fallback_recommendation"])
             self.assertFalse(queue.exists())
 
 
