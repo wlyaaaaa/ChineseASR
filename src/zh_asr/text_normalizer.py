@@ -80,7 +80,6 @@ _TRADITIONAL_TO_SIMPLIFIED = str.maketrans(
         "產": "产",
         "業": "业",
         "務": "务",
-        "務": "务",
         "處": "处",
         "理": "理",
         "辦": "办",
@@ -108,7 +107,6 @@ _TRADITIONAL_TO_SIMPLIFIED = str.maketrans(
         "謹": "谨",
         "離": "离",
         "雜": "杂",
-        "訊": "讯",
         "龍": "龙",
         "馬": "马",
         "門": "门",
@@ -117,7 +115,6 @@ _TRADITIONAL_TO_SIMPLIFIED = str.maketrans(
         "優": "优",
         "選": "选",
         "項": "项",
-        "網": "网",
     }
 )
 
