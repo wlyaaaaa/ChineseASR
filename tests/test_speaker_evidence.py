@@ -75,6 +75,76 @@ def write_reference_set(root: Path, names: list[str], *, duplicate_first: bool =
 
 
 class SpeakerEvidenceTests(unittest.TestCase):
+    def test_readback_is_thin_current_and_never_counts_same_source(self):
+        from zh_asr.result_writer import canonical_json_sha256
+        from zh_asr.speaker_evidence import (
+            readback_self_speaker_evidence,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "held-out.raw"
+            target.write_bytes(b"audio")
+            profile_path = root / "person-self.voice-profile.json"
+            profile = {"profile": "current"}
+            profile_hash = canonical_json_sha256(profile)
+            base = {
+                "target": {
+                    "source": {"path": str(target), "sha256": "a" * 64, "bytes": 5},
+                    "segment": {"start_ms": 100, "end_ms": 900, "channel": "right"},
+                },
+                "profile": {"sha256": profile_hash},
+                "source_relation": "held_out_source",
+                "identity_status": "unconfirmed",
+                "meaning": "只支持本人候选，不能单独确认身份。",
+            }
+
+            def persist(name, document):
+                path = root / f"{name}.voice-evidence.json"
+                path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+                return path
+
+            current_path = persist("current", base)
+            stale = json.loads(json.dumps(base))
+            stale["profile"]["sha256"] = "f" * 64
+            stale_path = persist("stale", stale)
+            drifted = json.loads(json.dumps(base))
+            drifted["target"]["source"]["sha256"] = "c" * 64
+            drift_path = persist("drift", drifted)
+            same_source = json.loads(json.dumps(base))
+            same_source["source_relation"] = "enrollment_source"
+            same_path = persist("same-source", same_source)
+
+            with patch("zh_asr.speaker_evidence.load_self_speaker_profile", return_value=profile), patch(
+                "zh_asr.speaker_evidence.file_sha256", return_value="a" * 64
+            ) as hash_file, patch(
+                "zh_asr.speaker_attribution._parse_voice_evidence",
+                side_effect=lambda documents: tuple(documents),
+            ), patch(
+                "zh_asr.speaker_attribution._voice_source_relation",
+                side_effect=lambda document: document["source_relation"],
+            ):
+                payload = readback_self_speaker_evidence(
+                    target,
+                    profile_path=profile_path,
+                    evidence_paths=[current_path, stale_path, drift_path, same_path],
+                )
+
+        self.assertEqual(hash_file.call_count, 1)
+        self.assertEqual(payload["current_valid_evidence_count"], 1)
+        self.assertEqual(payload["evidence"][0]["source_relation"], "held_out_source")
+        self.assertEqual(
+            payload["invalid_evidence_count_by_reason"],
+            {
+                "target_source_hash_drift": 1,
+                "inactive_profile": 1,
+                "enrollment_source_not_directional": 1,
+            },
+        )
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn('"score"', serialized)
+        self.assertNotIn('"embedding"', serialized)
+
     def test_multi_reference_enrollment_persists_one_normalized_centroid_without_paths(self):
         from zh_asr.result_writer import canonical_json_sha256
         from zh_asr.speaker_evidence import (

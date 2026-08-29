@@ -10,9 +10,11 @@ process memory and are discarded after a centroid or hash-bound score is written
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
 import gc
 import importlib.metadata
+from itertools import islice
 import json
 import math
 from pathlib import Path
@@ -35,7 +37,9 @@ SELF_SPEAKER_MULTI_PROFILE_SCHEMA = "chinese-asr.person-self-voice-profile.v3"
 SELF_SPEAKER_MULTI_EVIDENCE_SCHEMA = "chinese-asr.person-self-voice-evidence.v2"
 SELF_SPEAKER_REFERENCE_SET_SCHEMA = "chinese-asr.person-self-voice-reference-set.v1"
 SPEAKER_MODEL_EVIDENCE_SCHEMA = "chinese-asr.speaker-model-evidence.v1"
+SPEAKER_EVIDENCE_READBACK_SCHEMA = "chinese-asr.person-self-voice-evidence-readback.v1"
 MAX_SPEAKER_EVIDENCE_DURATION_MS = 120_000
+MAX_SPEAKER_EVIDENCE_READBACK_FILES = 256
 VOICE_SCORE_AMBIGUITY_MARGIN = 0.02
 MIN_SELF_SPEAKER_REFERENCES = 2
 MAX_SELF_SPEAKER_REFERENCES = 3
@@ -320,6 +324,126 @@ def write_self_speaker_evidence(
     evidence = create_self_speaker_evidence(target_audio, **kwargs)
     _write_json_atomic(output_path.resolve(), evidence)
     return evidence
+
+
+def readback_self_speaker_evidence(
+    target_audio: Path,
+    *,
+    profile_path: Path | None = None,
+    evidence_paths: Sequence[Path] = (),
+) -> dict[str, Any]:
+    """Read current held-out evidence for one named file without loading a model."""
+
+    target = Path(target_audio).resolve()
+    if not target.is_file():
+        raise FileNotFoundError(f"Audio/video file not found: {target}")
+    target_size = target.stat().st_size
+    target_sha256 = file_sha256(target)
+
+    try:
+        profile = load_self_speaker_profile(
+            (profile_path or default_self_speaker_profile_path()).resolve()
+        )
+        profile_hash = canonical_json_sha256(profile)
+        profile_status = "current"
+    except FileNotFoundError:
+        profile_hash = None
+        profile_status = "missing"
+    except SpeakerEvidenceError:
+        profile_hash = None
+        profile_status = "invalid"
+
+    if evidence_paths:
+        candidates = list(dict.fromkeys(Path(value).resolve() for value in evidence_paths))
+        if len(candidates) > MAX_SPEAKER_EVIDENCE_READBACK_FILES:
+            raise SpeakerEvidenceError("At most 256 explicit evidence files are allowed.")
+        search_mode = "explicit"
+        enumeration_complete = True
+    else:
+        root = default_self_speaker_profile_path().parent.resolve()
+        found = list(
+            islice(
+                (path.resolve() for path in root.rglob("*.voice-evidence.json") if not path.is_symlink() and path.is_file()),
+                MAX_SPEAKER_EVIDENCE_READBACK_FILES + 1,
+            )
+        ) if root.is_dir() else []
+        enumeration_complete = len(found) <= MAX_SPEAKER_EVIDENCE_READBACK_FILES
+        candidates = sorted(found[:MAX_SPEAKER_EVIDENCE_READBACK_FILES], key=lambda path: str(path).casefold())
+        search_mode = "private_outputs"
+
+    # Lazy import reuses the existing validator without creating a module cycle.
+    from .speaker_attribution import _parse_voice_evidence, _voice_source_relation
+
+    current: list[dict[str, Any]] = []
+    invalid: Counter[str] = Counter()
+    ignored_other_source_count = 0
+    for evidence_path in candidates:
+        try:
+            document = json.loads(evidence_path.read_text(encoding="utf-8"))
+            document = _parse_voice_evidence((document,))[0]
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            invalid["invalid_or_missing_evidence"] += 1
+            continue
+
+        source = document["target"]["source"]
+        source_sha256 = str(source["sha256"]).lower()
+        if source_sha256 != target_sha256:
+            if Path(source["path"]).resolve() == target:
+                invalid["target_source_hash_drift"] += 1
+            else:
+                ignored_other_source_count += 1
+            continue
+        source_relation = _voice_source_relation(document)
+        reason = (
+            "target_source_hash_drift" if source["bytes"] != target_size else
+            f"active_profile_{profile_status}" if profile_status != "current" else
+            "inactive_profile" if str(document["profile"]["sha256"]).lower() != profile_hash else
+            "enrollment_source_not_directional" if source_relation == "enrollment_source" else
+            None
+        )
+        if reason:
+            invalid[reason] += 1
+            continue
+
+        segment = document["target"]["segment"]
+        current.append(
+            {
+                "evidence_path": str(evidence_path),
+                "start_ms": segment["start_ms"],
+                "end_ms": segment["end_ms"],
+                "channel": segment["channel"],
+                "source_relation": source_relation,
+                "identity_status": document["identity_status"],
+                "meaning": document["meaning"],
+            }
+        )
+
+    current.sort(key=lambda item: (item["start_ms"], item["evidence_path"]))
+    if current:
+        gap = "只有列出的区间有当前留出证据，未测试区间仍为 unknown。"
+    elif profile_status != "current":
+        gap = f"当前 person:self profile 为 {profile_status}，身份保持 unknown。"
+    else:
+        gap = "未找到该原件的当前留出证据，身份保持 unknown。"
+    if not enumeration_complete:
+        gap += " 默认枚举已达256项上限；可用重复 --evidence 精确指定。"
+
+    return {
+        "schema": SPEAKER_EVIDENCE_READBACK_SCHEMA,
+        "target": {"path": str(target), "sha256": target_sha256},
+        "search": {"mode": search_mode, "candidate_count": len(candidates), "enumeration_complete": enumeration_complete},
+        "profile_status": profile_status,
+        "identity_status": "unconfirmed" if current else "unknown",
+        "current_valid_evidence_count": len(current),
+        "evidence": current,
+        "tested_coverage": [
+            {key: item[key] for key in ("start_ms", "end_ms", "channel")}
+            for item in current
+        ],
+        "invalid_evidence_count_by_reason": dict(invalid),
+        "ignored_other_source_count": ignored_other_source_count,
+        "gap": gap,
+    }
 
 
 def load_self_speaker_profile(profile_path: Path) -> dict[str, Any]:

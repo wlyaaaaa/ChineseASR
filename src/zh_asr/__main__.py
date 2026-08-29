@@ -39,6 +39,7 @@ from .speaker_evidence import (
     enroll_self_speaker,
     enroll_self_speaker_reference_set,
     load_self_speaker_profile,
+    readback_self_speaker_evidence,
     write_self_speaker_evidence,
 )
 from .service import CALLER_BINDING_ENV, serve_api
@@ -206,6 +207,29 @@ def main(argv: list[str] | None = None) -> int:
         "--require-held-out",
         action="store_true",
         help="Fail closed if the target source contributed to the active profile.",
+    )
+
+    speaker_evidence_readback = subparsers.add_parser(
+        "speaker-evidence-readback",
+        help="Read current person:self evidence for one explicitly named audio/video file.",
+        description=(
+            "Read only existing, hash-bound person:self evidence; do not load a model, "
+            "write files, or scan outside outputs/private."
+        ),
+    )
+    speaker_evidence_readback.add_argument("target_media", type=Path)
+    speaker_evidence_readback.add_argument(
+        "--evidence",
+        type=Path,
+        action="append",
+        default=[],
+        help="Exact voice-evidence JSON path; repeat to bypass the bounded private-output lookup.",
+    )
+    speaker_evidence_readback.add_argument(
+        "--profile",
+        type=Path,
+        default=default_self_speaker_profile_path(),
+        help="Current private person:self profile used only to reject stale evidence.",
     )
 
     speaker_delete = subparsers.add_parser(
@@ -531,6 +555,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"person:self evidence: {args.out}")
             print(f"Similarity: {evidence['score']['value']:.4f}")
             print("Identity status: unconfirmed (fuse this evidence before attribution)")
+            return 0
+        if args.command == "speaker-evidence-readback":
+            payload = readback_self_speaker_evidence(
+                args.target_media,
+                profile_path=args.profile,
+                evidence_paths=args.evidence,
+            )
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 0
         if args.command == "speaker-profile-delete":
             delete_self_speaker_profile(

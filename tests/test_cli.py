@@ -538,6 +538,7 @@ engines:
     def test_speaker_commands_are_discoverable_without_loading_a_model(self):
         enroll = self.run_cli("speaker-enroll", "--help")
         evidence = self.run_cli("speaker-evidence", "--help")
+        readback = self.run_cli("speaker-evidence-readback", "--help")
         delete = self.run_cli("speaker-profile-delete", "--help")
 
         self.assertEqual(enroll.returncode, 0, enroll.stderr)
@@ -547,8 +548,38 @@ engines:
         self.assertEqual(evidence.returncode, 0, evidence.stderr)
         self.assertIn("--channel", evidence.stdout)
         self.assertIn("--require-held-out", evidence.stdout)
+        self.assertEqual(readback.returncode, 0, readback.stderr)
+        self.assertIn("--evidence", readback.stdout)
+        self.assertIn("target_media", readback.stdout)
         self.assertEqual(delete.returncode, 0, delete.stderr)
         self.assertIn("--confirm-delete", delete.stdout)
+
+    def test_speaker_evidence_readback_returns_unknown_json_without_writing_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "named.aac"
+            target.write_bytes(b"named-media")
+            missing_profile = root / "missing-profile.json"
+            missing_evidence = root / "missing.voice-evidence.json"
+            before = sorted(path.name for path in root.iterdir())
+            result = self.run_cli(
+                "speaker-evidence-readback",
+                str(target),
+                "--profile",
+                str(missing_profile),
+                "--evidence",
+                str(missing_evidence),
+            )
+            after = sorted(path.name for path in root.iterdir())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["identity_status"], "unknown")
+        self.assertEqual(payload["current_valid_evidence_count"], 0)
+        self.assertEqual(payload["profile_status"], "missing")
+        self.assertEqual(before, after)
+        self.assertNotIn("score", result.stdout)
+        self.assertNotIn("embedding", result.stdout)
 
 
 if __name__ == "__main__":
