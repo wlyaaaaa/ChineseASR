@@ -337,8 +337,10 @@ def readback_self_speaker_evidence(
     target = Path(target_audio).resolve()
     if not target.is_file():
         raise FileNotFoundError(f"Audio/video file not found: {target}")
-    target_size = target.stat().st_size
+    target_snapshot = _file_snapshot(target)
+    target_size = target_snapshot[2]
     target_sha256 = file_sha256(target)
+    _require_file_snapshot(target, target_snapshot)
 
     try:
         profile = load_self_speaker_profile(
@@ -428,6 +430,8 @@ def readback_self_speaker_evidence(
     if not enumeration_complete:
         gap += " 默认枚举已达256项上限；可用重复 --evidence 精确指定。"
 
+    _require_file_snapshot(target, target_snapshot)
+
     return {
         "schema": SPEAKER_EVIDENCE_READBACK_SCHEMA,
         "target": {"path": str(target), "sha256": target_sha256},
@@ -444,6 +448,33 @@ def readback_self_speaker_evidence(
         "ignored_other_source_count": ignored_other_source_count,
         "gap": gap,
     }
+
+
+def _file_snapshot(path: Path) -> tuple[int, int, int, int, int]:
+    metadata = path.stat()
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+
+
+def _require_file_snapshot(
+    path: Path,
+    expected: tuple[int, int, int, int, int],
+) -> None:
+    try:
+        current = _file_snapshot(path)
+    except OSError as exc:
+        raise SpeakerEvidenceError(
+            "Target media changed or became unavailable during speaker-evidence readback."
+        ) from exc
+    if current != expected:
+        raise SpeakerEvidenceError(
+            "Target media changed or was replaced during speaker-evidence readback."
+        )
 
 
 def load_self_speaker_profile(profile_path: Path) -> dict[str, Any]:

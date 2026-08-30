@@ -75,6 +75,37 @@ def write_reference_set(root: Path, names: list[str], *, duplicate_first: bool =
 
 
 class SpeakerEvidenceTests(unittest.TestCase):
+    def test_readback_rejects_target_replaced_during_hash(self):
+        from zh_asr.result_writer import file_sha256 as actual_file_sha256
+        from zh_asr.speaker_evidence import (
+            SpeakerEvidenceError,
+            readback_self_speaker_evidence,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "named.raw"
+            target.write_bytes(b"old-audio")
+            old_hash = actual_file_sha256(target)
+
+            def hash_then_replace(_path):
+                target.write_bytes(b"new-audio-content")
+                return old_hash
+
+            with patch(
+                "zh_asr.speaker_evidence.file_sha256",
+                side_effect=hash_then_replace,
+            ):
+                with self.assertRaisesRegex(
+                    SpeakerEvidenceError,
+                    "changed or was replaced",
+                ):
+                    readback_self_speaker_evidence(
+                        target,
+                        profile_path=root / "missing-profile.json",
+                        evidence_paths=[root / "missing-evidence.json"],
+                    )
+
     def test_readback_is_thin_current_and_never_counts_same_source(self):
         from zh_asr.result_writer import canonical_json_sha256
         from zh_asr.speaker_evidence import (
