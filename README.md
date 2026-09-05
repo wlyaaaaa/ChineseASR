@@ -179,7 +179,7 @@ API Key 只由 Secret Broker 注入固定、哈希绑定的子进程环境，不
 .\scripts\setup-core.ps1
 ```
 
-核心依赖文件 `requirements-core.txt` 固定 `funasr==1.4.5`。Fun-ASR-Nano 是面向 GPU 的较重模型，先完成 CUDA/PyTorch 与核心依赖安装，再按需下载；不需要 Nano 的机器无需额外安装模型。
+核心依赖文件 `requirements-core.txt` 固定 `funasr==1.4.14`。Fun-ASR-Nano 是面向 GPU 的较重模型，先完成 CUDA/PyTorch 与核心依赖安装，再按需下载；不需要 Nano 的机器无需额外安装模型。
 
 下载 quick / secondary 默认需要的 SenseVoice：
 
