@@ -1,0 +1,4 @@
+# Narrow Windows dictation host dependencies.
+sounddevice==0.5.6
+pystray==0.19.5
+Pillow>=10

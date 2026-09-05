@@ -1,0 +1,10 @@
+# Desktop dictation is independent of the file-transcription defaults.
+engine: qwen3-asr-1.7b
+sample_rate: 16000
+silence_ms: 600
+min_speech_ms: 240
+max_chunk_sec: 20
+# null follows the current Windows default input device at each recording.
+input_device: DJI Mic Mini
+# Context supplies spellings, never an instruction to rewrite the transcript.
+hotwords: "Codex, ChineseASR, Win+H, API, GitHub, Python, PowerShell, Qwen, RTX 5090D"

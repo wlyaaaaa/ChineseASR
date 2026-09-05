@@ -94,7 +94,7 @@ class ConfigTests(unittest.TestCase):
     def test_core_requirements_pin_funasr_145(self):
         requirements = (PROJECT_ROOT / "requirements-core.txt").read_text(encoding="utf-8").splitlines()
 
-        self.assertIn("funasr==1.4.5", requirements)
+        self.assertIn("funasr==1.4.14", requirements)
         self.assertTrue(any(line.startswith("more-itertools>=") for line in requirements))
         self.assertTrue(any(line.startswith("rapidfuzz>=") for line in requirements))
         self.assertTrue(any(line.startswith("websockets>=") for line in requirements))

@@ -2,7 +2,29 @@
 
 `ChineseASR` 是一个本地优先的中文语音转文字项目，目标是把中文录音转成可审计、低幻觉、可复现的文本。它面向 Windows + CUDA 工作站，默认 quick 使用 `SenseVoiceSmall`，strict 使用 `Qwen3-ASR-1.7B + SenseVoiceSmall`。FunASR 官方 GPU flagship `Fun-ASR-Nano-2512` 已作为显式 `fun-asr-nano` profile 提供，但不会因为安装完成而改变 quick 默认；可选的 `FireRedASR2-LLM` 是证据级词汇主引擎，也不会自动取代默认 strict 组合。
 
-这个项目优先解决三件事：
+项目同时提供录音转写和 Windows 桌面语音输入。本文是使用入口；项目执行规则见 `AGENTS.md`，机器状态以 PCConfig 和 Windows 现场为准。
+
+## Win+H 语音输入
+
+在任意普通应用的输入框按 **Win+H** 开始说话，再按 **Win+H** 结束；停顿时会逐句输入。**Esc** 取消尚未输入的部分，已输入文字保留。不会自动按回车发送。
+
+听写使用现有 **Qwen3-ASR-1.7B**，不做双模型复核或自动润色。模型提前加载到内存，录音期间使用 GPU；空闲释放显存和 LocalGpuBroker 租约，便于其他本地 AI 工具继续工作。首次启动需要准备模型，托盘会显示状态。
+
+```powershell
+.\scripts\dictation.ps1 -Mode Install  # 安装听写依赖、登录自启并立即启动
+.\scripts\dictation.ps1 -Mode Status
+.\scripts\dictation.ps1 -Mode Stop
+.\scripts\dictation.ps1 -Mode Start
+.\scripts\dictation.ps1 -Mode Uninstall  # 移除登录自启，保留项目和模型
+```
+
+运行时接管 Win+H，退出或从托盘暂停快捷键后恢复系统行为。麦克风和技术词拼写在 `configs/dictation.yaml` 设置；`input_device: null` 表示跟随 Windows 默认麦克风。指定设备未连接时会提示连接，不切换到其他麦克风。焦点改变时停止自动输入，托盘“复制最近文本”可手动取回完整识别结果。管理员窗口可能拒绝普通权限程序输入，需手动复制。
+
+录音和识别结果不保存为历史文件；`outputs/dictation/runtime.log` 只记录运行错误、耗时和字数。公开短音频只能检查软件集成及速度，个人口音、麦克风与实际体验仍以本人试用为准。
+
+**更新原则**：AI 可以自主更新兼容依赖；没有证据证明新模型明显更好时维持当前模型，有可靠的中文效果、速度和兼容证据后再新增或替换。不会因为“发布了新版本”就自动换模，也未设置定时下载服务。
+
+录音转写优先解决三件事：
 
 - **中文准确性优先**：strict 模式默认以 `Qwen3-ASR-1.7B` 为主引擎，`SenseVoiceSmall` 为对照锚点。
 - **低幻觉和可复核**：双模型分歧、静音出字、模板废话、异常重复、繁体残留、超长无标点等都会进入 audit / metrics / review。
@@ -31,7 +53,6 @@
 
 ## 不适合场景
 
-- 只想要一个极简 GUI。
 - 不愿意本地安装模型权重和 Python 环境。
 - 希望普通录音或整个文件夹自动上传云端转写；云入口只接受明确的重要录音。
 - 需要英文、多语种或字幕生产工具链作为主目标。
