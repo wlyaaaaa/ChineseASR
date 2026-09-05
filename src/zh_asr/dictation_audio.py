@@ -101,6 +101,39 @@ def _candidate_devices(requested: str | int | None) -> list[dict[str, Any]]:
     )
 
 
+def list_microphones(refresh: bool = True) -> list[dict[str, str | None]]:
+    """Names are stable preferences; endpoint indices are resolved at open time."""
+    if refresh:
+        _refresh_portaudio()
+    options = [{"value": None, "label": "Windows 默认麦克风"}]
+    seen = set()
+    host_names = _host_api_names()
+    devices = sorted(sd.query_devices(), key=lambda d: _host_api_rank(
+        host_names[int(d["hostapi"])] if 0 <= int(d["hostapi"]) < len(host_names) else ""))
+    for info in devices:
+        name = str(info["name"]).strip()
+        if not info["max_input_channels"] or "声音映射器" in name or "主声音捕获" in name:
+            continue
+        host_index = int(info["hostapi"])
+        host_name = host_names[host_index] if 0 <= host_index < len(host_names) else ""
+        if _host_api_rank(host_name) == 3 and "DJI Mic Mini" not in name:
+            continue  # Do not crowd a small menu with raw driver pins and orphan endpoints.
+        if "DJI Mic Mini" in name:
+            name = "DJI Mic Mini"
+        # Prefer the ordinary Windows endpoint over raw WDM device-resource names.
+        if name.startswith("@") or "@System32" in name:
+            if "DJI Mic Mini" in name:
+                name = "DJI Mic Mini"
+            else:
+                continue
+        key = name.rstrip(" )").casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        options.append({"value": name, "label": name})
+    return options
+
+
 def open_microphone(settings: Any, callback: Callable[..., Any]):
     """Open and start the configured input device at 16 kHz mono float32.
 

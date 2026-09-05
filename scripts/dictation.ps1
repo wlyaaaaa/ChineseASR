@@ -83,6 +83,7 @@ try {
         task_name = $TaskName
         task_state = if ($Task) { [string]$Task.State } else { 'NotInstalled' }
         hotkey = 'Win+H'
+        hotkeys = @('Win+H', 'Ctrl+Win+H')
         config = (Join-Path $Root 'configs\dictation.yaml')
     } | ConvertTo-Json
 } finally {

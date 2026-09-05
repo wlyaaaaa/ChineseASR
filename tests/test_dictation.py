@@ -5,6 +5,9 @@ import threading
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
+from tempfile import TemporaryDirectory
+from pathlib import Path
+import json
 
 import numpy as np
 
@@ -19,6 +22,9 @@ class FakeHost:
         self.insertions = []
         self.messages = []
         self.last_text = ""
+        self.visible = False
+        self.callbacks = queue.Queue()
+        self.busy = False
 
     def insert_text(self, text, target):
         self.insertions.append((text, target))
@@ -29,6 +35,25 @@ class FakeHost:
 
     def set_last_text(self, text):
         self.last_text = text
+
+    def capture_target(self):
+        return "original-focus"
+
+    def open_panel(self):
+        self.visible = True
+
+    def hide_panel(self):
+        self.visible = False
+
+    def set_busy(self, value):
+        self.busy = value
+
+    def post_to_ui(self, callback):
+        self.callbacks.put(callback)
+
+    def pump(self):
+        while not self.callbacks.empty():
+            self.callbacks.get_nowait()()
 
 
 class FakeEngine:
@@ -54,41 +79,58 @@ def recording_with_chunks(count=2):
 
 
 class DictationTests(unittest.TestCase):
-    def test_simultaneous_ui_and_worker_cleanup_closes_stream_once(self):
+    def test_hide_is_immediate_and_cancels_without_waiting_for_audio_driver(self):
+        host = FakeHost()
+        controller = DictationController(host, DictationSettings(), FakeEngine([]))
+        controller.toggle()
+        recording = controller.recording
+        controller.hide()
+        self.assertFalse(host.visible)
+        self.assertTrue(recording.stopped.is_set())
+        self.assertTrue(recording.cancelled.is_set())
+        self.assertFalse(controller.quit_event.is_set())
+        self.assertEqual(controller.audio_commands.qsize(), 2)
+
+    def test_cancel_during_open_closes_late_stream_without_starting_transcription(self):
         entered, release = threading.Event(), threading.Event()
-        calls = []
-        def stop():
-            calls.append("stop")
+        closed = []
+        def open_late(*args):
             entered.set()
             release.wait(2)
-        controller = DictationController(FakeHost(), DictationSettings(), FakeEngine([]))
-        controller.stream = SimpleNamespace(stop=stop, close=lambda: calls.append("close"))
-        worker = threading.Thread(target=controller._close_stream)
-        worker.start()
-        try:
-            self.assertTrue(entered.wait(1))
-            controller._close_stream()
-        finally:
-            release.set()
-            worker.join(2)
-        self.assertEqual(calls, ["stop", "close"])
-
-    def test_disconnect_while_stopping_cancels_pending_text_and_closes_stream(self):
+            return SimpleNamespace(stop=lambda: closed.append("stop"), close=lambda: closed.append("close"))
         host = FakeHost()
-        controller = DictationController(host, DictationSettings(), FakeEngine(["不应输入"]))
-        controller.recording = recording_with_chunks(1)
-        controller.recording.stopped.clear()
-        controller.segmenter = PauseSegmenter(DictationSettings())
-        closed = []
-        def failed_stop():
-            raise OSError("device disconnected")
-        controller.stream = SimpleNamespace(stop=failed_stop, close=lambda: closed.append(True))
-        with self.assertLogs("zh_asr.dictation", level="ERROR"):
-            controller.stop()
-        self.assertEqual(closed, [True])
-        self.assertTrue(controller.recording.cancelled.is_set())
-        controller._recognize(controller.recording)
-        self.assertEqual(host.insertions, [])
+        controller = DictationController(host, DictationSettings(), FakeEngine([]))
+        with patch("zh_asr.dictation_audio.open_microphone", side_effect=open_late):
+            controller.audio_worker.start()
+            controller.toggle()
+            self.assertTrue(entered.wait(1))
+            controller.hide()
+            release.set()
+            controller.audio_commands.put(None)
+            controller.audio_worker.join(2)
+        host.pump()
+        self.assertEqual(closed, ["stop", "close"])
+        self.assertTrue(controller.commands.empty())
+        self.assertIsNone(controller.recording)
+        self.assertFalse(host.visible)
+
+    def test_microphone_selection_is_saved_and_applies_to_next_session(self):
+        host = FakeHost()
+        settings = DictationSettings(input_device="DJI Mic Mini")
+        controller = DictationController(host, settings, FakeEngine([]))
+        controller.toggle()
+        recording = controller.recording
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "preferences.json"
+            with patch("zh_asr.dictation.preferences_path", return_value=path):
+                controller.select_microphone("UGREEN Camera Audio")
+                self.assertEqual(json.loads(path.read_text())["input_device"], "UGREEN Camera Audio")
+                self.assertEqual(settings.with_preferences().input_device, "UGREEN Camera Audio")
+                path.write_text("{bad json")
+                self.assertEqual(settings.with_preferences().input_device, "DJI Mic Mini")
+        self.assertEqual(recording.settings.input_device, "DJI Mic Mini")
+        self.assertTrue(recording.stopped.is_set())
+        self.assertEqual(controller.settings.input_device, "UGREEN Camera Audio")
 
     def test_silence_does_not_trigger_model(self):
         segmenter = PauseSegmenter(DictationSettings())

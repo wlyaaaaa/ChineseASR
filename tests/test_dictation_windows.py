@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-import unittest
 import time
+import threading
+import unittest
 
 from zh_asr.dictation_windows import (
     KeyboardEvent,
+    TargetWindow,
     WindowsHost,
+    _HOST_INPUT_EXTRA_INFO,
     _VK_ESCAPE,
     _VK_H,
+    _VK_LCONTROL,
+    _VK_LMENU,
+    _VK_LSHIFT,
     _VK_LWIN,
     _WM_KEYDOWN,
     _WM_KEYUP,
@@ -37,6 +43,10 @@ class FakeWindowsApi:
         self.unhooked: list[int] = []
         self.menu_masks = 0
         self.nonactivation_calls: list[tuple[int, bool]] = []
+        self.own_process_windows: set[int] = set()
+        self.message_queue_ready = threading.Event()
+        self.message_quit = threading.Event()
+        self.posted_thread_quits: list[int] = []
 
     def _new_handle(self) -> int:
         self.next_handle += 1
@@ -91,11 +101,33 @@ class FakeWindowsApi:
     def call_next_hook(self, *_args: object) -> int:
         return 0
 
+    def current_thread_id(self) -> int:
+        return threading.get_ident()
+
+    def ensure_message_queue(self) -> None:
+        self.message_queue_ready.set()
+
+    def pump_messages(self) -> None:
+        self.message_quit.wait(1)
+
+    def post_thread_quit(self, thread_id: int) -> bool:
+        self.posted_thread_quits.append(thread_id)
+        self.message_quit.set()
+        return True
+
     def get_foreground_window(self) -> int:
         return self.foreground
 
     def get_root_window(self, hwnd: int) -> int:
-        return self.root if hwnd == self.foreground else 0
+        if hwnd == self.foreground:
+            return self.root
+        return hwnd if hwnd in (self.root, 2001) else 0
+
+    def get_window_process_id(self, hwnd: int) -> int:
+        return 42 if hwnd in self.own_process_windows else 99
+
+    def current_process_id(self) -> int:
+        return 42
 
     def get_focus_window(self, foreground: int) -> int:
         return self.focus if foreground == self.foreground else 0
@@ -150,6 +182,19 @@ class FakeScheduledRoot:
         self.scheduled.append((delay_ms, callback))
 
 
+class FakeTray:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.stopped = threading.Event()
+
+    def run(self) -> None:
+        self.started.set()
+        self.stopped.wait(1)
+
+    def stop(self) -> None:
+        self.stopped.set()
+
+
 class WindowsHostTests(unittest.TestCase):
     def make_host(self):
         self.api = FakeWindowsApi()
@@ -174,10 +219,104 @@ class WindowsHostTests(unittest.TestCase):
         self.assertEqual(["toggle"], self.calls)
         self.assertEqual(1, self.api.menu_masks)
 
-    def test_injected_and_released_shortcut_events_are_not_taken_over(self):
+    def test_low_level_hook_uses_a_separate_message_pump_and_stops_cleanly(self):
+        host = self.make_host()
+        host._install_hook()
+        try:
+            self.assertTrue(self.api.message_queue_ready.wait(0.2))
+            self.assertEqual(701, host._hook_handle)
+            self.assertIsNotNone(host._hook_thread)
+        finally:
+            host._stop_hook_worker()
+
+        self.assertEqual([701], self.api.unhooked)
+        self.assertEqual(0, host._hook_handle)
+        self.assertEqual(1, len(self.api.posted_thread_quits))
+
+    def test_tray_uses_our_daemon_thread_and_can_be_stopped_boundedly(self):
+        tray = FakeTray()
+        host = WindowsHost(
+            on_toggle=lambda: None,
+            on_cancel=lambda: None,
+            on_quit=lambda: None,
+            api=FakeWindowsApi(),
+            tray_factory=lambda _host: tray,
+        )
+        host._start_tray()
+        try:
+            self.assertTrue(tray.started.wait(0.2))
+            self.assertTrue(host._tray_thread.daemon)
+        finally:
+            tray.stop()
+            host._tray_thread.join(timeout=0.2)
+
+    def test_only_our_exact_marked_injected_events_are_ignored(self):
         host = self.make_host()
 
-        self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_H, _WM_KEYDOWN, injected=True)))
+        self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYDOWN, injected=True)))
+        self.assertFalse(
+            host._handle_keyboard_event(
+                KeyboardEvent(_VK_H, _WM_KEYDOWN, injected=True, extra_info=_HOST_INPUT_EXTRA_INFO)
+            )
+        )
+        self.assertFalse(
+            host._handle_keyboard_event(
+                KeyboardEvent(_VK_H, _WM_KEYUP, injected=True, extra_info=_HOST_INPUT_EXTRA_INFO)
+            )
+        )
+        self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYUP, injected=True)))
+        host._dispatch_pending_events()
+        self.assertEqual([], self.calls)
+
+    def test_externally_injected_win_h_is_taken_over_like_a_physical_hotkey(self):
+        host = self.make_host()
+
+        self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYDOWN, injected=True)))
+        self.assertTrue(host._handle_keyboard_event(KeyboardEvent(_VK_H, _WM_KEYDOWN, injected=True)))
+        self.assertTrue(host._handle_keyboard_event(KeyboardEvent(_VK_H, _WM_KEYUP, injected=True)))
+        self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYUP, injected=True)))
+        host._dispatch_pending_events()
+
+        self.assertEqual(["toggle"], self.calls)
+        self.assertEqual(1, self.api.menu_masks)
+
+    def test_ctrl_win_h_is_supported_for_physical_and_externally_injected_input(self):
+        for injected in (False, True):
+            with self.subTest(injected=injected):
+                host = self.make_host()
+                self.assertFalse(
+                    host._handle_keyboard_event(KeyboardEvent(_VK_LCONTROL, _WM_KEYDOWN, injected=injected))
+                )
+                self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYDOWN, injected=injected)))
+                self.assertTrue(host._handle_keyboard_event(KeyboardEvent(_VK_H, _WM_KEYDOWN, injected=injected)))
+                self.assertTrue(host._handle_keyboard_event(KeyboardEvent(_VK_H, _WM_KEYUP, injected=injected)))
+                self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYUP, injected=injected)))
+                self.assertFalse(
+                    host._handle_keyboard_event(KeyboardEvent(_VK_LCONTROL, _WM_KEYUP, injected=injected))
+                )
+                host._dispatch_pending_events()
+
+                self.assertEqual(["toggle"], self.calls)
+                self.assertEqual(1, self.api.menu_masks)
+
+    def test_win_alt_h_and_win_shift_h_are_left_entirely_to_windows(self):
+        for modifier in (_VK_LMENU, _VK_LSHIFT):
+            with self.subTest(modifier=modifier):
+                host = self.make_host()
+                self.assertFalse(host._handle_keyboard_event(KeyboardEvent(modifier, _WM_KEYDOWN)))
+                self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYDOWN)))
+                self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_H, _WM_KEYDOWN)))
+                self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_H, _WM_KEYUP)))
+                self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYUP)))
+                self.assertFalse(host._handle_keyboard_event(KeyboardEvent(modifier, _WM_KEYUP)))
+                host._dispatch_pending_events()
+
+                self.assertEqual([], self.calls)
+                self.assertEqual(0, self.api.menu_masks)
+
+    def test_released_shortcut_events_are_not_taken_over(self):
+        host = self.make_host()
+
         host.set_shortcut_released(True)
         self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYDOWN)))
         self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_H, _WM_KEYDOWN)))
@@ -239,7 +378,7 @@ class WindowsHostTests(unittest.TestCase):
         self.assertFalse(is_running(self.api))
         self.assertFalse(request_existing_quit(self.api))
 
-    def test_overlay_hides_normal_notices_but_keeps_busy_and_errors_visible(self):
+    def test_show_does_not_reopen_a_panel_after_the_user_hides_it(self):
         host = self.make_host()
         overlay = FakeOverlay()
         host._overlay = overlay
@@ -248,24 +387,70 @@ class WindowsHostTests(unittest.TestCase):
 
         host.show("已输入", "普通通知")
         host._render_overlay()
+        self.assertEqual(0, overlay.deiconify_count)
+
+        host.open_panel()
+        host._dispatch_pending_events()
+        self.assertEqual(1, overlay.deiconify_count)
+
+        host.hide_panel()
+        host._dispatch_pending_events()
+        self.assertEqual(1, overlay.withdraw_count)
+        host.show("识别失败", "错误详情", error=True)
         host._render_overlay()
         self.assertEqual(1, overlay.deiconify_count)
 
-        host._visible_until = time.monotonic() - 0.01
-        host._render_overlay()
-        host._render_overlay()
-        self.assertEqual(1, overlay.withdraw_count)
+    def test_panel_callbacks_devices_and_external_target_fallback(self):
+        calls: list[object] = []
+        host = WindowsHost(
+            on_toggle=lambda: calls.append("toggle"),
+            on_cancel=lambda: None,
+            on_quit=lambda: None,
+            on_hide=lambda: calls.append("hide"),
+            on_device_change=lambda value: calls.append(("device", value)),
+            on_refresh_devices=lambda: calls.append("refresh"),
+            api=FakeWindowsApi(),
+        )
+        host.set_microphones(
+            [{"value": "dji", "label": "DJI Mic Mini"}, {"value": None, "label": "Windows 默认麦克风"}],
+            selected="dji",
+        )
+        self.assertEqual([], calls)
+        self.assertEqual("dji", host._selected_microphone)
+        host._select_microphone(None)
+        host._refresh_devices_from_panel()
+        self.assertEqual([("device", None), "refresh"], calls)
 
-        host.set_busy(True)
-        host._render_overlay()
-        host._render_overlay()
-        self.assertEqual(2, overlay.deiconify_count)
-        host.set_busy(False)
-        host.show("识别失败", "错误详情", error=True)
-        self.assertEqual("", host.latest_text)
-        host._render_overlay()
-        host._render_overlay()
-        self.assertEqual(2, overlay.deiconify_count)
+        host._own_window_roots = {1001}
+        host._last_external_target = TargetWindow(2001, 2002)
+        host._api.foreground = 101
+        host._api.root = 1001
+        self.assertEqual(TargetWindow(2001, 2002), host.capture_target())
+        self.assertFalse(host.insert_text("不应输入", TargetWindow(1001, 201)))
+
+        host._own_window_roots.clear()
+        host._api.own_process_windows.add(101)
+        self.assertEqual(TargetWindow(2001, 2002), host.capture_target())
+
+    def test_post_to_ui_and_x_hide_before_notifying_controller(self):
+        state: list[object] = []
+        host = WindowsHost(
+            on_toggle=lambda: None,
+            on_cancel=lambda: None,
+            on_quit=lambda: None,
+            on_hide=lambda: state.append(host._panel_open),
+            api=FakeWindowsApi(),
+        )
+        overlay = FakeOverlay()
+        host._overlay = overlay
+        host._overlay_visible = True
+        host._panel_open = True
+        host.post_to_ui(lambda: state.append("ui"))
+        host._drain_ui_calls()
+        host._hide_from_panel()
+
+        self.assertEqual(["ui", False], state)
+        self.assertEqual(1, overlay.withdraw_count)
 
     def test_overlay_reapplies_nonactivation_after_tk_finishes_wrapping_window(self):
         host = self.make_host()

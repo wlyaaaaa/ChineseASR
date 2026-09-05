@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -20,6 +20,7 @@ from .config import get_engine_spec, load_model_config, project_root
 from .gpu_broker import GpuBrokerConflict, GpuBrokerLease
 
 LOG = logging.getLogger("zh_asr.dictation")
+HOTKEY_LABEL = "Win+H / Ctrl+Win+H"
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,16 @@ class DictationSettings:
     max_chunk_sec: float = 20
     input_device: str | int | None = None
     hotwords: str = ""
+
+    def with_preferences(self) -> "DictationSettings":
+        try:
+            value = json.loads(preferences_path().read_text(encoding="utf-8"))
+            selected = value["input_device"]
+            if selected is None or isinstance(selected, str):
+                return replace(self, input_device=selected)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return self
 
     @classmethod
     def load(cls, path: Path | None = None) -> "DictationSettings":
@@ -46,6 +57,18 @@ class DictationSettings:
         if not 3 <= settings.max_chunk_sec <= 30:
             raise ValueError("max_chunk_sec must be between 3 and 30.")
         return settings
+
+
+def preferences_path() -> Path:
+    return project_root() / "outputs" / "dictation" / "preferences.json"
+
+
+def save_microphone_preference(value: str | None) -> None:
+    path = preferences_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_suffix(".tmp")
+    pending.write_text(json.dumps({"input_device": value}, ensure_ascii=False), encoding="utf-8")
+    pending.replace(path)
 
 
 class PauseSegmenter:
@@ -173,6 +196,34 @@ class QwenDictationEngine:
                  len(audio) / self.settings.sample_rate, time.perf_counter() - started, len(text))
         return to_simplified(text)
 
+    def warmup(self) -> None:
+        self.activate()
+        limit = self.wrapper.model.max_new_tokens
+        try:
+            self.wrapper.model.max_new_tokens = 1
+            self.transcribe(np.zeros(self.settings.sample_rate // 2, dtype=np.float32))
+        finally:
+            self.wrapper.model.max_new_tokens = limit
+
+    def dispose(self) -> None:
+        """Quit directly, without copying GPU weights back to RAM first."""
+        lease, self.lease = self.lease, None
+        had_model = self.wrapper is not None
+        self.wrapper = None
+        try:
+            if had_model:
+                import torch
+                # CPU-resident weights need no full-heap GC before process exit.
+                # A live GPU lease does: free any cycles before admitting another job.
+                if lease is not None:
+                    import gc
+                    gc.collect()
+                if torch.cuda.is_initialized():
+                    torch.cuda.empty_cache()
+        finally:
+            if lease is not None:
+                lease.__exit__(None, None, None)
+
     def park(self) -> None:
         lease, self.lease = self.lease, None
         if lease is None:
@@ -202,69 +253,139 @@ class Recording:
     text: str = ""
     insertion_failed: bool = False
     error: str = ""
+    settings: DictationSettings | None = None
+    segmenter: PauseSegmenter | None = None
+    stream: object = None
+    submitted: bool = False
+    audio_lock: threading.Lock = field(default_factory=threading.Lock)
+    capture_finished: threading.Event = field(default_factory=threading.Event)
+    recognition_finished: threading.Event = field(default_factory=threading.Event)
 
 
 class DictationController:
+    """The UI never waits for a driver, model load, inference or GPU cleanup."""
+
     def __init__(self, host, settings: DictationSettings, engine=None):
         self.host = host
         self.settings = settings
         self.engine = engine or QwenDictationEngine(settings)
         self.commands: queue.Queue = queue.Queue()
+        self.audio_commands: queue.Queue = queue.Queue()
         self.recording: Recording | None = None
-        self.stream = None
-        self.segmenter: PauseSegmenter | None = None
-        self.audio_lock = threading.Lock()
         self.quit_event = threading.Event()
         self.initialization_failed = False
+        self.pending_start = False
         self.worker = threading.Thread(target=self._worker, name="dictation-asr", daemon=True)
+        self.audio_worker = threading.Thread(target=self._audio_worker, name="dictation-audio", daemon=True)
 
     def start(self) -> None:
-        self.host.show("正在准备语音输入", "首次加载模型；Win+H 可开始录音")
+        self.host.show("正在准备模型", "可以先录音，准备完成后自动转写")
+        self.audio_worker.start()
+        self.audio_commands.put(("devices", False))
         self.worker.start()
 
     def toggle(self) -> None:
-        if self.initialization_failed:
-            self.host.show("语音模型尚未就绪", "从托盘退出后重启语音输入", error=True)
+        LOG.info("dictation toggle received")
+        target = self.host.capture_target()  # Capture before any window can take focus.
+        self.host.open_panel()
+        if self.quit_event.is_set():
             return
-        if self.recording:
+        if self.initialization_failed:
+            self.host.show("模型加载失败", "从托盘退出后重新启动", error=True)
+            return
+        if self.recording is not None:
             if not self.recording.stopped.is_set():
+                self.pending_start = False
                 self.stop()
             else:
-                self.host.show("正在完成转写", "请稍候，Esc 可取消")
+                self.pending_start = not self.pending_start
+                self.host.show("准备继续录音" if self.pending_start else "已暂停", "正在完成上一段" if self.pending_start else "点击麦克风继续")
             return
-        from .dictation_audio import open_microphone
-        recording = Recording(self.host.capture_target(), queue.Queue(),
-                              threading.Event(), threading.Event())
-        self.segmenter = PauseSegmenter(self.settings)
+        self._begin_recording(target)
+
+    def _begin_recording(self, target=None) -> None:
+        if self.quit_event.is_set():
+            return
+        recording = Recording(target or self.host.capture_target(), queue.Queue(),
+                              threading.Event(), threading.Event(), settings=self.settings,
+                              segmenter=PauseSegmenter(self.settings))
         self.recording = recording
         self.host.set_busy(True)
-        try:
-            self.stream = open_microphone(self.settings, self._audio_callback)
-        except Exception as exc:
-            if self.stream:
-                self.stream.close()
-                self.stream = None
-            self.recording = None
-            self.host.set_busy(False)
-            LOG.error("microphone failed: %s", type(exc).__name__)
-            selected = self.settings.input_device or "Windows 默认麦克风"
-            self.host.show("麦克风无法打开", f"请连接 {selected}，再按 Win+H 重试", error=True)
-            return
-        self.commands.put(recording)
-        self.host.show("正在聆听", "Win+H 结束 · Esc 取消", recording=True)
+        self.host.show("正在打开麦克风", "再次按快捷键或按钮可暂停")
+        self.audio_commands.put(("open", recording))
 
-    def _audio_callback(self, data, frames, time_info, status) -> None:
-        with self.audio_lock:
-            recording = self.recording
-            if recording is None or recording.stopped.is_set():
+    def _audio_worker(self) -> None:
+        from .dictation_audio import list_microphones, open_microphone
+        while True:
+            command = self.audio_commands.get()
+            if command is None:
+                return
+            action, value = command
+            if action == "devices":
+                try:
+                    options = list_microphones(refresh=bool(value))
+                    self.host.post_to_ui(lambda options=options: self.host.set_microphones(options, self.settings.input_device))
+                except Exception:
+                    LOG.exception("microphone enumeration failed")
+                continue
+            recording = value
+            if action == "open":
+                if recording.stopped.is_set() or self.quit_event.is_set():
+                    self._close_capture(recording)
+                    continue
+                try:
+                    recording.stream = open_microphone(
+                        recording.settings,
+                        lambda data, frames, timing, status, r=recording: self._audio_callback(r, data, status))
+                    if recording.stopped.is_set() or self.quit_event.is_set():
+                        self._close_capture(recording)
+                        continue
+                    recording.submitted = True
+                    self.commands.put(recording)
+                    self.host.post_to_ui(lambda r=recording: self._capture_started(r))
+                except Exception:
+                    LOG.exception("microphone open failed")
+                    recording.error = "请连接所选麦克风，或在下方选择其他设备"
+                    recording.cancelled.set()
+                    recording.stopped.set()
+                    self._close_capture(recording)
+            elif action == "close":
+                self._close_capture(recording)
+
+    def _capture_started(self, recording: Recording) -> None:
+        if self.recording is recording and not recording.stopped.is_set() and not self.quit_event.is_set():
+            self.host.show("正在聆听", "点击麦克风或快捷键暂停", recording=True)
+
+    def _close_capture(self, recording: Recording) -> None:
+        # All PortAudio open/close/enumeration runs on this one audio thread.
+        stream, recording.stream = recording.stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                recording.error = "麦克风连接已中断，请重新连接或选择其他设备"
+                recording.cancelled.set()
+                LOG.exception("microphone stop failed")
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    LOG.exception("microphone close failed")
+        recording.capture_finished.set()
+        if not recording.submitted:
+            recording.recognition_finished.set()
+        self.host.post_to_ui(lambda r=recording: self._recording_finished(r))
+
+    def _audio_callback(self, recording: Recording, data, status) -> None:
+        with recording.audio_lock:
+            if recording.stopped.is_set() or recording.cancelled.is_set():
                 return
             if status:
-                # Missing microphone samples must not be reported as a clean transcript.
                 recording.cancelled.set()
-                recording.error = "麦克风采集发生丢帧，请检查默认输入设备后重试"
-                LOG.warning("microphone buffer status: %s", status)
+                recording.error = "录音发生丢帧，请重新连接或选择其他麦克风"
+                self.host.post_to_ui(lambda: self.stop(cancel=True))
                 return
-            for chunk in self.segmenter.feed(data[:, 0]):
+            for chunk in recording.segmenter.feed(data[:, 0]):
                 recording.chunks.put(chunk)
 
     def stop(self, cancel: bool = False) -> None:
@@ -273,100 +394,132 @@ class DictationController:
             return
         if cancel:
             recording.cancelled.set()
-        try:
-            self._close_stream()
-        except Exception:
-            recording.cancelled.set()
-            recording.error = "麦克风连接已中断，请连接设备后重试"
-            LOG.exception("microphone stop failed")
-        with self.audio_lock:
+        with recording.audio_lock:
             if not recording.stopped.is_set():
-                recording.stopped.set()
-                tail = self.segmenter.flush()
+                recording.stopped.set()  # Stop accepting samples before touching a driver.
+                tail = recording.segmenter.flush() if recording.segmenter is not None else None
                 if tail is not None and not cancel:
                     recording.chunks.put(tail)
                 recording.chunks.put(None)
-        self.host.show("正在结束" if cancel else "正在完成转写", "已停止麦克风", recording=False)
-
-    def _close_stream(self) -> None:
-        # UI cancellation and the inference worker can finish simultaneously.
-        # Only one thread takes responsibility for closing the PortAudio stream.
-        with self.audio_lock:
-            stream, self.stream = self.stream, None
-        if stream is not None:
-            try:
-                stream.stop()
-            finally:
-                stream.close()
+                self.audio_commands.put(("close", recording))
+        self.host.show("已暂停", "点击麦克风或快捷键继续")
 
     def cancel(self) -> None:
+        self.pending_start = False
         self.stop(cancel=True)
 
+    def hide(self) -> None:
+        self.host.hide_panel()
+        self.cancel()
+
+    def select_microphone(self, value: str | None) -> None:
+        self.pending_start = False
+        self.stop()  # Complete the old device's last phrase; apply only to the next session.
+        self.settings = replace(self.settings, input_device=value)
+        try:
+            save_microphone_preference(value)
+        except OSError:
+            LOG.exception("microphone preference save failed")
+        self.host.show("麦克风已切换", "点击麦克风开始录音")
+        self.audio_commands.put(("devices", True))
+
+    def refresh_devices(self) -> None:
+        self.pending_start = False
+        self.stop()
+        self.audio_commands.put(("devices", True))
+
+    def _recording_finished(self, recording: Recording) -> None:
+        if not (recording.capture_finished.is_set() and recording.recognition_finished.is_set()):
+            return
+        if self.recording is not recording:
+            return
+        self.recording = None
+        self.host.set_busy(False)
+        if recording.error:
+            self.host.show("暂时无法听写", recording.error, error=True)
+        if self.pending_start and not self.quit_event.is_set():
+            self.pending_start = False
+            self._begin_recording()
+
     def close(self) -> None:
+        if self.quit_event.is_set():
+            return
+        self.host.hide_panel()  # Disappear now; cleanup must never hold a panel on screen.
+        self.pending_start = False
         self.stop(cancel=True)
         self.quit_event.set()
         self.commands.put(None)
-        # The UI stays responsive; the worker parks the GPU before exiting.
-        self.host.show("正在退出", "正在释放语音模型")
-        threading.Thread(target=self._finish_close, daemon=True).start()
+        self.audio_commands.put(None)
+        threading.Thread(target=self._finish_close, name="dictation-close", daemon=True).start()
 
     def _finish_close(self) -> None:
-        self.worker.join(timeout=30)
+        self.worker.join(timeout=20)
+        self.audio_worker.join(timeout=3)
         self.host.close()
 
     def _worker(self) -> None:
         try:
+            started = time.perf_counter()
             self.engine.load()
+            LOG.info("model loaded seconds=%.3f", time.perf_counter() - started)
+            if self.quit_event.is_set():
+                return
             try:
-                self.engine.activate()
-                self.engine.transcribe(np.zeros(self.settings.sample_rate // 2, dtype=np.float32))
+                self.engine.warmup()
             except GpuBrokerConflict:
-                pass  # Prewarming is optional when another local task owns the GPU.
+                pass
             except Exception:
-                LOG.exception("optional GPU prewarm failed; dictation can retry")
+                LOG.exception("optional prewarm failed")
             finally:
-                try:
-                    self.engine.park()
-                except Exception:
-                    LOG.exception("optional prewarm cleanup failed; dictation can retry")
+                if not self.quit_event.is_set():
+                    try:
+                        self.engine.park()
+                    except Exception:
+                        LOG.exception("optional prewarm cleanup failed")
             LOG.info("ready engine=%s; idle weights in RAM", self.settings.engine)
             if self.recording is None:
-                self.host.show("语音输入已就绪", "在输入框按 Win+H 开始")
+                self.host.show("准备就绪", "快捷键唤出即可录音")
             while not self.quit_event.is_set():
                 recording = self.commands.get()
                 if recording is None:
                     break
                 try:
                     self._recognize(recording)
-                except Exception as exc:
+                except Exception:
                     LOG.exception("dictation session failed")
                     recording.cancelled.set()
-                    self.host.show("语音输入暂时失败", "可重新按 Win+H；详情见本地运行日志", error=True)
+                    recording.error = "转写暂时失败，可重新开始"
                 finally:
+                    if not recording.stopped.is_set():
+                        self.host.post_to_ui(lambda: self.stop(cancel=True))
                     try:
-                        self.engine.park()
+                        if self.quit_event.is_set():
+                            self.engine.dispose()
+                        else:
+                            self.engine.park()
                     except Exception:
-                        LOG.exception("GPU park failed")
-                    # Usually already stopped by the UI. Error/overflow can end early.
-                    try:
-                        self._close_stream()
-                    except Exception:
-                        LOG.exception("microphone cleanup failed")
-                    self.recording = None
-                    self.host.set_busy(False)
+                        LOG.exception("GPU cleanup failed")
+                    recording.recognition_finished.set()
+                    self.host.post_to_ui(lambda r=recording: self._recording_finished(r))
         except Exception:
             self.initialization_failed = True
             LOG.exception("dictation initialization failed")
-            self.stop(cancel=True)
-            self.recording = None
-            self.host.set_busy(False)
-            self.host.show("语音模型加载失败", "请从托盘退出后重启语音输入；详情见本地运行日志", error=True)
+            self.host.post_to_ui(self._model_failed)
         finally:
+            started = time.perf_counter()
             try:
-                self.engine.park()
+                self.engine.dispose()
             except Exception:
                 LOG.exception("GPU release failed")
-            LOG.info("dictation worker stopped")
+            LOG.info("dictation worker stopped; dispose_seconds=%.3f", time.perf_counter() - started)
+
+    def _model_failed(self) -> None:
+        self.cancel()
+        if self.recording is not None:
+            self.recording.recognition_finished.set()
+            self._recording_finished(self.recording)
+        self.host.set_busy(False)
+        self.host.show("语音模型加载失败", "请从托盘退出后重启", error=True)
 
     def _recognize(self, recording: Recording) -> None:
         while not recording.cancelled.is_set() and not self.quit_event.is_set():
@@ -374,7 +527,7 @@ class DictationController:
                 self.engine.activate()
                 break
             except GpuBrokerConflict:
-                self.host.show("等待本地 GPU", "录音已保留在内存中；Esc 可取消",
+                self.host.show("等待 GPU", "录音仍在内存中，Esc 可取消",
                                recording=not recording.stopped.is_set())
                 recording.cancelled.wait(0.3)
         while not recording.cancelled.is_set() and not self.quit_event.is_set():
@@ -385,30 +538,27 @@ class DictationController:
             if audio is None:
                 break
             text = self.engine.transcribe(audio)
-            if recording.cancelled.is_set():
+            if recording.cancelled.is_set() or self.quit_event.is_set():
                 break
             if not text:
                 continue
             recording.text += text
             self.host.set_last_text(recording.text)
-            # Never inject late text into a newly focused app or input control.
             if not recording.insertion_failed:
                 recording.insertion_failed = not self.host.insert_text(text, recording.target)
             if recording.insertion_failed:
-                self.host.show("输入位置已改变", recording.text, error=True,
+                self.host.show("输入位置已改变", "可从托盘复制最近文字", error=True,
                                recording=not recording.stopped.is_set())
             elif not recording.stopped.is_set():
-                self.host.show("正在聆听", "Win+H 结束 · Esc 取消", recording=True)
+                self.host.show("正在聆听", "点击麦克风或快捷键暂停", recording=True)
         if recording.error:
             self.host.show("录音未能完整采集", recording.error, error=True)
         elif recording.cancelled.is_set():
-            self.host.show("已取消", "已输入的文字保留在输入框中")
+            self.host.show("已暂停", "已输入的文字保留")
         elif recording.insertion_failed:
-            self.host.show("文字已识别，未继续输入", recording.text, error=True)
-        elif recording.text:
-            self.host.show("已输入", "Win+H 可继续；文字不会自动发送")
+            self.host.show("已暂停", "可从托盘复制最近文字", error=True)
         else:
-            self.host.show("没有识别到可输入的文字", "靠近麦克风后按 Win+H 重试")
+            self.host.show("已暂停", "点击麦克风或快捷键继续")
 
 
 def configure_logging() -> None:
@@ -436,7 +586,7 @@ def main(argv=None) -> int:
         import sounddevice as sd
         print(sd.query_devices())
         return 0
-    settings = DictationSettings.load(args.config)
+    settings = DictationSettings.load(args.config).with_preferences()
     # pythonw has no console streams. Dependencies must not crash writing progress.
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w")
@@ -472,7 +622,10 @@ def main(argv=None) -> int:
     controller = None
     host = WindowsHost(on_toggle=lambda: controller.toggle(),
                        on_cancel=lambda: controller.cancel(),
-                       on_quit=lambda: controller.close())
+                       on_quit=lambda: controller.close(),
+                       on_hide=lambda: controller.hide(),
+                       on_device_change=lambda value: controller.select_microphone(value),
+                       on_refresh_devices=lambda: controller.refresh_devices())
     if not host.acquire_single_instance():
         host.close()
         return 0
