@@ -43,6 +43,7 @@ from .speaker_evidence import (
     write_self_speaker_evidence,
 )
 from .service import CALLER_BINDING_ENV, serve_api
+from .transcript_readback import read_transcript_readback
 
 
 _GPU_LEASE_AUTHENTICATED = contextvars.ContextVar(
@@ -104,6 +105,18 @@ def main(argv: list[str] | None = None) -> int:
     long_cmd.add_argument("--chunk-sec", type=int, default=300)
     long_cmd.add_argument("--overlap-sec", type=int, default=1)
     long_cmd.add_argument("--force", action="store_true")
+
+    readback = subparsers.add_parser(
+        "transcript-readback",
+        help="Read an existing hash-bound transcript without loading an ASR model.",
+    )
+    readback.add_argument("--audio-sha256", required=True)
+    readback.add_argument(
+        "--jobs-snapshot",
+        type=Path,
+        default=Path("outputs") / "api" / "jobs.json",
+        help="Owner-managed jobs snapshot; only its referenced result artifacts are read.",
+    )
 
     batch = subparsers.add_parser("batch", help="Transcribe every supported audio file in a folder.")
     batch.add_argument("input_dir", type=Path)
@@ -352,6 +365,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"Failed: {summary.failed}"
             )
             return 1 if summary.failed else 0
+        if args.command == "transcript-readback":
+            payload = read_transcript_readback(
+                args.audio_sha256,
+                jobs_snapshot=args.jobs_snapshot,
+            )
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 2 if payload.get("status") == "invalid_request" else 0
         if args.command == "batch":
             summary = _run_with_gpu_lease(
                 args.device,

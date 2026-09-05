@@ -90,6 +90,31 @@ cd <repo-root>
 .\scripts\transcribe-folder.ps1 -InputDir C:\path\to\audio-folder
 ```
 
+### 已有转写的哈希回读
+
+需要让媒体检索复用已经存在的转写和时间段时，可以按原音频 SHA-256 只读回读 owner（归属方）管理的任务快照：
+
+```powershell
+.\.venv\Scripts\python.exe -B -m zh_asr transcript-readback `
+  --audio-sha256 <64-hex-source-sha256> `
+  --jobs-snapshot .\outputs\api\jobs.json
+```
+
+该命令只读取 `jobs.json` 和其中明确引用的结果文件，不读取原音频，不启动服务或模型，不创建数据库、缓存或新结果。
+它同时核对 `job.request.audio_sha256`、objective sidecar（目标结果旁路文件）的 `audio.raw_sha256` 与
+`idempotency_basis.source_audio_sha256`，确认处理已完成，并按 sidecar 声明的路径、字节数和 SHA-256 核对实际解析的 raw artifact（原始结果文件）字节。
+
+机器结果的顶层字段为 `schema`、`status`、`source_audio_sha256`、`segments`、`artifact`、`quality`、
+`coverage`、`evidence_status` 和 `lookup_scope`。有可用时间段时，`status=ok`，每个 `segments` 项至少包含
+`start_ms`、`end_ms`、`text`、`speaker`、`timestamp_granularity` 和 `raw_path`；raw 结果明确提供的细粒度
+`timestamp` 数组只有在有效且位于该片段内时才保留。`quality`、`coverage` 和 `evidence_status` 只做保守投影，不把
+`coverage.status=complete` 自动改成完整覆盖。
+
+没有保留任务、结果完整性校验失败或匹配转写没有有效时间段时，命令返回 `status=not_found` 或 `status=gap`，
+并在 `gap.code` 给出原因，不猜测时间。仍在处理的任务会返回其 ID，应继续该任务而非重复提交。重复源哈希按时间段可用性、证据、质量、覆盖和段数确定性取优，任务新旧
+本身不被当作质量证明。Paraformer 的 `sentence_info` 是当前明确支持的逐句时间和匿名说话人结构；其他引擎只有
+在 raw 结构明确提供有效时间段时才会被回读。
+
 固定端到端 smoke：
 
 ```powershell
