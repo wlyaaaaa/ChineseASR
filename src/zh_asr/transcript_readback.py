@@ -515,8 +515,9 @@ def _cloud_chunk_coverage(
     return {
         "status": "partial",
         "complete": False,
-        "basis": "cloud_chunk_ranges_not_sentence_timestamps",
+        "basis": "cloud_chunk_ranges",
         "original_audio_coverage_verified": False,
+        "partial_reason": "original_audio_duration_not_bound_by_cloud_result",
         "start_ms": merged[0][0],
         "end_ms": merged[-1][1],
         "intervals_ms": merged,

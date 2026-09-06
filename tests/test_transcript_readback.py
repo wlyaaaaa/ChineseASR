@@ -269,6 +269,11 @@ class TranscriptReadbackTests(unittest.TestCase):
         self.assertFalse(payload["quality"]["accuracy_certified"])
         self.assertEqual(payload["coverage"]["status"], "partial")
         self.assertFalse(payload["coverage"]["complete"])
+        self.assertEqual(payload["coverage"]["basis"], "cloud_chunk_ranges")
+        self.assertEqual(
+            payload["coverage"]["partial_reason"],
+            "original_audio_duration_not_bound_by_cloud_result",
+        )
         self.assertEqual(payload["coverage"]["overlap_ms"], 1_000)
         self.assertEqual(payload["lookup_scope"]["matching_cloud_results"], 1)
         self.assertFalse(payload["lookup_scope"]["original_audio_read"])
