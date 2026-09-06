@@ -103,6 +103,53 @@ class TranscriptReadbackTests(unittest.TestCase):
         )
         return snapshot, digest, raw, objective_path
 
+    def _write_cloud_result(
+        self,
+        root: Path,
+        source_hash: str,
+        *,
+        important_only: bool = False,
+        chunks: list[dict[str, object]] | None = None,
+    ) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        if chunks is None:
+            chunks = [
+                {
+                    "index": 1,
+                    "start_ms": 0,
+                    "end_ms": 180_000,
+                    "audio_sha256": "a" * 64,
+                    "provider_request_id": "request-1",
+                    "text": "派出所第一段。",
+                },
+                {
+                    "index": 2,
+                    "start_ms": 179_000,
+                    "end_ms": 240_000,
+                    "audio_sha256": "b" * 64,
+                    "provider_request_id": "request-2",
+                    "text": "派出所第二段。",
+                },
+            ]
+        result = {
+            "schema": "chineseasr.qwen-audio3-quality-review-result.v1",
+            "job_id": "00000000-0000-4000-8000-000000000002",
+            "model": "qwen-audio-3.0-asr-flash",
+            "provider": "aliyun-bailian",
+            "provider_endpoint": "https://example.invalid/cloud-asr",
+            "purpose": "quality_review",
+            "important_only": important_only,
+            "status": "succeeded",
+            "credential_result": "Success",
+            "cloud_upload_performed": True,
+            "source_audio_sha256": source_hash,
+            "source_audio_bytes": 12_345,
+            "chunks": chunks,
+        }
+        path = root / "cloud-job.result.json"
+        path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        return path
+
     def test_readback_returns_verified_hash_and_timestamped_segments(self):
         from zh_asr.transcript_readback import read_transcript_readback
 
@@ -193,6 +240,105 @@ class TranscriptReadbackTests(unittest.TestCase):
         self.assertEqual(payload["coverage"]["status"], "partial")
         self.assertFalse(payload["coverage"]["complete"])
         self.assertEqual(payload["coverage"]["gap_ms"], 250)
+
+    def test_hash_bound_cloud_result_exposes_only_chunk_precision(self):
+        from zh_asr.transcript_readback import read_transcript_readback
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_hash = hashlib.sha256(b"selected cloud source").hexdigest()
+            snapshot = root / "jobs.json"
+            snapshot.write_text(json.dumps({"jobs": []}), encoding="utf-8")
+            cloud_root = root / "cloud-jobs"
+            cloud_path = self._write_cloud_result(cloud_root, source_hash)
+            cloud_hash = hashlib.sha256(cloud_path.read_bytes()).hexdigest()
+            payload = read_transcript_readback(
+                source_hash,
+                snapshot,
+                cloud_results_root=cloud_root,
+            )
+
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["artifact"]["job_id"], "00000000-0000-4000-8000-000000000002")
+        self.assertEqual(payload["artifact"]["raw_json"]["sha256"], cloud_hash)
+        self.assertEqual(payload["artifact"]["cloud_result"]["purpose"], "quality_review")
+        self.assertFalse(payload["artifact"]["cloud_result"]["important_only"])
+        self.assertEqual([item["timestamp_granularity"] for item in payload["segments"]], ["chunk", "chunk"])
+        self.assertEqual([(item["start_ms"], item["end_ms"]) for item in payload["segments"]], [(0, 180_000), (179_000, 240_000)])
+        self.assertEqual(payload["quality"]["status"], "unknown")
+        self.assertFalse(payload["quality"]["accuracy_certified"])
+        self.assertEqual(payload["coverage"]["status"], "partial")
+        self.assertFalse(payload["coverage"]["complete"])
+        self.assertEqual(payload["coverage"]["overlap_ms"], 1_000)
+        self.assertEqual(payload["lookup_scope"]["matching_cloud_results"], 1)
+        self.assertFalse(payload["lookup_scope"]["original_audio_read"])
+        self.assertFalse(payload["lookup_scope"]["model_run"])
+
+    def test_cloud_quality_result_with_importance_label_is_rejected(self):
+        from zh_asr.transcript_readback import read_transcript_readback
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_hash = hashlib.sha256(b"mislabeled cloud source").hexdigest()
+            snapshot = root / "jobs.json"
+            snapshot.write_text(json.dumps({"jobs": []}), encoding="utf-8")
+            cloud_root = root / "cloud-jobs"
+            self._write_cloud_result(cloud_root, source_hash, important_only=True)
+            payload = read_transcript_readback(
+                source_hash,
+                snapshot,
+                cloud_results_root=cloud_root,
+            )
+
+        self.assertEqual(payload["status"], "gap")
+        self.assertEqual(payload["gap"]["code"], "no_valid_transcript_artifact")
+        self.assertIn(
+            "cloud_result_purpose_invalid",
+            {item["reason"] for item in payload["lookup_scope"]["rejections"]},
+        )
+
+    def test_known_quality_local_result_is_preferred_over_cloud_result(self):
+        from zh_asr.transcript_readback import read_transcript_readback
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot, source_hash, _raw, _objective = self._write_bundle(root)
+            cloud_root = root / "cloud-jobs"
+            self._write_cloud_result(cloud_root, source_hash)
+            payload = read_transcript_readback(
+                source_hash,
+                snapshot,
+                cloud_results_root=cloud_root,
+            )
+
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["artifact"]["job_id"], "job-1")
+        self.assertNotEqual(payload["artifact"]["raw_artifact_role"], "cloud_result")
+
+    def test_local_segment_precision_beats_same_quality_cloud_chunks(self):
+        from zh_asr.transcript_readback import read_transcript_readback
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot, source_hash, _raw, _objective = self._write_bundle(
+                root,
+                raw_payload={
+                    "segments": [{"start": 100, "end": 250, "text": "本地片段"}]
+                },
+                quality_status="unknown",
+                coverage_status="partial",
+            )
+            cloud_root = root / "cloud-jobs"
+            self._write_cloud_result(cloud_root, source_hash)
+            payload = read_transcript_readback(
+                source_hash,
+                snapshot,
+                cloud_results_root=cloud_root,
+            )
+
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["artifact"]["job_id"], "job-1")
+        self.assertEqual(payload["segments"][0]["timestamp_granularity"], "segment")
 
     def test_duplicate_hash_prefers_quality_and_coverage_over_job_freshness(self):
         from zh_asr.audio_outcome import build_objective_result

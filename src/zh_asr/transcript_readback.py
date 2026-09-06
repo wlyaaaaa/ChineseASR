@@ -1,10 +1,9 @@
 """Read existing hash-bound ASR artifacts without running a model.
 
-The readback route intentionally consumes only the persisted job snapshot and
-the result files named by those jobs.  It never opens the source audio.  This
-keeps the media consumer independent from an ASR runtime while still allowing
-the owner to verify that a returned transcript belongs to the requested source
-bytes.
+The readback route consumes the persisted local-job snapshot and retained
+cloud-result artifacts.  It never opens the source audio.  This keeps the
+media consumer independent from an ASR runtime while still allowing the owner
+to verify that a returned transcript claims the requested source bytes.
 """
 
 from __future__ import annotations
@@ -25,11 +24,17 @@ READBACK_SCHEMA = "chinese-asr.transcript-readback.v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 _RAW_OUTPUT_KEYS = ("raw_json", "primary_raw_json", "secondary_raw_json")
 _MAX_REJECTIONS = 32
+_DEFAULT_CLOUD_RESULTS_ROOT = Path("outputs") / "cloud-jobs"
+_CLOUD_RESULT_PURPOSES = {
+    "chineseasr.qwen-audio3-important-result.v1": ("important_evidence", True),
+    "chineseasr.qwen-audio3-quality-review-result.v1": ("quality_review", False),
+}
 
 
 def read_transcript_readback(
     audio_sha256: str,
     jobs_snapshot: Path | str = Path("outputs") / "api" / "jobs.json",
+    cloud_results_root: Path | str = _DEFAULT_CLOUD_RESULTS_ROOT,
 ) -> dict[str, Any]:
     """Read the best existing transcript bundle for one source hash.
 
@@ -50,12 +55,17 @@ def read_transcript_readback(
         )
 
     snapshot = Path(jobs_snapshot).expanduser().resolve()
+    cloud_root = Path(cloud_results_root).expanduser().resolve()
     lookup_scope: dict[str, Any] = {
-        "kind": "jobs_snapshot_and_referenced_artifacts",
+        "kind": "jobs_snapshot_and_cloud_result_artifacts",
         "jobs_snapshot": str(snapshot),
         "jobs_examined": 0,
         "matching_jobs": 0,
         "artifact_candidates_examined": 0,
+        "cloud_results_root": str(cloud_root),
+        "cloud_result_files_examined": 0,
+        "matching_cloud_results": 0,
+        "cloud_result_candidates_examined": 0,
         "valid_candidates": 0,
         "rejected_candidates": 0,
         "original_audio_read": False,
@@ -153,6 +163,14 @@ def read_transcript_readback(
             else:
                 _record_rejection(rejected, job_id, reason, output_key)
 
+    cloud_candidates, cloud_rejections, cloud_scope = _read_cloud_result_candidates(
+        cloud_root,
+        requested_hash,
+    )
+    valid_candidates.extend(cloud_candidates)
+    rejected.extend(cloud_rejections)
+    lookup_scope.update(cloud_scope)
+
     lookup_scope["valid_candidates"] = len(valid_candidates)
     lookup_scope["rejected_candidates"] = len(rejected)
     if rejected:
@@ -162,13 +180,16 @@ def read_transcript_readback(
         lookup_scope["pending_jobs"] = pending_jobs[:_MAX_REJECTIONS]
 
     if not valid_candidates:
-        if lookup_scope["matching_jobs"] == 0:
+        if (
+            lookup_scope["matching_jobs"] == 0
+            and lookup_scope["matching_cloud_results"] == 0
+        ):
             return _response(
                 status="not_found",
                 source_audio_sha256=requested_hash,
                 gap={
                     "code": "source_hash_not_in_jobs_snapshot",
-                    "message": "No retained job in the owner snapshot carries this source hash.",
+                    "message": "No retained local job or cloud result carries this source hash.",
                 },
                 lookup_scope=lookup_scope,
             )
@@ -283,6 +304,226 @@ def _raw_output_values(outputs: Mapping[str, Any]) -> list[tuple[str, str]]:
         seen.add(normalized)
         values.append((key, value))
     return values
+
+
+def _read_cloud_result_candidates(
+    cloud_root: Path,
+    requested_hash: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, int]]:
+    candidates: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    scope = {
+        "cloud_result_files_examined": 0,
+        "matching_cloud_results": 0,
+        "cloud_result_candidates_examined": 0,
+    }
+    try:
+        paths = sorted(cloud_root.glob("*.result.json"), key=lambda path: path.name.casefold())
+    except OSError:
+        return candidates, rejected, scope
+
+    for result_path in paths:
+        if not result_path.is_file():
+            continue
+        scope["cloud_result_files_examined"] += 1
+        candidate, matches_source, reason = _inspect_cloud_result_candidate(
+            result_path,
+            requested_hash,
+        )
+        if not matches_source:
+            continue
+        scope["matching_cloud_results"] += 1
+        scope["cloud_result_candidates_examined"] += 1
+        if candidate is not None:
+            candidates.append(candidate)
+        else:
+            _record_rejection(
+                rejected,
+                result_path.name.removesuffix(".result.json"),
+                reason,
+                "cloud_result",
+            )
+    return candidates, rejected, scope
+
+
+def _inspect_cloud_result_candidate(
+    result_path: Path,
+    requested_hash: str,
+) -> tuple[dict[str, Any] | None, bool, str]:
+    try:
+        result_bytes = result_path.read_bytes()
+        result = json.loads(result_bytes)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, False, ""
+    if not isinstance(result, Mapping):
+        return None, False, ""
+
+    source_hash = str(result.get("source_audio_sha256") or "").strip().lower()
+    if source_hash != requested_hash:
+        return None, False, ""
+
+    expected = _CLOUD_RESULT_PURPOSES.get(str(result.get("schema") or ""))
+    if expected is None:
+        return None, True, "cloud_result_schema_invalid"
+    expected_purpose, expected_important_only = expected
+    if (
+        result.get("status") != "succeeded"
+        or result.get("credential_result") != "Success"
+        or result.get("cloud_upload_performed") is not True
+    ):
+        return None, True, "cloud_result_not_succeeded"
+    if (
+        result.get("purpose") != expected_purpose
+        or result.get("important_only") is not expected_important_only
+    ):
+        return None, True, "cloud_result_purpose_invalid"
+    job_id = str(result.get("job_id") or "").strip()
+    model = str(result.get("model") or "").strip()
+    provider = str(result.get("provider") or "").strip()
+    source_bytes = result.get("source_audio_bytes")
+    if not job_id or not model or not provider or type(source_bytes) is not int or source_bytes <= 0:
+        return None, True, "cloud_result_identity_invalid"
+
+    chunks = result.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        return None, True, "cloud_result_chunks_missing"
+    segments, chunk_metadata, coverage = _normalize_cloud_chunks(chunks)
+    if segments is None:
+        return None, True, "cloud_result_chunks_invalid"
+
+    result_hash = hashlib.sha256(result_bytes).hexdigest()
+    artifact = {
+        "job_id": job_id,
+        "engine": model,
+        "mode": expected_purpose,
+        "raw_artifact_role": "cloud_result",
+        "raw_json": {
+            "path": str(result_path),
+            "sha256": result_hash,
+            "size_bytes": len(result_bytes),
+        },
+        "cloud_result": {
+            "schema": str(result["schema"]),
+            "provider": provider,
+            "provider_endpoint": str(result.get("provider_endpoint") or ""),
+            "purpose": expected_purpose,
+            "important_only": expected_important_only,
+            "credential_result": "Success",
+            "cloud_upload_performed": True,
+            "source_audio_bytes": source_bytes,
+            "chunks": chunk_metadata,
+        },
+    }
+    return (
+        {
+            "job_id": job_id,
+            "engine": model,
+            "segments": segments,
+            "total_segments": len(chunks),
+            "timed_segments": len(segments),
+            "quality": {
+                "status": "unknown",
+                "basis": "cloud_result_not_accuracy_certified",
+                "accuracy_certified": False,
+            },
+            "coverage": coverage,
+            "evidence_status": "not_applicable",
+            "objective_outcome": "indeterminate",
+            "artifact": artifact,
+            "selection_reason": (
+                "Selected a retained cloud result whose declared source hash matches the requested audio; "
+                "its ranges are cloud chunks, not sentence timestamps, and cloud provenance is not an accuracy preference."
+            ),
+        },
+        True,
+        "",
+    )
+
+
+def _normalize_cloud_chunks(
+    chunks: list[Any],
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]], dict[str, Any]]:
+    indexed: list[tuple[int, int | float, int | float, dict[str, Any], dict[str, Any]]] = []
+    seen_indexes: set[int] = set()
+    for position, value in enumerate(chunks):
+        if not isinstance(value, Mapping):
+            return None, [], {}
+        index = value.get("index")
+        start = _valid_ms(value.get("start_ms"))
+        end = _valid_ms(value.get("end_ms"))
+        text = value.get("text")
+        chunk_hash = str(value.get("audio_sha256") or "").strip().lower()
+        provider_request_id = str(value.get("provider_request_id") or "").strip()
+        if (
+            type(index) is not int
+            or index < 1
+            or index in seen_indexes
+            or start is None
+            or end is None
+            or end <= start
+            or not isinstance(text, str)
+            or not text.strip()
+            or not _SHA256_RE.fullmatch(chunk_hash)
+            or not provider_request_id
+        ):
+            return None, [], {}
+        seen_indexes.add(index)
+        segment = {
+            "start_ms": start,
+            "end_ms": end,
+            "text": text,
+            "speaker": None,
+            "timestamp_granularity": "chunk",
+            "raw_path": f"$.chunks[{position}]",
+        }
+        metadata = {
+            "index": index,
+            "start_ms": start,
+            "end_ms": end,
+            "audio_sha256": chunk_hash,
+            "provider_request_id": provider_request_id,
+        }
+        indexed.append((index, start, end, segment, metadata))
+
+    indexed.sort(key=lambda item: (item[1], item[2], item[0]))
+    coverage = _cloud_chunk_coverage([(item[1], item[2]) for item in indexed])
+    return (
+        [item[3] for item in indexed],
+        [item[4] for item in indexed],
+        coverage,
+    )
+
+
+def _cloud_chunk_coverage(
+    ranges: list[tuple[int | float, int | float]],
+) -> dict[str, Any]:
+    merged: list[list[int | float]] = []
+    overlap_ms: int | float = 0
+    gap_ms: int | float = 0
+    for start, end in ranges:
+        if not merged:
+            merged.append([start, end])
+            continue
+        previous = merged[-1]
+        if start > previous[1]:
+            gap_ms += start - previous[1]
+            merged.append([start, end])
+        else:
+            overlap_ms += max(0, min(end, previous[1]) - start)
+            if end > previous[1]:
+                previous[1] = end
+    return {
+        "status": "partial",
+        "complete": False,
+        "basis": "cloud_chunk_ranges_not_sentence_timestamps",
+        "original_audio_coverage_verified": False,
+        "start_ms": merged[0][0],
+        "end_ms": merged[-1][1],
+        "intervals_ms": merged,
+        "excluded_ranges_ms": [],
+        "overlap_ms": overlap_ms,
+        "gap_ms": gap_ms,
+    }
 
 
 def _inspect_candidate(
@@ -532,6 +773,7 @@ def _candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
         -_evidence_rank(str(candidate.get("evidence_status") or "")),
         -_quality_rank(candidate.get("quality")),
         -_coverage_rank(candidate.get("coverage")),
+        -_timestamp_precision_rank(candidate.get("segments")),
         -int(candidate.get("timed_segments") or 0),
         -_engine_rank(str(candidate.get("engine") or "")),
         -int(candidate.get("total_segments") or 0),
@@ -556,6 +798,26 @@ def _coverage_rank(value: Any) -> int:
     if status == "complete" and value.get("complete") is True:
         return 1 if value.get("gap_ms") or value.get("excluded_ranges_ms") else 2
     return 1 if status == "partial" else 0
+
+
+def _timestamp_precision_rank(value: Any) -> int:
+    if not isinstance(value, list):
+        return 0
+    ranks = {
+        "sentence_with_subspans": 3,
+        "sentence": 2,
+        "segment_with_subspans": 2,
+        "segment": 2,
+        "chunk": 1,
+    }
+    return max(
+        (
+            ranks.get(str(segment.get("timestamp_granularity") or ""), 0)
+            for segment in value
+            if isinstance(segment, Mapping)
+        ),
+        default=0,
+    )
 
 
 def _engine_rank(value: str) -> int:
