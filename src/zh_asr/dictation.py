@@ -275,6 +275,7 @@ class DictationController:
         self.quit_event = threading.Event()
         self.initialization_failed = False
         self.pending_start = False
+        self.pending_target = None
         self.worker = threading.Thread(target=self._worker, name="dictation-asr", daemon=True)
         self.audio_worker = threading.Thread(target=self._audio_worker, name="dictation-audio", daemon=True)
 
@@ -299,9 +300,17 @@ class DictationController:
                 self.stop()
             else:
                 self.pending_start = not self.pending_start
+                self.pending_target = target if self.pending_start else None
                 self.host.show("准备继续录音" if self.pending_start else "已暂停", "正在完成上一段" if self.pending_start else "点击麦克风继续")
             return
         self._begin_recording(target)
+
+    def toggle_visibility(self) -> None:
+        """Hotkeys control visibility; the on-panel button controls recording."""
+        if self.host.panel_visible:
+            self.hide()
+        else:
+            self.toggle()
 
     def _begin_recording(self, target=None) -> None:
         if self.quit_event.is_set():
@@ -345,7 +354,7 @@ class DictationController:
                     self.host.post_to_ui(lambda r=recording: self._capture_started(r))
                 except Exception:
                     LOG.exception("microphone open failed")
-                    recording.error = "请连接所选麦克风，或在下方选择其他设备"
+                    recording.error = "请连接所选麦克风，或右键选择其他设备"
                     recording.cancelled.set()
                     recording.stopped.set()
                     self._close_capture(recording)
@@ -410,7 +419,9 @@ class DictationController:
 
     def hide(self) -> None:
         self.host.hide_panel()
-        self.cancel()
+        self.pending_start = False
+        self.pending_target = None
+        self.stop()
 
     def select_microphone(self, value: str | None) -> None:
         self.pending_start = False
@@ -439,7 +450,8 @@ class DictationController:
             self.host.show("暂时无法听写", recording.error, error=True)
         if self.pending_start and not self.quit_event.is_set():
             self.pending_start = False
-            self._begin_recording()
+            target, self.pending_target = self.pending_target, None
+            self._begin_recording(target)
 
     def close(self) -> None:
         if self.quit_event.is_set():
@@ -624,6 +636,7 @@ def main(argv=None) -> int:
                        on_cancel=lambda: controller.cancel(),
                        on_quit=lambda: controller.close(),
                        on_hide=lambda: controller.hide(),
+                       on_hotkey=lambda: controller.toggle_visibility(),
                        on_device_change=lambda value: controller.select_microphone(value),
                        on_refresh_devices=lambda: controller.refresh_devices())
     if not host.acquire_single_instance():

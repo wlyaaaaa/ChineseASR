@@ -42,6 +42,10 @@ class FakeHost:
     def open_panel(self):
         self.visible = True
 
+    @property
+    def panel_visible(self):
+        return self.visible
+
     def hide_panel(self):
         self.visible = False
 
@@ -79,7 +83,7 @@ def recording_with_chunks(count=2):
 
 
 class DictationTests(unittest.TestCase):
-    def test_hide_is_immediate_and_cancels_without_waiting_for_audio_driver(self):
+    def test_hide_immediately_pauses_without_waiting_or_discarding_the_tail(self):
         host = FakeHost()
         controller = DictationController(host, DictationSettings(), FakeEngine([]))
         controller.toggle()
@@ -87,9 +91,31 @@ class DictationTests(unittest.TestCase):
         controller.hide()
         self.assertFalse(host.visible)
         self.assertTrue(recording.stopped.is_set())
-        self.assertTrue(recording.cancelled.is_set())
+        self.assertFalse(recording.cancelled.is_set())
         self.assertFalse(controller.quit_event.is_set())
         self.assertEqual(controller.audio_commands.qsize(), 2)
+
+    def test_hotkey_toggles_visibility_while_button_only_toggles_recording(self):
+        host = FakeHost()
+        controller = DictationController(host, DictationSettings(), FakeEngine([]))
+        controller.toggle_visibility()
+        first = controller.recording
+        self.assertTrue(host.visible)
+        self.assertFalse(first.stopped.is_set())
+        controller.toggle()
+        self.assertTrue(host.visible)
+        self.assertTrue(first.stopped.is_set())
+        controller.toggle_visibility()
+        self.assertFalse(host.visible)
+        self.assertFalse(controller.pending_start)
+        controller.toggle_visibility()
+        self.assertTrue(host.visible)
+        self.assertTrue(controller.pending_start)
+        first.capture_finished.set()
+        first.recognition_finished.set()
+        controller._recording_finished(first)
+        self.assertIsNot(controller.recording, first)
+        self.assertFalse(controller.recording.stopped.is_set())
 
     def test_cancel_during_open_closes_late_stream_without_starting_transcription(self):
         entered, release = threading.Event(), threading.Event()

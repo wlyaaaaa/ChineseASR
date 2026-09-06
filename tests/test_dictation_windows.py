@@ -326,6 +326,18 @@ class WindowsHostTests(unittest.TestCase):
 
         self.assertEqual([], self.calls)
 
+    def test_hotkey_and_record_button_have_separate_actions(self):
+        calls = []
+        host = WindowsHost(on_toggle=lambda: calls.append("record"), on_cancel=lambda: None,
+                           on_quit=lambda: None, on_hotkey=lambda: calls.append("visibility"),
+                           api=FakeWindowsApi())
+        host._events.put("toggle")
+        host._dispatch_pending_events()
+        self.assertEqual(["visibility"], calls)
+        self.assertFalse(host.panel_visible)
+        host._toggle_from_panel()
+        self.assertEqual(["visibility", "record"], calls)
+
     def test_escape_is_only_taken_while_controller_marks_host_busy(self):
         host = self.make_host()
         host.show("正在聆听", recording=True)
@@ -451,6 +463,20 @@ class WindowsHostTests(unittest.TestCase):
 
         self.assertEqual(["ui", False], state)
         self.assertEqual(1, overlay.withdraw_count)
+
+    def test_close_arriving_during_render_does_not_strand_tk_mainloop(self):
+        host = self.make_host()
+        root = FakeScheduledRoot()
+        host._root = root
+        host._running = True
+        host._render_overlay = host.close
+        host._poll()
+        self.assertFalse(host._finalized)
+        self.assertEqual(1, len(root.scheduled))
+        _delay, next_turn = root.scheduled.pop()
+        next_turn()
+        self.assertTrue(host._finalized)
+        self.assertFalse(host._running)
 
     def test_overlay_reapplies_nonactivation_after_tk_finishes_wrapping_window(self):
         host = self.make_host()

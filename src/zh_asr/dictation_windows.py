@@ -66,6 +66,8 @@ _ERROR_ALREADY_EXISTS = 183
 _EVENT_MODIFY_STATE = 0x0002
 _SYNCHRONIZE = 0x00100000
 _WAIT_OBJECT_0 = 0
+_PANEL_WIDTH = 160
+_PANEL_HEIGHT = 60
 _PM_NOREMOVE = 0
 
 _MUTEX_NAME = r"Local\ChineseASR.DictationHost.v1"
@@ -401,6 +403,36 @@ class _WinApi:
     def current_process_id(self) -> int:
         return int(self.kernel32.GetCurrentProcessId())
 
+    def enable_pixel_coordinates(self) -> None:
+        """Make the app's geometry physical pixels, not DPI-virtualized pixels."""
+        setter = getattr(self.user32, "SetProcessDpiAwarenessContext", None)
+        if setter is not None:
+            setter.argtypes = [ctypes.c_void_p]
+            setter.restype = wintypes.BOOL
+            if setter(ctypes.c_void_p(-4)):
+                return
+        # Only affects this GUI thread if another library set process awareness.
+        thread_setter = getattr(self.user32, "SetThreadDpiAwarenessContext", None)
+        if thread_setter is not None:
+            thread_setter.argtypes = [ctypes.c_void_p]
+            thread_setter.restype = ctypes.c_void_p
+            thread_setter(ctypes.c_void_p(-4))
+
+    def round_panel(self, hwnd: int, width: int, height: int) -> None:
+        gdi = ctypes.WinDLL("gdi32", use_last_error=True)
+        gdi.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+        gdi.CreateRoundRectRgn.restype = ctypes.c_void_p
+        gdi.DeleteObject.argtypes = [ctypes.c_void_p]
+        self.user32.SetWindowRgn.argtypes = [_HWND, ctypes.c_void_p, wintypes.BOOL]
+        self.user32.SetWindowRgn.restype = ctypes.c_int
+        region = gdi.CreateRoundRectRgn(0, 0, width + 1, height + 1, 32, 32)
+        if region and not self.user32.SetWindowRgn(_HWND(self.get_root_window(hwnd)), region, True):
+            gdi.DeleteObject(region)
+
+    def move_window(self, hwnd: int, x: int, y: int) -> None:
+        self.user32.SetWindowPos(_HWND(self.get_root_window(hwnd)), None, x, y, 0, 0,
+                                 _SWP_NOSIZE | _SWP_NOACTIVATE | 0x0004)
+
     def get_focus_window(self, foreground: int) -> int:
         if not foreground:
             return 0
@@ -555,6 +587,7 @@ class WindowsHost:
         on_quit: Callable[[], None],
         *,
         on_hide: Callable[[], None] | None = None,
+        on_hotkey: Callable[[], None] | None = None,
         on_device_change: Callable[[str | None], None] | None = None,
         on_refresh_devices: Callable[[], None] | None = None,
         api: _Platform | None = None,
@@ -566,6 +599,7 @@ class WindowsHost:
         self.on_cancel = on_cancel
         self.on_quit = on_quit
         self.on_hide = on_hide or (lambda: None)
+        self.on_hotkey = on_hotkey or on_toggle
         self.on_device_change = on_device_change or (lambda _value: None)
         self.on_refresh_devices = on_refresh_devices or (lambda: None)
         self._api = api or _WinApi()
@@ -614,6 +648,15 @@ class WindowsHost:
         self._device_var = None
         self._device_menu = None
         self._record_canvas = None
+        self._close_canvas = None
+        self._device_canvas = None
+        self._background_canvas = None
+        self._image_cache = {}
+        self._record_hover = False
+        self._close_hover = False
+        self._painted_record_state = None
+        self._tooltip = None
+        self._tooltip_after = None
         self._status_label = None
         self._microphones: list[dict[str, str | None]] = []
         self._selected_microphone: str | None = None
@@ -630,6 +673,11 @@ class WindowsHost:
     def latest_text(self) -> str:
         with self._lock:
             return self._last_text
+
+    @property
+    def panel_visible(self) -> bool:
+        with self._lock:
+            return self._panel_open
 
     def post_to_ui(self, callback: Callable[[], None]) -> None:
         """Run a small callback on Tk's thread without making Tk cross-thread calls."""
@@ -835,8 +883,8 @@ class WindowsHost:
     def _create_overlay(self) -> None:
         if self._tk_module is None:
             import tkinter as tk
-
             self._tk_module = tk
+        self._api.enable_pixel_coordinates()
         tk = self._tk_module
         self._root = tk.Tk()
         self._ui_thread_id = threading.get_ident()
@@ -845,124 +893,148 @@ class WindowsHost:
         self._overlay.withdraw()
         self._overlay.overrideredirect(True)
         self._overlay.attributes("-topmost", True)
-        self._overlay.configure(bg="#ffffff", highlightthickness=1, highlightbackground="#d8e3da")
+        self._overlay.configure(bg="#ffffff")
 
-        header = tk.Frame(self._overlay, bg="#f3f8f4", height=34)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        title = tk.Label(
-            header,
-            text="中文听写",
-            anchor="w",
-            fg="#166534",
-            bg="#f3f8f4",
-            font=("Microsoft YaHei UI", 9, "bold"),
-        )
-        title.pack(side="left", fill="both", expand=True, padx=(12, 0))
-        close = tk.Label(
-            header,
-            text="×",
-            width=3,
-            fg="#64748b",
-            bg="#f3f8f4",
-            font=("Segoe UI", 15),
-            takefocus=False,
-        )
-        close.pack(side="right", fill="y")
-        for widget in (header, title):
-            widget.bind("<ButtonPress-1>", self._begin_drag)
-            widget.bind("<B1-Motion>", self._drag_panel)
-        close.bind("<ButtonRelease-1>", lambda _event: self._hide_from_panel())
+        background = tk.Canvas(self._overlay, width=_PANEL_WIDTH, height=_PANEL_HEIGHT,
+                               bg="#ffffff", highlightthickness=0, takefocus=False)
+        background.place(x=0, y=0, width=_PANEL_WIDTH, height=_PANEL_HEIGHT)
+        background.create_image(0, 0, anchor="nw", image=self._asset("background"))
+        background.bind("<ButtonPress-1>", self._begin_drag)
+        background.bind("<B1-Motion>", self._drag_panel)
+        background.bind("<Button-3>", self._open_device_menu)
+        self._background_canvas = background
 
-        frame = tk.Frame(self._overlay, bg="#ffffff", padx=14, pady=7)
-        frame.pack(fill="both", expand=True)
-        self._status_var = tk.StringVar(value=self._status)
-        self._detail_var = tk.StringVar(value=self._detail)
-        self._status_label = tk.Label(
-            frame,
-            textvariable=self._status_var,
-            anchor="center",
-            justify="center",
-            fg="#166534",
-            bg="#ffffff",
-            font=("Microsoft YaHei UI", 10, "bold"),
-        )
-        self._status_label.pack(fill="x")
+        self._record_canvas = tk.Canvas(self._overlay, width=48, height=48, bg="#ffffff",
+                                        highlightthickness=0, takefocus=False, cursor="hand2")
+        self._record_canvas.place(x=48, y=6, width=48, height=48)
+        self._record_canvas.bind("<ButtonRelease-1>", lambda _e: self._toggle_from_panel())
+        self._record_canvas.bind("<Button-3>", self._open_device_menu)
+        self._record_canvas.bind("<Enter>", lambda _e: self._record_hover_changed(True))
+        self._record_canvas.bind("<Leave>", lambda _e: self._record_hover_changed(False))
 
-        self._record_canvas = tk.Canvas(
-            frame,
-            width=62,
-            height=62,
-            bg="#ffffff",
-            highlightthickness=0,
-            takefocus=False,
-            cursor="hand2",
-        )
-        self._record_canvas.pack(pady=(2, 1))
-        self._record_canvas.bind("<ButtonRelease-1>", lambda _event: self._toggle_from_panel())
+        self._device_canvas = tk.Canvas(self._overlay, width=18, height=24, bg="#ffffff",
+                                        highlightthickness=0, takefocus=False, cursor="hand2")
+        self._device_canvas.place(x=98, y=18, width=18, height=24)
+        self._device_canvas.create_image(0, 0, anchor="nw", image=self._asset("device"))
+        self._device_canvas.bind("<ButtonRelease-1>", self._open_device_menu)
 
-        tk.Label(
-            frame,
-            textvariable=self._detail_var,
-            anchor="center",
-            justify="center",
-            wraplength=276,
-            fg="#64748b",
-            bg="#ffffff",
-            font=("Microsoft YaHei UI", 8),
-        ).pack(fill="x", pady=(0, 4))
+        self._close_canvas = tk.Canvas(self._overlay, width=28, height=28, bg="#ffffff",
+                                       highlightthickness=0, takefocus=False, cursor="hand2")
+        self._close_canvas.place(x=118, y=16, width=28, height=28)
+        self._close_canvas.bind("<ButtonRelease-1>", lambda _e: self._hide_from_panel())
+        self._close_canvas.bind("<Enter>", lambda _e: self._paint_close_button(True))
+        self._close_canvas.bind("<Leave>", lambda _e: self._paint_close_button(False))
 
-        device_row = tk.Frame(frame, bg="#ffffff")
-        device_row.pack(fill="x")
-        tk.Label(
-            device_row,
-            text="麦克风",
-            fg="#64748b",
-            bg="#ffffff",
-            font=("Microsoft YaHei UI", 8),
-        ).pack(side="left")
-        self._device_var = tk.StringVar(value="选择麦克风")
-        selector = tk.Menubutton(
-            device_row,
-            width=20,
-            textvariable=self._device_var,
-            anchor="w",
-            relief="flat",
-            bd=0,
-            padx=7,
-            pady=2,
-            fg="#334155",
-            bg="#f1f5f2",
-            activebackground="#e2f2e7",
-            font=("Microsoft YaHei UI", 9),
-            takefocus=False,
-        )
-        selector.pack(side="left", fill="x", expand=True, padx=(7, 5))
-        self._device_menu = tk.Menu(selector, tearoff=False, bg="#ffffff", activebackground="#dcfce7")
-        selector.configure(menu=self._device_menu)
-        refresh = tk.Label(
-            device_row,
-            text="刷新",
-            fg="#16803b",
-            bg="#ffffff",
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 9),
-            takefocus=False,
-        )
-        refresh.pack(side="right")
-        refresh.bind("<ButtonRelease-1>", lambda _event: self._refresh_devices_from_panel())
-
-        width, height = 304, 180
-        x = max(0, (self._overlay.winfo_screenwidth() - width) // 2)
-        y = max(0, self._overlay.winfo_screenheight() - height - 84)
-        self._overlay.geometry(f"{width}x{height}+{x}+{y}")
+        self._device_var = tk.StringVar(value="")
+        self._device_menu = tk.Menu(self._overlay, tearoff=False, bg="#ffffff",
+                                    activebackground="#dcfce7", font=("Microsoft YaHei UI", -12))
+        x = max(0, (self._overlay.winfo_screenwidth() - _PANEL_WIDTH) // 2)
+        y = max(0, self._overlay.winfo_screenheight() - _PANEL_HEIGHT - 80)
+        self._overlay.geometry(f"{_PANEL_WIDTH}x{_PANEL_HEIGHT}+{x}+{y}")
         self._overlay.protocol("WM_DELETE_WINDOW", self._hide_from_panel)
-        # Apply WS_EX_NOACTIVATE before the first show, not only after it.
-        self._overlay.withdraw()
         self._api.make_window_nonactivating(int(self._overlay.winfo_id()), show=False)
         self._refresh_own_window_roots_ui()
         self._refresh_microphone_menu_ui()
         self._paint_record_button_ui()
+        self._paint_close_button(False)
+
+    def _asset(self, kind: str, active: bool = False, error: bool = False, hover: bool = False):
+        key = (kind, active, error, hover)
+        if key in self._image_cache:
+            return self._image_cache[key]
+        from PIL import Image, ImageDraw, ImageTk
+        scale = 4
+        width, height = {"background": (_PANEL_WIDTH, _PANEL_HEIGHT), "record": (48, 48), "close": (28, 28), "device": (18, 24)}[kind]
+        image = Image.new("RGB", (width * scale, height * scale), "#ffffff")
+        draw = ImageDraw.Draw(image)
+        def box(values):
+            return tuple(round(value * scale) for value in values)
+        if kind == "background":
+            draw.rounded_rectangle(box((.5, .5, width-.5, height-.5)), radius=16*scale,
+                                   fill="#ffffff", outline="#dce7df", width=scale)
+            for x in (17, 21):
+                for y in (25, 30, 35):
+                    draw.ellipse(box((x-1, y-1, x+1, y+1)), fill="#c4cec7")
+        elif kind == "device":
+            draw.line(box((5, 10, 9, 14, 13, 10)), fill="#238957", width=round(1.6*scale))
+        elif kind == "close":
+            if hover:
+                draw.ellipse(box((1, 1, 27, 27)), fill="#eef3ef")
+            draw.line(box((10, 10, 18, 18)), fill="#66766c", width=round(1.6*scale))
+            draw.line(box((18, 10, 10, 18)), fill="#66766c", width=round(1.6*scale))
+        else:
+            fill = "#13ae65" if active else ("#dcf5e6" if hover else "#edf9f2")
+            ink = "#ffffff" if active else "#18985a"
+            draw.ellipse(box((2, 2, 46, 46)), fill=fill, outline="#87d5aa", width=scale)
+            draw.rounded_rectangle(box((20, 10, 28, 28)), radius=4*scale, fill=ink)
+            draw.arc(box((15, 19, 33, 37)), start=0, end=180, fill=ink, width=2*scale)
+            draw.line(box((15, 23, 15, 28)), fill=ink, width=2*scale)
+            draw.line(box((33, 23, 33, 28)), fill=ink, width=2*scale)
+            draw.line(box((24, 36, 24, 40)), fill=ink, width=2*scale)
+            draw.line(box((19, 40, 29, 40)), fill=ink, width=2*scale)
+            if error:
+                draw.ellipse(box((37, 3, 45, 11)), fill="#e5654f", outline="#ffffff", width=scale)
+        photo = ImageTk.PhotoImage(image.resize((width, height), Image.Resampling.LANCZOS), master=self._root)
+        self._image_cache[key] = photo
+        return photo
+
+    def _paint_close_button(self, hover: bool) -> None:
+        if self._close_canvas is not None:
+            self._close_canvas.delete("all")
+            self._close_canvas.create_image(0, 0, anchor="nw", image=self._asset("close", hover=hover))
+
+    def _record_hover_changed(self, inside: bool) -> None:
+        self._record_hover = inside
+        self._paint_record_button_ui()
+        self._hide_tooltip()
+        if inside and self._root is not None:
+            self._tooltip_after = self._root.after(450, self._show_tooltip)
+
+    def _tooltip_text(self) -> str:
+        with self._lock:
+            status, detail, error, active = self._status, self._detail, self._error, self._recording
+        if error:
+            if "麦克风" in detail:
+                return "麦克风不可用 · 右键切换"
+            if "输入位置" in status:
+                return "输入位置已变 · 右键复制"
+            return status[:24]
+        return "正在录音 · 单击暂停" if active else "单击录音 · 右键选麦克风"
+
+    def _show_tooltip(self) -> None:
+        self._tooltip_after = None
+        if not self._panel_open or not self._record_hover or self._root is None:
+            return
+        tk = self._tk_module
+        tip = tk.Toplevel(self._root)
+        self._tooltip = tip
+        tip.withdraw()
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=self._tooltip_text(), font=("Microsoft YaHei UI", -12),
+                 fg="#526258", bg="#f8fbf9", padx=8, pady=5).pack()
+        tip.update_idletasks()
+        tip.geometry(f"+{max(0,self._overlay.winfo_rootx())}+{max(0,self._overlay.winfo_rooty()-tip.winfo_reqheight()-6)}")
+        self._api.make_window_nonactivating(int(tip.winfo_id()), show=False)
+        tip.deiconify()
+        self._api.make_window_nonactivating(int(tip.winfo_id()))
+
+    def _hide_tooltip(self) -> None:
+        if self._tooltip_after is not None and self._root is not None:
+            self._root.after_cancel(self._tooltip_after)
+            self._tooltip_after = None
+        if self._tooltip is not None:
+            self._tooltip.destroy()
+            self._tooltip = None
+
+    def _open_device_menu(self, event) -> None:
+        self._hide_tooltip()
+        self._remember_external_target()
+        self._refresh_microphone_menu_ui()
+        try:
+            self._device_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._device_menu.grab_release()
 
     def _is_ui_thread(self) -> bool:
         return self._ui_thread_id is not None and self._ui_thread_id == threading.get_ident()
@@ -990,9 +1062,10 @@ class WindowsHost:
         if self._overlay is None or self._drag_offset is None:
             return
         offset_x, offset_y = self._drag_offset
-        self._overlay.geometry(f"+{max(0, event.x_root - offset_x)}+{max(0, event.y_root - offset_y)}")
+        self._api.move_window(int(self._overlay.winfo_id()), event.x_root - offset_x, event.y_root - offset_y)
 
     def _toggle_from_panel(self) -> None:
+        self._hide_tooltip()
         self._remember_external_target()
         self._invoke_callback(self.on_toggle, "切换听写失败")
 
@@ -1006,6 +1079,7 @@ class WindowsHost:
         self._render_overlay()
 
     def _hide_panel_ui(self) -> None:
+        self._hide_tooltip()
         with self._lock:
             self._panel_open = False
         if self._overlay is not None and self._overlay_visible:
@@ -1034,32 +1108,28 @@ class WindowsHost:
             choices = list(self._microphones)
             selected = self._selected_microphone
         self._device_menu.delete(0, "end")
-        selected_label = None
+        self._device_var.set(selected or "")
         for item in choices:
             value = item["value"]
             label = str(item["label"])
-            if value == selected:
-                selected_label = label
-            self._device_menu.add_command(label=label, command=lambda item_value=value: self._select_microphone(item_value))
+            self._device_menu.add_radiobutton(label=label, variable=self._device_var, value=value or "",
+                                              command=lambda item_value=value: self._select_microphone(item_value))
         if not choices:
             self._device_menu.add_command(label="未发现可用麦克风", state="disabled")
-        display = selected_label or ("Windows 默认麦克风" if selected is None else "选择麦克风")
-        self._device_var.set(display if len(display) <= 24 else display[:21] + "…")
+        self._device_menu.add_separator()
+        self._device_menu.add_command(label="刷新麦克风", command=self._refresh_devices_from_panel)
+        self._device_menu.add_command(label="复制最近文字", command=self.copy_text)
 
     def _paint_record_button_ui(self) -> None:
         if self._record_canvas is None:
             return
         with self._lock:
-            active = self._recording
-        canvas = self._record_canvas
-        canvas.delete("all")
-        fill = "#16a34a" if active else "#ecfdf3"
-        ink = "#ffffff" if active else "#15803d"
-        canvas.create_oval(4, 4, 58, 58, fill=fill, outline="#22a65a", width=2)
-        canvas.create_oval(25, 14, 37, 34, fill=ink, outline=ink)
-        canvas.create_line(23, 31, 23, 36, 41, 36, 41, 31, fill=ink, width=2)
-        canvas.create_line(32, 36, 32, 44, fill=ink, width=2)
-        canvas.create_line(25, 45, 39, 45, fill=ink, width=2)
+            state = (self._recording, self._error, self._record_hover)
+        if state == self._painted_record_state:
+            return
+        self._painted_record_state = state
+        self._record_canvas.delete("all")
+        self._record_canvas.create_image(0, 0, anchor="nw", image=self._asset("record", *state))
 
     def _install_hook(self) -> None:
         """Install the low-level hook on its own message-pump thread.
@@ -1228,7 +1298,9 @@ class WindowsHost:
             self._finalize_close()
             return
         self._render_overlay()
-        if self._running and not self._close_requested:
+        # A close request can arrive during rendering. Always schedule one more
+        # turn while running, otherwise the request loses its only UI wake-up.
+        if self._running:
             self._root.after(25, self._poll)
 
     def _drain_ui_calls(self) -> None:
@@ -1266,8 +1338,7 @@ class WindowsHost:
                 continue
             if action == "toggle":
                 self._remember_external_target()
-                self._open_panel_ui()
-                self._invoke_callback(self.on_toggle, "切换听写失败")
+                self._invoke_callback(self.on_hotkey, "切换听写失败")
             elif action == "cancel":
                 self._invoke_callback(self.on_cancel, "取消听写失败")
             elif action == "copy":
@@ -1305,17 +1376,8 @@ class WindowsHost:
         if self._overlay is None:
             return
         with self._lock:
-            status = self._status
-            detail = self._detail
-            error = self._error
             should_show = self._panel_open
-        if len(detail) > 92:
-            detail = detail[:89] + "…（托盘可复制全文）"
         try:
-            self._status_var.set(status)
-            self._detail_var.set(detail)
-            if self._status_label is not None:
-                self._status_label.configure(fg="#b91c1c" if error else "#166534")
             self._paint_record_button_ui()
             if should_show and not self._overlay_visible:
                 self._overlay.deiconify()
@@ -1324,8 +1386,7 @@ class WindowsHost:
                 self._refresh_own_window_roots_ui()
                 self._schedule_overlay_style_reapply()
             elif not should_show and self._overlay_visible:
-                self._overlay.withdraw()
-                self._overlay_visible = False
+                self._hide_panel_ui()
         except Exception:
             pass
 
@@ -1347,6 +1408,8 @@ class WindowsHost:
             # ``show=False`` only refreshes the real wrapper's style; it never
             # reveals an overlay that the normal visibility policy has hidden.
             self._api.make_window_nonactivating(int(self._overlay.winfo_id()), show=False)
+            if hasattr(self._api, "round_panel"):
+                self._api.round_panel(int(self._overlay.winfo_id()), _PANEL_WIDTH, _PANEL_HEIGHT)
             self._refresh_own_window_roots_ui()
         except Exception:
             pass
@@ -1375,7 +1438,7 @@ class WindowsHost:
         draw.ellipse((25, 13, 39, 37), fill=(255, 255, 255, 255))
         draw.rectangle((29, 35, 35, 48), fill=(255, 255, 255, 255))
         menu = pystray.Menu(
-            pystray.MenuItem("显示并开始/暂停听写", lambda *_: self._events.put("toggle")),
+            pystray.MenuItem("显示/隐藏听写", lambda *_: self._events.put("toggle")),
             pystray.MenuItem("取消本次听写", lambda *_: self._events.put("cancel")),
             pystray.MenuItem("复制最近识别文字", lambda *_: self.copy_text()),
             pystray.MenuItem("暂时释放/恢复两组快捷键", lambda *_: self._events.put("release")),
@@ -1388,6 +1451,7 @@ class WindowsHost:
         if self._finalized:
             return
         self._finalized = True
+        self._hide_tooltip()
         self._running = False
         # Remove the user-visible panel first.  Controller/model cleanup may take
         # a while, but it must never leave an "exiting" strip in front of the user.
