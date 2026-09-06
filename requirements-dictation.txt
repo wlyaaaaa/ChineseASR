@@ -2,3 +2,4 @@
 sounddevice==0.5.6
 pystray==0.19.5
 Pillow>=10
+webrtcvad-wheels==2.0.14

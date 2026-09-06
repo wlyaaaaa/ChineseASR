@@ -17,6 +17,7 @@ import time
 import numpy as np
 
 from .config import get_engine_spec, load_model_config, project_root
+from .dictation_vad import VoiceActivityDetector, contains_speech
 from .gpu_broker import GpuBrokerConflict, GpuBrokerLease
 
 LOG = logging.getLogger("zh_asr.dictation")
@@ -74,32 +75,35 @@ def save_microphone_preference(value: str | None) -> None:
 class PauseSegmenter:
     """Keep short pre-roll and end a phrase at pauses, with a bounded long phrase.
 
-    RMS is only a microphone activity gate, not evidence that audio is speech.
-    Low-energy blocks are retained inside a phrase, including quiet word endings.
+    VAD selects phrase boundaries; every sample inside a phrase is retained,
+    including pre-roll, unvoiced consonants and quiet word endings.
     """
 
-    def __init__(self, settings: DictationSettings):
+    def __init__(self, settings: DictationSettings, detector=None):
         self.settings = settings
+        self.detector = detector or VoiceActivityDetector(settings.sample_rate)
         self.pre_roll: deque[np.ndarray] = deque(maxlen=10)  # 200 ms at 20 ms/block
         self.blocks: list[np.ndarray] = []
+        self.speech_flags: list[bool] = []
         self.voiced_samples = 0
         self.silent_samples = 0
         self.samples = 0
-        self.noise = 0.00015
 
     def feed(self, samples: np.ndarray) -> list[np.ndarray]:
         samples = np.asarray(samples, dtype=np.float32).reshape(-1).copy()
-        rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
-        active = rms >= max(0.0008, min(self.noise * 3.5, 0.008))
+        if not samples.size:
+            return []
+        active = self.detector.is_speech(samples)
         if not self.blocks and not active:
-            self.noise = self.noise * 0.98 + rms * 0.02
             self.pre_roll.append(samples)
             return []
         if not self.blocks:
             self.blocks.extend(self.pre_roll)
+            self.speech_flags.extend(False for _ in self.pre_roll)
             self.samples = sum(len(block) for block in self.blocks)
             self.pre_roll.clear()
         self.blocks.append(samples)
+        self.speech_flags.append(active)
         self.samples += len(samples)
         self.voiced_samples += len(samples) if active else 0
         self.silent_samples = 0 if active else self.silent_samples + len(samples)
@@ -114,13 +118,16 @@ class PauseSegmenter:
             cut = min(range(first, len(self.blocks)),
                       key=lambda i: float(np.mean(self.blocks[i] ** 2))) + 1
             head, tail = self.blocks[:cut], self.blocks[cut:]
+            head_voiced = sum(len(block) for block, voiced in
+                              zip(head, self.speech_flags[:cut]) if voiced)
             self.blocks = tail
+            self.speech_flags = self.speech_flags[cut:]
             self.samples = sum(len(block) for block in tail)
-            threshold = max(0.0008, min(self.noise * 3.5, 0.008))
-            self.voiced_samples = sum(len(block) for block in tail
-                if float(np.sqrt(np.mean(block ** 2))) >= threshold)
+            self.voiced_samples = sum(len(block) for block, voiced in
+                                      zip(tail, self.speech_flags) if voiced)
             self.silent_samples = 0
-            return [np.concatenate(head)]
+            return ([np.concatenate(head)] if head_voiced >=
+                    sr * self.settings.min_speech_ms / 1000 else [])
         return []
 
     def flush(self) -> np.ndarray | None:
@@ -129,6 +136,7 @@ class PauseSegmenter:
                 self.settings.sample_rate * self.settings.min_speech_ms / 1000):
             result = np.concatenate(self.blocks)
         self.blocks.clear()
+        self.speech_flags.clear()
         self.pre_roll.clear()
         self.voiced_samples = self.silent_samples = self.samples = 0
         return result
@@ -181,6 +189,12 @@ class QwenDictationEngine:
             raise
 
     def transcribe(self, audio: np.ndarray) -> str:
+        if not contains_speech(audio, self.settings.sample_rate, self.settings.min_speech_ms):
+            LOG.info("dictation chunk skipped: no sustained speech detected")
+            return ""
+        return self._infer(audio)
+
+    def _infer(self, audio: np.ndarray) -> str:
         self.activate()
         self.lease.raise_if_lost()
         started = time.perf_counter()
@@ -191,7 +205,7 @@ class QwenDictationEngine:
                 audio=(audio, self.settings.sample_rate),
                 language=self.wrapper.language, context=self.settings.hotwords)
         self.lease.raise_if_lost()
-        text = "".join(str(getattr(item, "text", "")) for item in results).strip()
+        text = "".join(str(getattr(item, "text", "") or "") for item in (results or [])).strip()
         LOG.info("transcribed audio_sec=%.3f elapsed_sec=%.3f chars=%d",
                  len(audio) / self.settings.sample_rate, time.perf_counter() - started, len(text))
         return to_simplified(text)
@@ -201,7 +215,8 @@ class QwenDictationEngine:
         limit = self.wrapper.model.max_new_tokens
         try:
             self.wrapper.model.max_new_tokens = 1
-            self.transcribe(np.zeros(self.settings.sample_rate // 2, dtype=np.float32))
+            # Warm the actual GPU kernels; the normal input gate rejects silence.
+            self._infer(np.zeros(self.settings.sample_rate // 2, dtype=np.float32))
         finally:
             self.wrapper.model.max_new_tokens = limit
 

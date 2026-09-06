@@ -927,7 +927,8 @@ class WindowsHost:
 
         self._device_var = tk.StringVar(value="")
         self._device_menu = tk.Menu(self._overlay, tearoff=False, bg="#ffffff",
-                                    activebackground="#dcfce7", font=("Microsoft YaHei UI", -12))
+                                    # Points follow Windows DPI; the outer panel stays in pixels.
+                                    activebackground="#dcfce7", font=("Microsoft YaHei UI", 10))
         x = max(0, (self._overlay.winfo_screenwidth() - _PANEL_WIDTH) // 2)
         y = max(0, self._overlay.winfo_screenheight() - _PANEL_HEIGHT - 80)
         self._overlay.geometry(f"{_PANEL_WIDTH}x{_PANEL_HEIGHT}+{x}+{y}")

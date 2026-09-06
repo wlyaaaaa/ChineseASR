@@ -6,5 +6,5 @@ min_speech_ms: 240
 max_chunk_sec: 20
 # null follows the current Windows default input device at each recording.
 input_device: DJI Mic Mini
-# Context supplies spellings, never an instruction to rewrite the transcript.
-hotwords: "Codex, ChineseASR, Win+H, API, GitHub, Python, PowerShell, Qwen, RTX 5090D"
+# Optional context; leave empty to avoid prompt echo on unclear audio.
+hotwords: ""

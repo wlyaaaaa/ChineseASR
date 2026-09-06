@@ -12,7 +12,7 @@ import json
 import numpy as np
 
 from zh_asr.dictation import (
-    DictationController, DictationSettings, PauseSegmenter, Recording,
+    DictationController, DictationSettings, PauseSegmenter, QwenDictationEngine, Recording,
 )
 
 
@@ -83,6 +83,12 @@ def recording_with_chunks(count=2):
 
 
 class DictationTests(unittest.TestCase):
+    @staticmethod
+    def assembly_segmenter(settings=None):
+        # These tests check sample preservation and boundaries, not acoustics.
+        detector = SimpleNamespace(is_speech=lambda frame: bool(np.any(frame)))
+        return PauseSegmenter(settings or DictationSettings(), detector=detector)
+
     def test_hide_immediately_pauses_without_waiting_or_discarding_the_tail(self):
         host = FakeHost()
         controller = DictationController(host, DictationSettings(), FakeEngine([]))
@@ -165,7 +171,7 @@ class DictationTests(unittest.TestCase):
         self.assertIsNone(segmenter.flush())
 
     def test_pause_keeps_preroll_and_quiet_word_ending(self):
-        segmenter = PauseSegmenter(DictationSettings())
+        segmenter = self.assembly_segmenter()
         for _ in range(10):
             segmenter.feed(np.zeros(320))
         for _ in range(20):
@@ -180,12 +186,45 @@ class DictationTests(unittest.TestCase):
 
     def test_long_continuous_speech_and_final_tail_have_no_sample_gap(self):
         settings = DictationSettings(max_chunk_sec=3)
-        segmenter = PauseSegmenter(settings)
+        segmenter = self.assembly_segmenter(settings)
         emitted = []
         for _ in range(174):
             emitted.extend(segmenter.feed(np.full(320, 0.03)))
         emitted.append(segmenter.flush())
         self.assertEqual(sum(len(chunk) for chunk in emitted), 174 * 320)
+
+    def test_short_noise_burst_is_not_submitted(self):
+        segmenter = self.assembly_segmenter()
+        for _ in range(3):
+            self.assertEqual(segmenter.feed(np.full(320, 0.03)), [])
+        for _ in range(40):
+            self.assertEqual(segmenter.feed(np.zeros(320)), [])
+        self.assertIsNone(segmenter.flush())
+
+    def test_silent_input_never_loads_or_calls_the_model(self):
+        engine = QwenDictationEngine(DictationSettings(hotwords="Codex, API"))
+        with patch.object(engine, "activate") as activate, patch.object(engine, "_infer") as infer:
+            noise = np.random.default_rng(0).normal(0, 0.01, 32000)
+            for audio in (np.zeros(0), np.zeros(16000), np.full(16000, 0.01), noise):
+                self.assertEqual(engine.transcribe(audio), "")
+        activate.assert_not_called()
+        infer.assert_not_called()
+        self.assertIsNone(engine.wrapper)
+
+    def test_warmup_runs_inference_despite_the_silence_gate(self):
+        engine = QwenDictationEngine(DictationSettings())
+        engine.wrapper = SimpleNamespace(model=SimpleNamespace(max_new_tokens=384))
+        with patch.object(engine, "activate"), patch.object(engine, "_infer") as infer:
+            engine.warmup()
+        infer.assert_called_once()
+        self.assertEqual(engine.wrapper.model.max_new_tokens, 384)
+
+    def test_empty_recognition_does_not_insert_any_text(self):
+        host = FakeHost()
+        controller = DictationController(host, DictationSettings(), FakeEngine(["", ""]))
+        controller._recognize(recording_with_chunks())
+        self.assertEqual(host.insertions, [])
+        self.assertEqual(host.last_text, "")
 
     def test_focus_change_stops_all_later_insertion_but_keeps_complete_text(self):
         host = FakeHost(allow=False)
