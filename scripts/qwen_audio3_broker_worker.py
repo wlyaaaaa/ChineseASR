@@ -17,8 +17,12 @@ import uuid
 import wave
 
 
-REQUEST_SCHEMA = "chineseasr.qwen-audio3-important-request.v1"
-RESULT_SCHEMA = "chineseasr.qwen-audio3-important-result.v1"
+IMPORTANT_REQUEST_SCHEMA = "chineseasr.qwen-audio3-important-request.v1"
+QUALITY_REVIEW_REQUEST_SCHEMA = "chineseasr.qwen-audio3-quality-review-request.v1"
+IMPORTANT_RESULT_SCHEMA = "chineseasr.qwen-audio3-important-result.v1"
+QUALITY_REVIEW_RESULT_SCHEMA = "chineseasr.qwen-audio3-quality-review-result.v1"
+IMPORTANT_PURPOSE = "important_evidence"
+QUALITY_REVIEW_PURPOSE = "quality_review"
 MODEL = "qwen-audio-3.0-asr-flash"
 DEFAULT_ENDPOINT = (
     "https://dashscope.aliyuncs.com/api/v1/services/"
@@ -81,10 +85,25 @@ def _load_json_object(path: Path) -> dict[str, Any]:
 
 
 def _validate_request(request: dict[str, Any]) -> dict[str, Any]:
-    if request.get("schema") != REQUEST_SCHEMA:
+    request_schema = request.get("schema")
+    if request_schema == IMPORTANT_REQUEST_SCHEMA:
+        if request.get("importance") != "important":
+            raise CloudPolicyError("importance_required")
+        if request.get("purpose", IMPORTANT_PURPOSE) != IMPORTANT_PURPOSE:
+            raise CloudPolicyError("request_purpose_invalid")
+        result_schema = IMPORTANT_RESULT_SCHEMA
+        purpose = IMPORTANT_PURPOSE
+        important_only = True
+    elif request_schema == QUALITY_REVIEW_REQUEST_SCHEMA:
+        if request.get("purpose") != QUALITY_REVIEW_PURPOSE:
+            raise CloudPolicyError("quality_review_purpose_required")
+        if "importance" in request:
+            raise CloudPolicyError("quality_review_importance_forbidden")
+        result_schema = QUALITY_REVIEW_RESULT_SCHEMA
+        purpose = QUALITY_REVIEW_PURPOSE
+        important_only = False
+    else:
         raise CloudPolicyError("request_schema_invalid")
-    if request.get("importance") != "important":
-        raise CloudPolicyError("importance_required")
     if request.get("cloud_upload_authorized") is not True:
         raise CloudPolicyError("cloud_upload_authorization_required")
     try:
@@ -111,6 +130,9 @@ def _validate_request(request: dict[str, Any]) -> dict[str, Any]:
         "audio_path": audio_path.resolve(),
         "chunk_sec": chunk_sec,
         "overlap_sec": overlap_sec,
+        "result_schema": result_schema,
+        "purpose": purpose,
+        "important_only": important_only,
     }
 
 
@@ -366,14 +388,21 @@ def _merge_texts(texts: list[str]) -> str:
     return "\n".join(merged)
 
 
-def _base_result(job_id: str = "") -> dict[str, Any]:
+def _base_result(
+    job_id: str = "",
+    *,
+    result_schema: str = IMPORTANT_RESULT_SCHEMA,
+    purpose: str = IMPORTANT_PURPOSE,
+    important_only: bool = True,
+) -> dict[str, Any]:
     return {
-        "schema": RESULT_SCHEMA,
+        "schema": result_schema,
         "job_id": job_id,
         "model": MODEL,
         "provider": "aliyun-bailian",
         "provider_endpoint": DEFAULT_ENDPOINT,
-        "important_only": True,
+        "purpose": purpose,
+        "important_only": important_only,
         "status": "failed",
         "error_code": "",
         "error_message": "",
@@ -395,8 +424,17 @@ def process_request_file(
     result = _base_result()
     try:
         request = _load_json_object(request_path)
+        if request.get("schema") == QUALITY_REVIEW_REQUEST_SCHEMA:
+            result = _base_result(
+                result_schema=QUALITY_REVIEW_RESULT_SCHEMA,
+                purpose=QUALITY_REVIEW_PURPOSE,
+                important_only=False,
+            )
         validated = _validate_request(request)
         result["job_id"] = validated["job_id"]
+        result["schema"] = validated["result_schema"]
+        result["purpose"] = validated["purpose"]
+        result["important_only"] = validated["important_only"]
         if not api_key or "\x00" in api_key:
             raise CloudApiError(
                 "api_key_missing",

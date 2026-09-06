@@ -33,23 +33,26 @@ def _write_request(
     path: Path,
     audio_path: Path,
     *,
-    importance: str = "important",
+    schema: str = "chineseasr.qwen-audio3-important-request.v1",
+    purpose: str | None = None,
+    importance: str | None = "important",
     cloud_upload_authorized: bool = True,
 ) -> None:
+    request = {
+        "schema": schema,
+        "job_id": "00000000-0000-4000-8000-000000000001",
+        "cloud_upload_authorized": cloud_upload_authorized,
+        "audio_path": str(audio_path.resolve()),
+        "created_utc": "2026-08-01T00:00:00Z",
+        "chunk_sec": 180,
+        "overlap_sec": 1,
+    }
+    if purpose is not None:
+        request["purpose"] = purpose
+    if importance is not None:
+        request["importance"] = importance
     path.write_text(
-        json.dumps(
-            {
-                "schema": "chineseasr.qwen-audio3-important-request.v1",
-                "job_id": "00000000-0000-4000-8000-000000000001",
-                "importance": importance,
-                "cloud_upload_authorized": cloud_upload_authorized,
-                "audio_path": str(audio_path.resolve()),
-                "created_utc": "2026-08-01T00:00:00Z",
-                "chunk_sec": 180,
-                "overlap_sec": 1,
-            },
-            ensure_ascii=False,
-        ),
+        json.dumps(request, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -106,6 +109,77 @@ class QwenAudio3BrokerWorkerTests(unittest.TestCase):
             self.assertFalse(result["cloud_upload_performed"])
             self.assertEqual([], calls)
 
+    def test_quality_review_is_not_labeled_as_important(self) -> None:
+        worker = _load_worker()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "short.wav"
+            _write_wav(audio)
+            request_path = root / "job.running.json"
+            _write_request(
+                request_path,
+                audio,
+                schema="chineseasr.qwen-audio3-quality-review-request.v1",
+                purpose="quality_review",
+                importance=None,
+            )
+            calls: list[object] = []
+
+            def transport(url, headers, payload, timeout):
+                calls.append((url, headers, payload, timeout))
+                return {
+                    "output": {"text": "这是普通存疑转写的云端复核。"},
+                    "request_id": "quality-review-request-1",
+                }
+
+            result = worker.process_request_file(
+                request_path,
+                api_key="test-key",
+                transport=transport,
+            )
+
+            self.assertEqual("succeeded", result["status"])
+            self.assertEqual(
+                "chineseasr.qwen-audio3-quality-review-result.v1",
+                result["schema"],
+            )
+            self.assertEqual("quality_review", result["purpose"])
+            self.assertFalse(result["important_only"])
+            self.assertEqual(1, len(calls))
+
+    def test_quality_review_rejects_any_importance_label_before_audio_reading(self) -> None:
+        worker = _load_worker()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            request_path = root / "job.running.json"
+            missing_audio = root / "must-not-be-read.wav"
+            _write_request(
+                request_path,
+                missing_audio,
+                schema="chineseasr.qwen-audio3-quality-review-request.v1",
+                purpose="quality_review",
+                importance="important",
+            )
+            calls: list[object] = []
+
+            def transport(*args, **kwargs):
+                calls.append((args, kwargs))
+                raise AssertionError("transport must not be called")
+
+            result = worker.process_request_file(
+                request_path,
+                api_key="test-key",
+                transport=transport,
+            )
+
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual(
+                "quality_review_importance_forbidden", result["error_code"]
+            )
+            self.assertFalse(result["important_only"])
+            self.assertFalse(result["cloud_upload_performed"])
+            self.assertEqual([], calls)
+
     def test_posts_official_payload_and_never_persists_key(self) -> None:
         worker = _load_worker()
         with tempfile.TemporaryDirectory() as tmp:
@@ -140,6 +214,11 @@ class QwenAudio3BrokerWorkerTests(unittest.TestCase):
             )
 
             self.assertEqual("succeeded", result["status"])
+            self.assertEqual(
+                "chineseasr.qwen-audio3-important-result.v1", result["schema"]
+            )
+            self.assertEqual("important_evidence", result["purpose"])
+            self.assertTrue(result["important_only"])
             self.assertEqual("这是专业录音连通测试。", result["text"])
             self.assertEqual("Success", result["credential_result"])
             self.assertTrue(result["cloud_upload_performed"])

@@ -48,7 +48,7 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
             timeout=30,
         )
 
-    def test_nonimportant_call_is_blocked_before_broker_or_queue(self) -> None:
+    def test_unlabelled_call_is_blocked_before_broker_or_queue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             audio = Path(tmp) / "ordinary.wav"
             queue = Path(tmp) / "queue"
@@ -58,10 +58,60 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
             self.assertEqual(2, result.returncode, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual("blocked", payload["status"])
-            self.assertEqual("importance_required", payload["error_code"])
+            self.assertEqual("cloud_use_purpose_required", payload["error_code"])
             self.assertFalse(payload["cloud_upload_performed"])
             self.assertEqual("do_not_retry", payload["cloud_retry_policy"])
             self.assertEqual("none", payload["local_fallback_recommendation"])
+            self.assertFalse(queue.exists())
+
+    def test_quality_review_is_explicit_and_not_labeled_important(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "ordinary.wav"
+            queue = Path(tmp) / "queue"
+            _write_wav(audio)
+            result = self._run(
+                "-Audio",
+                str(audio),
+                "-RequestRoot",
+                str(queue),
+                "-QualityReview",
+            )
+
+            self.assertEqual(2, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("blocked", payload["status"])
+            self.assertEqual(
+                "cloud_upload_authorization_required", payload["error_code"]
+            )
+            self.assertEqual(
+                "chineseasr.qwen-audio3-quality-review-result.v1",
+                payload["schema"],
+            )
+            self.assertEqual("quality_review", payload["purpose"])
+            self.assertFalse(payload["important_only"])
+            self.assertFalse(payload["cloud_upload_performed"])
+            self.assertFalse(queue.exists())
+
+    def test_important_and_quality_review_cannot_be_combined(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "ambiguous.wav"
+            queue = Path(tmp) / "queue"
+            _write_wav(audio)
+            result = self._run(
+                "-Audio",
+                str(audio),
+                "-RequestRoot",
+                str(queue),
+                "-Important",
+                "-QualityReview",
+                "-CloudUploadAuthorized",
+            )
+
+            self.assertEqual(2, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("blocked", payload["status"])
+            self.assertEqual("cloud_use_purpose_ambiguous", payload["error_code"])
+            self.assertFalse(payload["cloud_upload_performed"])
             self.assertFalse(queue.exists())
 
     def test_cloud_authorization_is_separate_from_importance(self) -> None:
@@ -83,6 +133,11 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
             self.assertEqual(
                 "cloud_upload_authorization_required", payload["error_code"]
             )
+            self.assertEqual(
+                "chineseasr.qwen-audio3-important-result.v1", payload["schema"]
+            )
+            self.assertEqual("important_evidence", payload["purpose"])
+            self.assertTrue(payload["important_only"])
             self.assertFalse(payload["cloud_upload_performed"])
             self.assertEqual("do_not_retry", payload["cloud_retry_policy"])
             self.assertEqual("none", payload["local_fallback_recommendation"])

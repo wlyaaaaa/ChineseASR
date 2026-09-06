@@ -7,6 +7,8 @@ param(
 
     [switch] $Important,
 
+    [switch] $QualityReview,
+
     [switch] $CloudUploadAuthorized,
 
     [ValidateRange(1, 180)]
@@ -27,7 +29,12 @@ $utf8NoBom = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = $utf8NoBom
 
 $brokerPath = 'C:\ProgramData\PCConfig\AuthorityHost\tools\Invoke-SecretBroker.ps1'
+# One registered, hash-pinned worker owns both explicitly labelled request purposes.
 $brokerTarget = 'qwen-audio3-asr-important-once'
+$importantRequestSchema = 'chineseasr.qwen-audio3-important-request.v1'
+$qualityReviewRequestSchema = 'chineseasr.qwen-audio3-quality-review-request.v1'
+$importantResultSchema = 'chineseasr.qwen-audio3-important-result.v1'
+$qualityReviewResultSchema = 'chineseasr.qwen-audio3-quality-review-result.v1'
 $canonicalRequestRoot = [IO.Path]::GetFullPath(
     'E:\Projects\Tools\ChineseASR\outputs\cloud-jobs'
 )
@@ -40,10 +47,11 @@ function Write-BoundedReceipt {
     )
 
     $receipt = [ordered]@{
-        schema = 'chineseasr.qwen-audio3-important-result.v1'
+        schema = $selectedResultSchema
         status = $Status
         error_code = $ErrorCode
-        important_only = $true
+        purpose = $selectedPurpose
+        important_only = $selectedImportantOnly
         cloud_upload_performed = $false
         plaintext_returned = $false
         secret_returned = $false
@@ -100,8 +108,27 @@ function Get-CloudFailureAdvice {
     }
 }
 
-if (-not $Important) {
-    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'importance_required' -ExitCode 2
+$selectedPurpose = 'unspecified'
+$selectedRequestSchema = $importantRequestSchema
+$selectedResultSchema = $importantResultSchema
+$selectedImportantOnly = $false
+if ($Important -and -not $QualityReview) {
+    $selectedPurpose = 'important_evidence'
+    $selectedRequestSchema = $importantRequestSchema
+    $selectedResultSchema = $importantResultSchema
+    $selectedImportantOnly = $true
+}
+elseif ($QualityReview -and -not $Important) {
+    $selectedPurpose = 'quality_review'
+    $selectedRequestSchema = $qualityReviewRequestSchema
+    $selectedResultSchema = $qualityReviewResultSchema
+}
+
+if ($Important -and $QualityReview) {
+    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'cloud_use_purpose_ambiguous' -ExitCode 2
+}
+if (-not $Important -and -not $QualityReview) {
+    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'cloud_use_purpose_required' -ExitCode 2
 }
 if (-not $CloudUploadAuthorized) {
     Write-BoundedReceipt `
@@ -135,14 +162,17 @@ $jobId = [Guid]::NewGuid().ToString()
 $requestPath = Join-Path $resolvedRequestRoot ($jobId + '.pending.json')
 $resultPath = Join-Path $resolvedRequestRoot ($jobId + '.result.json')
 $request = [ordered]@{
-    schema = 'chineseasr.qwen-audio3-important-request.v1'
+    schema = $selectedRequestSchema
     job_id = $jobId
-    importance = 'important'
+    purpose = $selectedPurpose
     cloud_upload_authorized = $true
     audio_path = $audioPath
     created_utc = [DateTimeOffset]::UtcNow.ToString('o')
     chunk_sec = $ChunkSec
     overlap_sec = $OverlapSec
+}
+if ($Important) {
+    $request['importance'] = 'important'
 }
 [IO.File]::WriteAllText(
     $requestPath,
@@ -180,11 +210,12 @@ if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
     }
     $advice = Get-CloudFailureAdvice -Status 'failed' -ErrorCode $errorCode -CredentialResult ''
     $receipt = [ordered]@{
-        schema = 'chineseasr.qwen-audio3-important-result.v1'
+        schema = $selectedResultSchema
         job_id = $jobId
         status = 'failed'
         error_code = $errorCode
-        important_only = $true
+        purpose = $selectedPurpose
+        important_only = $selectedImportantOnly
         cloud_upload_performed = $false
         broker_exit_code = $brokerExitCode
         plaintext_returned = $false
@@ -204,9 +235,10 @@ if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
 $result = Get-Content -LiteralPath $resultPath -Raw -Encoding utf8 |
     ConvertFrom-Json -Depth 30
 if (
-    [string]$result.schema -cne 'chineseasr.qwen-audio3-important-result.v1' -or
+    [string]$result.schema -cne $selectedResultSchema -or
     [string]$result.job_id -cne $jobId -or
-    $result.important_only -ne $true
+    [string]$result.purpose -cne $selectedPurpose -or
+    $result.important_only -ne $selectedImportantOnly
 ) {
     Write-BoundedReceipt -Status 'failed' -ErrorCode 'cloud_worker_result_invalid' -ExitCode 3
 }

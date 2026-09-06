@@ -38,7 +38,7 @@
 - **低幻觉和可复核**：双模型分歧、静音出字、模板废话、异常重复、繁体残留、超长无标点等都会进入 audit / metrics / review。
 - **适合 AI Agent 调用**：`scripts\asr-smart.ps1` 通过本地 API 提交任务，快速返回 job 状态，避免长时间卡住命令行或上层 Agent。
 
-它是本地优先而不是云转写服务：默认路径不会上传音频。只有调用独立的“重要录音专业云入口”并同时声明录音重要、授权本次云上传时，才会把本机切片发送给阿里云百炼；模型、输出、wheelhouse 和私人评测数据仍保留在本机。
+它是本地优先而不是云转写服务：默认路径不会上传音频。只有调用独立的云入口、明确标注本次是重要录音或已授权的存疑转写质量复核、并授权本次云上传时，才会把本机切片发送给阿里云百炼；模型、输出、wheelhouse 和私人评测数据仍保留在本机。
 
 ## 当前状态
 
@@ -109,6 +109,9 @@ cd <repo-root>
 # 明确的重要/专业录音才允许使用最强云候选；两个开关缺一即在上传前阻断
 .\scripts\asr-professional-cloud.ps1 -Audio C:\path\to\important.wav -Important -CloudUploadAuthorized -Json
 
+# 已授权、当前选定的普通存疑本地转写可作质量复核；不会被标成重要录音
+.\scripts\asr-professional-cloud.ps1 -Audio C:\path\to\uncertain.wav -QualityReview -CloudUploadAuthorized -Json
+
 # 快速单模型，只在明确接受较少审计时使用
 .\scripts\asr-smart.ps1 -Audio C:\path\to\audio.wav -Mode quick -WaitSec 15 -Json
 
@@ -156,7 +159,7 @@ cd <repo-root>
 .\scripts\smoke-evidence-asr.ps1 -Audio C:\path\to\important.mp3 -Json
 ```
 
-## 重要录音专业云入口
+## 重要录音与存疑质量复核云入口
 
 `scripts\asr-professional-cloud.ps1` 是唯一的云上传入口，当前 worker 固定调用阿里云百炼
 `qwen-audio-3.0-asr-flash` 同步接口。它与 `quick`、`strict`、`long-strict` 隔离，普通调用、
@@ -164,11 +167,14 @@ cd <repo-root>
 `qwen-audio-3.0-asr-flash-filetrans`，但该接口要求公网可访问的文件 URL；本项目坚持本地音频边界，
 因此尚未把它接入本地 worker。现有入口会在本机切片后调用同步模型。
 
-入口在创建任务和读取音频前依次要求：
+入口在创建任务和读取音频前要求一个且仅一个用途开关，以及上传授权：
 
-1. `-Important`：当前录音已被明确归类为重要或专业录音；
-2. `-CloudUploadAuthorized`：调用方确认这次可以把音频切片发送给阿里云百炼；
-3. Password Center 的受管目标 `qwen-audio3-asr-important-once` 完整性验证通过。
+1. `-Important`：当前录音已被明确归类为重要或专业录音。请求仍写入 `importance=important`，回执仍为 `important_only=true`；
+2. `-QualityReview`：仅用于已授权、当前选定的普通存疑本地转写质量复核。请求写入独立的 `purpose=quality_review`，没有 `importance` 字段，回执为 `important_only=false`；
+3. `-CloudUploadAuthorized`：调用方确认这次可以把音频切片发送给阿里云百炼；
+4. Password Center 的受管目标 `qwen-audio3-asr-important-once` 完整性验证通过，并且其固定 worker 哈希与当前项目 worker 一致。
+
+两个用途开关不能同时使用。普通质量复核不会自动启动 FireRed、Qwen 或其它本地双引擎；只有结果与上下文仍有影响理解的分歧时，才按实际需要回核原音和本地结果。重要证据录音仍适用下文的本地证据链与人工核听要求。
 
 API Key 只由 Secret Broker 注入固定、哈希绑定的子进程环境，不进入命令行、请求文件、
 转写结果或模型上下文。音频先在本机转为 16 kHz 单声道 WAV，再按最多 180 秒切片；
