@@ -83,6 +83,26 @@ def recording_with_chunks(count=2):
 
 
 class DictationTests(unittest.TestCase):
+    def test_monitor_targets_survive_microphone_preference(self):
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "dictation.yaml"
+            config.write_text("panel_monitor_ids: [PHLC34B, MTT1337]\n", encoding="utf-8")
+            preferences = Path(directory) / "preferences.json"
+            preferences.write_text('{"input_device": "example microphone"}', encoding="utf-8")
+            with patch("zh_asr.dictation.preferences_path", return_value=preferences):
+                settings = DictationSettings.load(config).with_preferences()
+            self.assertEqual(settings.panel_monitor_ids, ["PHLC34B", "MTT1337"])
+            self.assertEqual(settings.input_device, "example microphone")
+
+    def test_invalid_monitor_target_configuration_is_rejected(self):
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "dictation.yaml"
+            for value in ("PHLC34B", [], [None], [" "]):
+                with self.subTest(value=value):
+                    config.write_text(json.dumps({"panel_monitor_ids": value}), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "panel_monitor_ids"):
+                        DictationSettings.load(config)
+
     @staticmethod
     def assembly_segmenter(settings=None):
         # These tests check sample preservation and boundaries, not acoustics.

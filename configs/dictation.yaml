@@ -8,3 +8,7 @@ max_chunk_sec: 20
 input_device: DJI Mic Mini
 # Optional context; leave empty to avoid prompt echo on unclear audio.
 hotwords: ""
+# Mirror the same session on the physical main monitor and MTT VDD.
+# Hardware model IDs remain stable when Windows display numbers change.
+# null uses the current Windows primary monitor instead.
+panel_monitor_ids: [PHLC34B, MTT1337]

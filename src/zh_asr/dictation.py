@@ -33,6 +33,7 @@ class DictationSettings:
     max_chunk_sec: float = 20
     input_device: str | int | None = None
     hotwords: str = ""
+    panel_monitor_ids: list[str] | None = None
 
     def with_preferences(self) -> "DictationSettings":
         try:
@@ -57,6 +58,12 @@ class DictationSettings:
             raise ValueError("min_speech_ms must be between 60 and 1000.")
         if not 3 <= settings.max_chunk_sec <= 30:
             raise ValueError("max_chunk_sec must be between 3 and 30.")
+        if settings.panel_monitor_ids is not None:
+            if (not isinstance(settings.panel_monitor_ids, list)
+                    or not settings.panel_monitor_ids
+                    or any(not isinstance(value, str) or not value.strip()
+                           for value in settings.panel_monitor_ids)):
+                raise ValueError("panel_monitor_ids must be null or a non-empty list of monitor hardware IDs.")
         return settings
 
 
@@ -653,7 +660,8 @@ def main(argv=None) -> int:
                        on_hide=lambda: controller.hide(),
                        on_hotkey=lambda: controller.toggle_visibility(),
                        on_device_change=lambda value: controller.select_microphone(value),
-                       on_refresh_devices=lambda: controller.refresh_devices())
+                       on_refresh_devices=lambda: controller.refresh_devices(),
+                       monitor_ids=settings.panel_monitor_ids)
     if not host.acquire_single_instance():
         host.close()
         return 0

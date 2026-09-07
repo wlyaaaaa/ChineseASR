@@ -8,7 +8,9 @@ from zh_asr.dictation_windows import (
     KeyboardEvent,
     TargetWindow,
     WindowsHost,
+    _DisplayMonitor,
     _HOST_INPUT_EXTRA_INFO,
+    _OverlayPanel,
     _VK_ESCAPE,
     _VK_H,
     _VK_LCONTROL,
@@ -43,10 +45,12 @@ class FakeWindowsApi:
         self.unhooked: list[int] = []
         self.menu_masks = 0
         self.nonactivation_calls: list[tuple[int, bool]] = []
+        self.move_calls: list[tuple[int, int, int]] = []
         self.own_process_windows: set[int] = set()
         self.message_queue_ready = threading.Event()
         self.message_quit = threading.Event()
         self.posted_thread_quits: list[int] = []
+        self.monitors: list[_DisplayMonitor] = []
 
     def _new_handle(self) -> int:
         self.next_handle += 1
@@ -147,6 +151,12 @@ class FakeWindowsApi:
     def make_window_nonactivating(self, _hwnd: int, show: bool = True) -> None:
         self.nonactivation_calls.append((_hwnd, show))
 
+    def list_monitors(self) -> list[_DisplayMonitor]:
+        return list(self.monitors)
+
+    def move_window(self, hwnd: int, x: int, y: int) -> None:
+        self.move_calls.append((hwnd, x, y))
+
 
 class FakeVar:
     def __init__(self) -> None:
@@ -157,9 +167,11 @@ class FakeVar:
 
 
 class FakeOverlay:
-    def __init__(self) -> None:
+    def __init__(self, window_id: int = 900) -> None:
+        self.window_id = window_id
         self.deiconify_count = 0
         self.withdraw_count = 0
+        self.destroy_count = 0
 
     def configure(self, **_kwargs: object) -> None:
         return None
@@ -170,8 +182,20 @@ class FakeOverlay:
     def withdraw(self) -> None:
         self.withdraw_count += 1
 
+    def destroy(self) -> None:
+        self.destroy_count += 1
+
     def winfo_id(self) -> int:
-        return 900
+        return self.window_id
+
+    def update_idletasks(self) -> None:
+        pass
+
+    def winfo_screenwidth(self) -> int:
+        return 1920
+
+    def winfo_screenheight(self) -> int:
+        return 1080
 
 
 class FakeScheduledRoot:
@@ -180,6 +204,9 @@ class FakeScheduledRoot:
 
     def after(self, delay_ms: int, callback: object) -> None:
         self.scheduled.append((delay_ms, callback))
+
+    def update_idletasks(self) -> None:
+        pass
 
 
 class FakeTray:
@@ -411,6 +438,91 @@ class WindowsHostTests(unittest.TestCase):
         host.show("识别失败", "错误详情", error=True)
         host._render_overlay()
         self.assertEqual(1, overlay.deiconify_count)
+
+    def test_configured_pnp_panels_follow_topology_without_using_tur_or_reopening_hidden_ui(self):
+        api = FakeWindowsApi()
+        calls: list[str] = []
+        physical = _DisplayMonitor("MONITOR\\PHLC34B\\001", "Philips", -1920, -200, 1920, 1080)
+        vdd = _DisplayMonitor("MONITOR\\MTT1337\\002", "MTT1337", 0, 0, 2880, 1740, primary=True)
+        tur = _DisplayMonitor("MONITOR\\TUR0000\\003", "TUR", 2880, 0, 2288, 1048)
+        api.monitors = [physical, vdd, tur]
+        host = WindowsHost(
+            on_toggle=lambda: calls.append("toggle"),
+            on_cancel=lambda: None,
+            on_quit=lambda: None,
+            monitor_ids=["PHLC34B", "MTT1337"],
+            api=api,
+        )
+        host._root = FakeScheduledRoot()
+        host._topology_initialized = True
+        created: list[_OverlayPanel] = []
+
+        def create_panel(monitor: _DisplayMonitor | None) -> _OverlayPanel:
+            panel = _OverlayPanel(monitor=monitor, overlay=FakeOverlay(900 + len(created)))
+            created.append(panel)
+            return panel
+
+        host._create_overlay_panel = create_panel  # type: ignore[method-assign]
+        host._sync_display_topology_ui(force=True)
+
+        self.assertEqual([physical, vdd], [panel.monitor for panel in host._panels])
+        host._panel_open = True
+        host._render_overlay()
+        self.assertEqual([1, 1], [panel.overlay.deiconify_count for panel in host._panels])
+        self.assertEqual([(900, True), (901, True)], api.nonactivation_calls)
+
+        host._hide_panel_ui()
+        api.monitors = [vdd, tur]
+        host._sync_display_topology_ui(force=True)
+        host.show("后台状态更新", "不会重新显示")
+        host._render_overlay()
+        self.assertEqual([vdd], [panel.monitor for panel in host._panels])
+        self.assertEqual(0, host._panels[0].overlay.deiconify_count)
+
+        api.monitors = [tur]
+        host._sync_display_topology_ui(force=True)
+        host._render_overlay()
+        self.assertEqual([], host._panels)
+        self.assertIsNone(host._overlay)
+
+        api.monitors = [physical, vdd, tur]
+        host._sync_display_topology_ui(force=True)
+        host.show("后台状态更新", "仍保持隐藏")
+        host._render_overlay()
+        self.assertEqual([physical, vdd], [panel.monitor for panel in host._panels])
+        self.assertEqual([0, 0], [panel.overlay.deiconify_count for panel in host._panels])
+        self.assertEqual([], calls)
+
+    def test_monitor_geometry_preserves_negative_coordinates_and_small_work_areas(self):
+        host = self.make_host()
+        monitor = _DisplayMonitor("MONITOR\\PHLC34B\\001", "Philips", -1920, -200, 120, 50)
+        panel = _OverlayPanel(monitor=monitor, overlay=FakeOverlay())
+
+        self.assertEqual((-1920, -200), host._panel_position(panel))
+        host._panels = [panel]
+        host._panel_open = True
+        host._render_overlay()
+        host._reapply_overlay_nonactivation(panel, finish_position=True)
+        self.assertEqual([(900, -1920, -200)], self.api.move_calls)
+        host._hide_panel_ui()
+        host._panel_open = True
+        host._render_overlay()
+        self.assertEqual([(900, -1920, -200)], self.api.move_calls)
+
+    def test_hotkey_dispatches_one_controller_toggle_for_multiple_panels(self):
+        host = self.make_host()
+        host._panels = [
+            _OverlayPanel(monitor=None, overlay=FakeOverlay(900)),
+            _OverlayPanel(monitor=None, overlay=FakeOverlay(901)),
+        ]
+
+        self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYDOWN)))
+        self.assertTrue(host._handle_keyboard_event(KeyboardEvent(_VK_H, _WM_KEYDOWN)))
+        self.assertTrue(host._handle_keyboard_event(KeyboardEvent(_VK_H, _WM_KEYUP)))
+        self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYUP)))
+        host._dispatch_pending_events()
+
+        self.assertEqual(["toggle"], self.calls)
 
     def test_panel_callbacks_devices_and_external_target_fallback(self):
         calls: list[object] = []

@@ -12,7 +12,7 @@ import queue
 import sys
 import threading
 import time
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Sequence
 
 
 _ULONG_PTR = ctypes.c_size_t
@@ -69,6 +69,8 @@ _WAIT_OBJECT_0 = 0
 _PANEL_WIDTH = 160
 _PANEL_HEIGHT = 60
 _PM_NOREMOVE = 0
+_MONITORINFOF_PRIMARY = 0x00000001
+_TOPOLOGY_REFRESH_SECONDS = 1.0
 
 _MUTEX_NAME = r"Local\ChineseASR.DictationHost.v1"
 _QUIT_EVENT_NAME = r"Local\ChineseASR.DictationHost.Quit.v1"
@@ -148,6 +150,36 @@ class _RECT(ctypes.Structure):
     ]
 
 
+class _MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+
+class _DISPLAY_DEVICEW(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("DeviceName", wintypes.WCHAR * 32),
+        ("DeviceString", wintypes.WCHAR * 128),
+        ("StateFlags", wintypes.DWORD),
+        ("DeviceID", wintypes.WCHAR * 128),
+        ("DeviceKey", wintypes.WCHAR * 128),
+    ]
+
+
+_MONITORENUMPROC = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+    _BOOL,
+    _HANDLE,
+    _HANDLE,
+    ctypes.POINTER(_RECT),
+    _LPARAM,
+)
+
+
 class _GUITHREADINFO(ctypes.Structure):
     _fields_ = [
         ("cbSize", wintypes.DWORD),
@@ -194,6 +226,38 @@ class KeyboardEvent:
     extra_info: int = 0
 
 
+@dataclass(frozen=True)
+class _DisplayMonitor:
+    """An active display with physical work-area coordinates and PnP evidence."""
+
+    pnp_id: str
+    friendly_name: str
+    left: int
+    top: int
+    width: int
+    height: int
+    primary: bool = False
+
+
+@dataclass
+class _OverlayPanel:
+    """Widget state for one visual copy of the shared dictation control."""
+
+    monitor: _DisplayMonitor | None
+    overlay: object
+    background_canvas: object | None = None
+    record_canvas: object | None = None
+    close_canvas: object | None = None
+    device_canvas: object | None = None
+    device_var: object | None = None
+    device_menu: object | None = None
+    visible: bool = False
+    needs_position: bool = True
+    record_hover: bool = False
+    painted_record_state: tuple[bool, bool, bool] | None = None
+    drag_offset: tuple[int, int] | None = None
+
+
 def is_available() -> bool:
     """Return whether this process can use the Windows desktop APIs."""
 
@@ -238,6 +302,7 @@ class _Platform(Protocol):
     def send_unicode_text(self, text: str) -> bool: ...
     def send_menu_mask(self) -> bool: ...
     def make_window_nonactivating(self, hwnd: int, show: bool = True) -> None: ...
+    def list_monitors(self) -> list[_DisplayMonitor]: ...
 
 
 class _WinApi:
@@ -296,6 +361,22 @@ class _WinApi:
             wintypes.UINT,
         ]
         self.user32.SetWindowPos.restype = _BOOL
+        self.user32.EnumDisplayMonitors.argtypes = [
+            _HANDLE,
+            ctypes.POINTER(_RECT),
+            _MONITORENUMPROC,
+            _LPARAM,
+        ]
+        self.user32.EnumDisplayMonitors.restype = _BOOL
+        self.user32.GetMonitorInfoW.argtypes = [_HANDLE, ctypes.POINTER(_MONITORINFOEXW)]
+        self.user32.GetMonitorInfoW.restype = _BOOL
+        self.user32.EnumDisplayDevicesW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(_DISPLAY_DEVICEW),
+            wintypes.DWORD,
+        ]
+        self.user32.EnumDisplayDevicesW.restype = _BOOL
         self._get_window_long = getattr(self.user32, "GetWindowLongPtrW", self.user32.GetWindowLongW)
         self._get_window_long.argtypes = [_HWND, ctypes.c_int]
         self._get_window_long.restype = ctypes.c_ssize_t
@@ -430,8 +511,43 @@ class _WinApi:
             gdi.DeleteObject(region)
 
     def move_window(self, hwnd: int, x: int, y: int) -> None:
-        self.user32.SetWindowPos(_HWND(self.get_root_window(hwnd)), None, x, y, 0, 0,
+        self.user32.SetWindowPos(_HWND(self.get_root_window(hwnd) or hwnd), None, x, y, 0, 0,
                                  _SWP_NOSIZE | _SWP_NOACTIVATE | 0x0004)
+
+    def list_monitors(self) -> list[_DisplayMonitor]:
+        """Enumerate active monitors with PnP IDs instead of volatile DISPLAYn names."""
+
+        monitors: list[_DisplayMonitor] = []
+
+        def visit(handle: object, _hdc: object, _rect: object, _data: int) -> int:
+            info = _MONITORINFOEXW()
+            info.cbSize = ctypes.sizeof(info)
+            if not self.user32.GetMonitorInfoW(_HANDLE(_handle_value(handle)), ctypes.byref(info)):
+                return True
+            display = _DISPLAY_DEVICEW()
+            display.cb = ctypes.sizeof(display)
+            self.user32.EnumDisplayDevicesW(info.szDevice, 0, ctypes.byref(display), 0)
+            work = info.rcWork
+            width = int(work.right - work.left)
+            height = int(work.bottom - work.top)
+            if width <= 0 or height <= 0:
+                return True
+            monitors.append(
+                _DisplayMonitor(
+                    pnp_id=str(display.DeviceID),
+                    friendly_name=str(display.DeviceString),
+                    left=int(work.left),
+                    top=int(work.top),
+                    width=width,
+                    height=height,
+                    primary=bool(info.dwFlags & _MONITORINFOF_PRIMARY),
+                )
+            )
+            return True
+
+        callback = _MONITORENUMPROC(visit)
+        self.user32.EnumDisplayMonitors(None, None, callback, 0)
+        return monitors
 
     def get_focus_window(self, foreground: int) -> int:
         if not foreground:
@@ -590,6 +706,7 @@ class WindowsHost:
         on_hotkey: Callable[[], None] | None = None,
         on_device_change: Callable[[str | None], None] | None = None,
         on_refresh_devices: Callable[[], None] | None = None,
+        monitor_ids: Sequence[str] | None = None,
         api: _Platform | None = None,
         instance_guard: SingleInstanceGuard | None = None,
         tk_module: object | None = None,
@@ -602,6 +719,13 @@ class WindowsHost:
         self.on_hotkey = on_hotkey or on_toggle
         self.on_device_change = on_device_change or (lambda _value: None)
         self.on_refresh_devices = on_refresh_devices or (lambda: None)
+        if isinstance(monitor_ids, str):
+            monitor_ids = [monitor_ids]
+        self._monitor_ids = (
+            None
+            if monitor_ids is None
+            else tuple(self._normalize_monitor_id(value) for value in monitor_ids if str(value).strip())
+        )
         self._api = api or _WinApi()
         self._process_id = self._api.current_process_id()
         self._guard = instance_guard or SingleInstanceGuard(self._api)
@@ -640,6 +764,10 @@ class WindowsHost:
         self._finalized = False
         self._root = None
         self._overlay = None
+        self._panels: list[_OverlayPanel] = []
+        self._topology_initialized = False
+        self._topology_signature: tuple[object, ...] | None = None
+        self._last_topology_check = 0.0
         self._ui_thread_id: int | None = None
         self._own_window_roots: set[int] = set()
         self._last_external_target: TargetWindow | None = None
@@ -657,12 +785,83 @@ class WindowsHost:
         self._painted_record_state = None
         self._tooltip = None
         self._tooltip_after = None
+        self._tooltip_panel: _OverlayPanel | None = None
         self._status_label = None
         self._microphones: list[dict[str, str | None]] = []
         self._selected_microphone: str | None = None
         self._drag_offset: tuple[int, int] | None = None
         self._tray = None
         self._tray_thread: threading.Thread | None = None
+
+    @staticmethod
+    def _normalize_monitor_id(value: object) -> str:
+        return "".join(character for character in str(value).upper() if character.isalnum())
+
+    def _active_monitors(self) -> list[_DisplayMonitor]:
+        """Return only currently active, usable monitors from the platform API."""
+
+        enumerator = getattr(self._api, "list_monitors", None)
+        if not callable(enumerator):
+            return []
+        try:
+            candidates = enumerator()
+        except Exception:
+            return []
+        return [
+            monitor
+            for monitor in candidates
+            if isinstance(monitor, _DisplayMonitor) and monitor.width > 0 and monitor.height > 0
+        ]
+
+    def _monitor_matches(self, monitor: _DisplayMonitor, target: str) -> bool:
+        identities = (monitor.pnp_id, monitor.friendly_name)
+        return any(target and target in self._normalize_monitor_id(identity) for identity in identities)
+
+    def _selected_monitors(self) -> list[_DisplayMonitor | None]:
+        """Use PnP selectors when configured; do not redirect an absent target elsewhere."""
+
+        monitors = self._active_monitors()
+        if self._monitor_ids is None:
+            if not monitors:
+                # Preserve the former single-primary-screen behavior on platforms
+                # which cannot enumerate monitors (including older test doubles).
+                return [None]
+            return [next((monitor for monitor in monitors if monitor.primary), monitors[0])]
+
+        selected: list[_DisplayMonitor] = []
+        for target in self._monitor_ids:
+            selected.extend(monitor for monitor in monitors if self._monitor_matches(monitor, target))
+        seen: set[tuple[str, str, int, int, int, int]] = set()
+        unique: list[_DisplayMonitor] = []
+        for monitor in selected:
+            key = (
+                monitor.pnp_id,
+                monitor.friendly_name,
+                monitor.left,
+                monitor.top,
+                monitor.width,
+                monitor.height,
+            )
+            if key not in seen:
+                seen.add(key)
+                unique.append(monitor)
+        return unique
+
+    @staticmethod
+    def _monitor_signature(monitors: Sequence[_DisplayMonitor | None]) -> tuple[object, ...]:
+        return tuple(
+            None
+            if monitor is None
+            else (
+                monitor.pnp_id,
+                monitor.friendly_name,
+                monitor.left,
+                monitor.top,
+                monitor.width,
+                monitor.height,
+            )
+            for monitor in monitors
+        )
 
     @property
     def shortcut_released(self) -> bool:
@@ -889,55 +1088,128 @@ class WindowsHost:
         self._root = tk.Tk()
         self._ui_thread_id = threading.get_ident()
         self._root.withdraw()
-        self._overlay = tk.Toplevel(self._root)
-        self._overlay.withdraw()
-        self._overlay.overrideredirect(True)
-        self._overlay.attributes("-topmost", True)
-        self._overlay.configure(bg="#ffffff")
+        self._topology_initialized = True
+        self._topology_signature = None
+        self._last_topology_check = 0.0
+        self._sync_display_topology_ui(force=True)
 
-        background = tk.Canvas(self._overlay, width=_PANEL_WIDTH, height=_PANEL_HEIGHT,
+    def _panel_position(self, panel: _OverlayPanel) -> tuple[int, int]:
+        monitor = panel.monitor
+        if monitor is None:
+            x = max(0, (int(panel.overlay.winfo_screenwidth()) - _PANEL_WIDTH) // 2)
+            y = max(0, int(panel.overlay.winfo_screenheight()) - _PANEL_HEIGHT - 80)
+        else:
+            # Preserve negative desktop coordinates: a monitor left of or above
+            # the primary display must not be clamped onto the wrong screen.
+            x = monitor.left + max(0, (monitor.width - _PANEL_WIDTH) // 2)
+            y = monitor.top + max(0, monitor.height - _PANEL_HEIGHT - 80)
+        return x, y
+
+    def _create_overlay_panel(self, monitor: _DisplayMonitor | None) -> _OverlayPanel:
+        tk = self._tk_module
+        overlay = tk.Toplevel(self._root)
+        overlay.withdraw()
+        overlay.overrideredirect(True)
+        overlay.attributes("-topmost", True)
+        overlay.configure(bg="#ffffff")
+        panel = _OverlayPanel(monitor=monitor, overlay=overlay)
+
+        background = tk.Canvas(overlay, width=_PANEL_WIDTH, height=_PANEL_HEIGHT,
                                bg="#ffffff", highlightthickness=0, takefocus=False)
         background.place(x=0, y=0, width=_PANEL_WIDTH, height=_PANEL_HEIGHT)
         background.create_image(0, 0, anchor="nw", image=self._asset("background"))
-        background.bind("<ButtonPress-1>", self._begin_drag)
-        background.bind("<B1-Motion>", self._drag_panel)
-        background.bind("<Button-3>", self._open_device_menu)
-        self._background_canvas = background
+        background.bind("<ButtonPress-1>", lambda event, current=panel: self._begin_drag(event, current))
+        background.bind("<B1-Motion>", lambda event, current=panel: self._drag_panel(event, current))
+        background.bind("<Button-3>", lambda event, current=panel: self._open_device_menu(event, current))
+        panel.background_canvas = background
 
-        self._record_canvas = tk.Canvas(self._overlay, width=48, height=48, bg="#ffffff",
-                                        highlightthickness=0, takefocus=False, cursor="hand2")
-        self._record_canvas.place(x=48, y=6, width=48, height=48)
-        self._record_canvas.bind("<ButtonRelease-1>", lambda _e: self._toggle_from_panel())
-        self._record_canvas.bind("<Button-3>", self._open_device_menu)
-        self._record_canvas.bind("<Enter>", lambda _e: self._record_hover_changed(True))
-        self._record_canvas.bind("<Leave>", lambda _e: self._record_hover_changed(False))
+        record = tk.Canvas(overlay, width=48, height=48, bg="#ffffff",
+                           highlightthickness=0, takefocus=False, cursor="hand2")
+        record.place(x=48, y=6, width=48, height=48)
+        record.bind("<ButtonRelease-1>", lambda _event: self._toggle_from_panel())
+        record.bind("<Button-3>", lambda event, current=panel: self._open_device_menu(event, current))
+        record.bind("<Enter>", lambda _event, current=panel: self._record_hover_changed(True, current))
+        record.bind("<Leave>", lambda _event, current=panel: self._record_hover_changed(False, current))
+        panel.record_canvas = record
 
-        self._device_canvas = tk.Canvas(self._overlay, width=18, height=24, bg="#ffffff",
-                                        highlightthickness=0, takefocus=False, cursor="hand2")
-        self._device_canvas.place(x=98, y=18, width=18, height=24)
-        self._device_canvas.create_image(0, 0, anchor="nw", image=self._asset("device"))
-        self._device_canvas.bind("<ButtonRelease-1>", self._open_device_menu)
+        device = tk.Canvas(overlay, width=18, height=24, bg="#ffffff",
+                           highlightthickness=0, takefocus=False, cursor="hand2")
+        device.place(x=98, y=18, width=18, height=24)
+        device.create_image(0, 0, anchor="nw", image=self._asset("device"))
+        device.bind("<ButtonRelease-1>", lambda event, current=panel: self._open_device_menu(event, current))
+        panel.device_canvas = device
 
-        self._close_canvas = tk.Canvas(self._overlay, width=28, height=28, bg="#ffffff",
-                                       highlightthickness=0, takefocus=False, cursor="hand2")
-        self._close_canvas.place(x=118, y=16, width=28, height=28)
-        self._close_canvas.bind("<ButtonRelease-1>", lambda _e: self._hide_from_panel())
-        self._close_canvas.bind("<Enter>", lambda _e: self._paint_close_button(True))
-        self._close_canvas.bind("<Leave>", lambda _e: self._paint_close_button(False))
+        close = tk.Canvas(overlay, width=28, height=28, bg="#ffffff",
+                          highlightthickness=0, takefocus=False, cursor="hand2")
+        close.place(x=118, y=16, width=28, height=28)
+        close.bind("<ButtonRelease-1>", lambda _event: self._hide_from_panel())
+        close.bind("<Enter>", lambda _event, current=panel: self._paint_close_button(True, current))
+        close.bind("<Leave>", lambda _event, current=panel: self._paint_close_button(False, current))
+        panel.close_canvas = close
 
-        self._device_var = tk.StringVar(value="")
-        self._device_menu = tk.Menu(self._overlay, tearoff=False, bg="#ffffff",
-                                    # Points follow Windows DPI; the outer panel stays in pixels.
-                                    activebackground="#dcfce7", font=("Microsoft YaHei UI", 10))
-        x = max(0, (self._overlay.winfo_screenwidth() - _PANEL_WIDTH) // 2)
-        y = max(0, self._overlay.winfo_screenheight() - _PANEL_HEIGHT - 80)
-        self._overlay.geometry(f"{_PANEL_WIDTH}x{_PANEL_HEIGHT}+{x}+{y}")
-        self._overlay.protocol("WM_DELETE_WINDOW", self._hide_from_panel)
-        self._api.make_window_nonactivating(int(self._overlay.winfo_id()), show=False)
+        panel.device_var = tk.StringVar(value="")
+        panel.device_menu = tk.Menu(overlay, tearoff=False, bg="#ffffff",
+                                   # Points follow Windows DPI; the outer panel stays in pixels.
+                                   activebackground="#dcfce7", font=("Microsoft YaHei UI", 10))
+        # Tk interprets a negative geometry offset relative to the right/bottom
+        # edge. Set size here and position the actual wrapper with native signed
+        # desktop coordinates once Tk has mapped it.
+        x, y = self._panel_position(panel)
+        overlay.geometry(f"{_PANEL_WIDTH}x{_PANEL_HEIGHT}+{max(0, x)}+{max(0, y)}")
+        overlay.protocol("WM_DELETE_WINDOW", self._hide_from_panel)
+        self._api.make_window_nonactivating(int(overlay.winfo_id()), show=False)
+        return panel
+
+    def _set_legacy_panel_references(self) -> None:
+        """Keep existing single-panel test and extension hooks pointed at panel one."""
+
+        panel = self._panels[0] if self._panels else None
+        self._overlay = None if panel is None else panel.overlay
+        self._background_canvas = None if panel is None else panel.background_canvas
+        self._record_canvas = None if panel is None else panel.record_canvas
+        self._close_canvas = None if panel is None else panel.close_canvas
+        self._device_canvas = None if panel is None else panel.device_canvas
+        self._device_var = None if panel is None else panel.device_var
+        self._device_menu = None if panel is None else panel.device_menu
+        self._record_hover = False if panel is None else panel.record_hover
+        self._painted_record_state = None if panel is None else panel.painted_record_state
+
+    def _destroy_overlay_panels(self) -> None:
+        panels, self._panels = self._panels, []
+        for panel in panels:
+            try:
+                panel.overlay.withdraw()
+                panel.overlay.destroy()
+            except Exception:
+                pass
+        self._overlay_visible = False
+        self._set_legacy_panel_references()
+
+    def _rebuild_overlay_panels(self, monitors: Sequence[_DisplayMonitor | None]) -> None:
+        self._hide_tooltip()
+        self._destroy_overlay_panels()
+        self._panels = [self._create_overlay_panel(monitor) for monitor in monitors]
+        self._set_legacy_panel_references()
         self._refresh_own_window_roots_ui()
         self._refresh_microphone_menu_ui()
         self._paint_record_button_ui()
         self._paint_close_button(False)
+
+    def _sync_display_topology_ui(self, *, force: bool = False) -> None:
+        """Recreate panels only for current target monitors after topology changes."""
+
+        if not self._topology_initialized or self._root is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_topology_check < _TOPOLOGY_REFRESH_SECONDS:
+            return
+        self._last_topology_check = now
+        monitors = self._selected_monitors()
+        signature = self._monitor_signature(monitors)
+        if not force and signature == self._topology_signature:
+            return
+        self._rebuild_overlay_panels(monitors)
+        self._topology_signature = signature
 
     def _asset(self, kind: str, active: bool = False, error: bool = False, hover: bool = False):
         key = (kind, active, error, hover)
@@ -979,17 +1251,33 @@ class WindowsHost:
         self._image_cache[key] = photo
         return photo
 
-    def _paint_close_button(self, hover: bool) -> None:
+    def _paint_close_button(self, hover: bool, panel: _OverlayPanel | None = None) -> None:
+        panels = [panel] if panel is not None else self._panels
+        if panels:
+            for current in panels:
+                if current.close_canvas is not None:
+                    current.close_canvas.delete("all")
+                    current.close_canvas.create_image(
+                        0, 0, anchor="nw", image=self._asset("close", hover=hover)
+                    )
+            return
         if self._close_canvas is not None:
             self._close_canvas.delete("all")
             self._close_canvas.create_image(0, 0, anchor="nw", image=self._asset("close", hover=hover))
 
-    def _record_hover_changed(self, inside: bool) -> None:
-        self._record_hover = inside
-        self._paint_record_button_ui()
+    def _record_hover_changed(self, inside: bool, panel: _OverlayPanel | None = None) -> None:
+        if panel is None:
+            self._record_hover = inside
+        else:
+            panel.record_hover = inside
+        self._paint_record_button_ui(panel)
         self._hide_tooltip()
         if inside and self._root is not None:
-            self._tooltip_after = self._root.after(450, self._show_tooltip)
+            self._tooltip_panel = panel
+            self._tooltip_after = self._root.after(
+                450,
+                lambda current=panel: self._show_tooltip(current),
+            )
 
     def _tooltip_text(self) -> str:
         with self._lock:
@@ -1002,9 +1290,12 @@ class WindowsHost:
             return status[:24]
         return "正在录音 · 单击暂停" if active else "单击录音 · 右键选麦克风"
 
-    def _show_tooltip(self) -> None:
+    def _show_tooltip(self, panel: _OverlayPanel | None = None) -> None:
         self._tooltip_after = None
-        if not self._panel_open or not self._record_hover or self._root is None:
+        current = panel or self._tooltip_panel
+        hovered = self._record_hover if current is None else current.record_hover
+        overlay = self._overlay if current is None else current.overlay
+        if not self._panel_open or not hovered or self._root is None or overlay is None:
             return
         tk = self._tk_module
         tip = tk.Toplevel(self._root)
@@ -1015,10 +1306,14 @@ class WindowsHost:
         tk.Label(tip, text=self._tooltip_text(), font=("Microsoft YaHei UI", -12),
                  fg="#526258", bg="#f8fbf9", padx=8, pady=5).pack()
         tip.update_idletasks()
-        tip.geometry(f"+{max(0,self._overlay.winfo_rootx())}+{max(0,self._overlay.winfo_rooty()-tip.winfo_reqheight()-6)}")
+        x = int(overlay.winfo_rootx())
+        y = int(overlay.winfo_rooty()) - int(tip.winfo_reqheight()) - 6
+        tip.geometry("+0+0")
         self._api.make_window_nonactivating(int(tip.winfo_id()), show=False)
         tip.deiconify()
         self._api.make_window_nonactivating(int(tip.winfo_id()))
+        tip.update_idletasks()
+        self._api.move_window(int(tip.winfo_id()), x, y)
 
     def _hide_tooltip(self) -> None:
         if self._tooltip_after is not None and self._root is not None:
@@ -1027,22 +1322,27 @@ class WindowsHost:
         if self._tooltip is not None:
             self._tooltip.destroy()
             self._tooltip = None
+        self._tooltip_panel = None
 
-    def _open_device_menu(self, event) -> None:
+    def _open_device_menu(self, event, panel: _OverlayPanel | None = None) -> None:
         self._hide_tooltip()
         self._remember_external_target()
         self._refresh_microphone_menu_ui()
+        menu = self._device_menu if panel is None else panel.device_menu
+        if menu is None:
+            return
         try:
-            self._device_menu.tk_popup(event.x_root, event.y_root)
+            menu.tk_popup(event.x_root, event.y_root)
         finally:
-            self._device_menu.grab_release()
+            menu.grab_release()
 
     def _is_ui_thread(self) -> bool:
         return self._ui_thread_id is not None and self._ui_thread_id == threading.get_ident()
 
     def _refresh_own_window_roots_ui(self) -> None:
         roots: set[int] = set()
-        for widget in (self._root, self._overlay):
+        overlays = [panel.overlay for panel in self._panels] or [self._overlay]
+        for widget in (self._root, *overlays):
             if widget is None:
                 continue
             try:
@@ -1054,16 +1354,24 @@ class WindowsHost:
         with self._lock:
             self._own_window_roots = roots
 
-    def _begin_drag(self, event) -> None:
-        if self._overlay is None:
+    def _begin_drag(self, event, panel: _OverlayPanel | None = None) -> None:
+        overlay = self._overlay if panel is None else panel.overlay
+        if overlay is None:
             return
-        self._drag_offset = (event.x_root - self._overlay.winfo_x(), event.y_root - self._overlay.winfo_y())
+        offset = (event.x_root - overlay.winfo_x(), event.y_root - overlay.winfo_y())
+        if panel is None:
+            self._drag_offset = offset
+        else:
+            panel.drag_offset = offset
+            panel.needs_position = False
 
-    def _drag_panel(self, event) -> None:
-        if self._overlay is None or self._drag_offset is None:
+    def _drag_panel(self, event, panel: _OverlayPanel | None = None) -> None:
+        overlay = self._overlay if panel is None else panel.overlay
+        offset = self._drag_offset if panel is None else panel.drag_offset
+        if overlay is None or offset is None:
             return
-        offset_x, offset_y = self._drag_offset
-        self._api.move_window(int(self._overlay.winfo_id()), event.x_root - offset_x, event.y_root - offset_y)
+        offset_x, offset_y = offset
+        self._api.move_window(int(overlay.winfo_id()), event.x_root - offset_x, event.y_root - offset_y)
 
     def _toggle_from_panel(self) -> None:
         self._hide_tooltip()
@@ -1083,6 +1391,16 @@ class WindowsHost:
         self._hide_tooltip()
         with self._lock:
             self._panel_open = False
+        if self._panels:
+            for panel in self._panels:
+                if panel.visible:
+                    try:
+                        panel.overlay.withdraw()
+                    except Exception:
+                        pass
+                panel.visible = False
+            self._overlay_visible = False
+            return
         if self._overlay is not None and self._overlay_visible:
             try:
                 self._overlay.withdraw()
@@ -1103,29 +1421,50 @@ class WindowsHost:
             self.show("切换麦克风失败", "可重新选择设备", error=True)
 
     def _refresh_microphone_menu_ui(self) -> None:
-        if self._device_menu is None or self._device_var is None:
-            return
         with self._lock:
             choices = list(self._microphones)
             selected = self._selected_microphone
-        self._device_menu.delete(0, "end")
-        self._device_var.set(selected or "")
-        for item in choices:
-            value = item["value"]
-            label = str(item["label"])
-            self._device_menu.add_radiobutton(label=label, variable=self._device_var, value=value or "",
-                                              command=lambda item_value=value: self._select_microphone(item_value))
-        if not choices:
-            self._device_menu.add_command(label="未发现可用麦克风", state="disabled")
-        self._device_menu.add_separator()
-        self._device_menu.add_command(label="刷新麦克风", command=self._refresh_devices_from_panel)
-        self._device_menu.add_command(label="复制最近文字", command=self.copy_text)
+        menus = (
+            [(panel.device_menu, panel.device_var) for panel in self._panels]
+            if self._panels
+            else [(self._device_menu, self._device_var)]
+        )
+        for menu, variable in menus:
+            if menu is None or variable is None:
+                continue
+            menu.delete(0, "end")
+            variable.set(selected or "")
+            for item in choices:
+                value = item["value"]
+                label = str(item["label"])
+                menu.add_radiobutton(
+                    label=label,
+                    variable=variable,
+                    value=value or "",
+                    command=lambda item_value=value: self._select_microphone(item_value),
+                )
+            if not choices:
+                menu.add_command(label="未发现可用麦克风", state="disabled")
+            menu.add_separator()
+            menu.add_command(label="刷新麦克风", command=self._refresh_devices_from_panel)
+            menu.add_command(label="复制最近文字", command=self.copy_text)
 
-    def _paint_record_button_ui(self) -> None:
+    def _paint_record_button_ui(self, panel: _OverlayPanel | None = None) -> None:
+        with self._lock:
+            recording, error = self._recording, self._error
+        panels = [panel] if panel is not None else self._panels
+        if panels:
+            for current in panels:
+                state = (recording, error, current.record_hover)
+                if current.record_canvas is None or state == current.painted_record_state:
+                    continue
+                current.painted_record_state = state
+                current.record_canvas.delete("all")
+                current.record_canvas.create_image(0, 0, anchor="nw", image=self._asset("record", *state))
+            return
         if self._record_canvas is None:
             return
-        with self._lock:
-            state = (self._recording, self._error, self._record_hover)
+        state = (recording, error, self._record_hover)
         if state == self._painted_record_state:
             return
         self._painted_record_state = state
@@ -1374,6 +1713,31 @@ class WindowsHost:
             self.show("无法复制文字", "请在托盘重试", error=True)
 
     def _render_overlay(self) -> None:
+        if self._topology_initialized:
+            self._sync_display_topology_ui()
+        if self._panels:
+            with self._lock:
+                should_show = self._panel_open
+            try:
+                self._paint_record_button_ui()
+                shown_now = False
+                if should_show:
+                    for panel in self._panels:
+                        if panel.visible:
+                            continue
+                        panel.overlay.deiconify()
+                        self._api.make_window_nonactivating(int(panel.overlay.winfo_id()))
+                        panel.visible = True
+                        shown_now = True
+                    self._overlay_visible = any(panel.visible for panel in self._panels)
+                    if shown_now:
+                        self._refresh_own_window_roots_ui()
+                        self._schedule_overlay_style_reapply()
+                elif self._overlay_visible:
+                    self._hide_panel_ui()
+            except Exception:
+                pass
+            return
         if self._overlay is None:
             return
         with self._lock:
@@ -1396,21 +1760,40 @@ class WindowsHost:
 
         if self._root is None:
             return
+        if self._panels:
+            for panel in self._panels:
+                for delay_ms in (0, 75, 250):
+                    try:
+                        self._root.after(
+                            delay_ms,
+                            lambda current=panel, final=delay_ms == 250: self._reapply_overlay_nonactivation(
+                                current, finish_position=final),
+                        )
+                    except Exception:
+                        return
+            return
         for delay_ms in (0, 75, 250):
             try:
                 self._root.after(delay_ms, self._reapply_overlay_nonactivation)
             except Exception:
                 return
 
-    def _reapply_overlay_nonactivation(self) -> None:
-        if self._overlay is None or not self._overlay_visible:
+    def _reapply_overlay_nonactivation(self, panel: _OverlayPanel | None = None,
+                                      *, finish_position: bool = False) -> None:
+        overlay = self._overlay if panel is None else panel.overlay
+        visible = self._overlay_visible if panel is None else panel.visible
+        if overlay is None or not visible:
             return
         try:
             # ``show=False`` only refreshes the real wrapper's style; it never
             # reveals an overlay that the normal visibility policy has hidden.
-            self._api.make_window_nonactivating(int(self._overlay.winfo_id()), show=False)
+            self._api.make_window_nonactivating(int(overlay.winfo_id()), show=False)
+            if panel is not None and panel.needs_position:
+                self._api.move_window(int(overlay.winfo_id()), *self._panel_position(panel))
+                if finish_position:
+                    panel.needs_position = False
             if hasattr(self._api, "round_panel"):
-                self._api.round_panel(int(self._overlay.winfo_id()), _PANEL_WIDTH, _PANEL_HEIGHT)
+                self._api.round_panel(int(overlay.winfo_id()), _PANEL_WIDTH, _PANEL_HEIGHT)
             self._refresh_own_window_roots_ui()
         except Exception:
             pass
@@ -1456,7 +1839,9 @@ class WindowsHost:
         self._running = False
         # Remove the user-visible panel first.  Controller/model cleanup may take
         # a while, but it must never leave an "exiting" strip in front of the user.
-        if self._overlay is not None:
+        if self._panels:
+            self._destroy_overlay_panels()
+        elif self._overlay is not None:
             try:
                 self._overlay.withdraw()
                 self._overlay.destroy()
@@ -1464,6 +1849,8 @@ class WindowsHost:
                 pass
             self._overlay = None
         self._overlay_visible = False
+        self._topology_initialized = False
+        self._topology_signature = None
         with self._lock:
             self._panel_open = False
             self._own_window_roots.clear()
