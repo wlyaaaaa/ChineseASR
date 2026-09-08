@@ -9,8 +9,56 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
 $Pythonw = Join-Path $Root '.venv\Scripts\pythonw.exe'
 $TaskName = 'ChineseASR Dictation'
+$ShortcutName = '中文听写.lnk'
+$Launcher = Join-Path $Root 'scripts\Start-Dictation.vbs'
+$Wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
 if (-not (Test-Path -LiteralPath $Pythonw)) {
     throw 'ChineseASR Python environment is missing. Run setup-core.ps1 and setup-qwen.ps1 first.'
+}
+
+function Get-DictationShortcutPath {
+    return (Join-Path ([Environment]::GetFolderPath('Programs')) $ShortcutName)
+}
+
+function Get-DictationShortcutState {
+    $path = Get-DictationShortcutPath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return [pscustomobject]@{ path = $path; present = $false; owned = $false; target = ''; arguments = '' }
+    }
+    $shell = New-Object -ComObject WScript.Shell
+    $link = $shell.CreateShortcut($path)
+    $target = [string]$link.TargetPath
+    $arguments = [string]$link.Arguments
+    $expectedArguments = '"' + $Launcher + '"'
+    $targetFull = $target
+    if (-not [string]::IsNullOrWhiteSpace($target)) {
+        try { $targetFull = [IO.Path]::GetFullPath($target) } catch { $targetFull = $target }
+    }
+    $owned = $targetFull -ieq [IO.Path]::GetFullPath($Wscript) -and $arguments -ceq $expectedArguments
+    return [pscustomobject]@{ path = $path; present = $true; owned = $owned; target = $target; arguments = $arguments }
+}
+
+function Install-DictationShortcut {
+    if (-not (Test-Path -LiteralPath $Launcher -PathType Leaf)) { throw 'ChineseASR start launcher is missing.' }
+    if (-not (Test-Path -LiteralPath $Wscript -PathType Leaf)) { throw 'Windows Script Host is missing.' }
+    $state = Get-DictationShortcutState
+    if ($state.present -and -not $state.owned) { throw 'The ChineseASR Start Menu shortcut path is owned by another target.' }
+    $shell = New-Object -ComObject WScript.Shell
+    $link = $shell.CreateShortcut($state.path)
+    $link.TargetPath = $Wscript
+    $link.Arguments = '"' + $Launcher + '"'
+    $link.WorkingDirectory = $Root
+    $link.Description = 'Start local ChineseASR Win+H dictation.'
+    $link.Save()
+    $after = Get-DictationShortcutState
+    if (-not $after.owned) { throw 'ChineseASR Start Menu shortcut readback failed.' }
+}
+
+function Remove-DictationShortcut {
+    $state = Get-DictationShortcutState
+    if ($state.present -and $state.owned) {
+        Remove-Item -LiteralPath $state.path -Force
+    }
 }
 
 function Test-DictationRunning {
@@ -85,6 +133,7 @@ try {
         $Principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
         $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
         Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Description 'Local ChineseASR Win+H dictation for the signed-in user. Restore with scripts\dictation.ps1 -Mode Install.' -Force | Out-Null
+        Install-DictationShortcut
         Start-ScheduledTask -TaskName $TaskName -TaskPath '\'
     } elseif ($Mode -eq 'Start') {
         Start-DictationHost
@@ -96,8 +145,10 @@ try {
         if ($Existing) {
             Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm:$false
         }
+        Remove-DictationShortcut
     }
     $Task = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
+    $Shortcut = Get-DictationShortcutState
     [pscustomobject]@{
         installed = [bool]$Task
         running = Test-DictationRunning
@@ -106,6 +157,9 @@ try {
         hotkey = 'Win+H'
         hotkeys = @('Win+H', 'Ctrl+Win+H')
         config = (Join-Path $Root 'configs\dictation.yaml')
+        shortcut_path = $Shortcut.path
+        shortcut_present = $Shortcut.present
+        shortcut_owned = $Shortcut.owned
     } | ConvertTo-Json
 } finally {
     Pop-Location
