@@ -11,6 +11,7 @@ $Pythonw = Join-Path $Root '.venv\Scripts\pythonw.exe'
 $TaskName = 'ChineseASR Dictation'
 $ShortcutName = '中文听写.lnk'
 $Launcher = Join-Path $Root 'scripts\Start-Dictation.vbs'
+$Icon = Join-Path $Root 'assets\chinese-dictation.ico'
 $Wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
 if (-not (Test-Path -LiteralPath $Pythonw)) {
     throw 'ChineseASR Python environment is missing. Run setup-core.ps1 and setup-qwen.ps1 first.'
@@ -23,23 +24,26 @@ function Get-DictationShortcutPath {
 function Get-DictationShortcutState {
     $path = Get-DictationShortcutPath
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        return [pscustomobject]@{ path = $path; present = $false; owned = $false; target = ''; arguments = '' }
+        return [pscustomobject]@{ path = $path; present = $false; owned = $false; icon_match = $false; target = ''; arguments = ''; icon = '' }
     }
     $shell = New-Object -ComObject WScript.Shell
     $link = $shell.CreateShortcut($path)
     $target = [string]$link.TargetPath
     $arguments = [string]$link.Arguments
+    $icon = [string]$link.IconLocation
     $expectedArguments = '"' + $Launcher + '"'
+    $expectedIcon = [IO.Path]::GetFullPath($Icon) + ',0'
     $targetFull = $target
     if (-not [string]::IsNullOrWhiteSpace($target)) {
         try { $targetFull = [IO.Path]::GetFullPath($target) } catch { $targetFull = $target }
     }
     $owned = $targetFull -ieq [IO.Path]::GetFullPath($Wscript) -and $arguments -ceq $expectedArguments
-    return [pscustomobject]@{ path = $path; present = $true; owned = $owned; target = $target; arguments = $arguments }
+    return [pscustomobject]@{ path = $path; present = $true; owned = $owned; icon_match = ($icon -ieq $expectedIcon); target = $target; arguments = $arguments; icon = $icon }
 }
 
 function Install-DictationShortcut {
     if (-not (Test-Path -LiteralPath $Launcher -PathType Leaf)) { throw 'ChineseASR start launcher is missing.' }
+    if (-not (Test-Path -LiteralPath $Icon -PathType Leaf)) { throw 'ChineseASR shortcut icon is missing.' }
     if (-not (Test-Path -LiteralPath $Wscript -PathType Leaf)) { throw 'Windows Script Host is missing.' }
     $state = Get-DictationShortcutState
     if ($state.present -and -not $state.owned) { throw 'The ChineseASR Start Menu shortcut path is owned by another target.' }
@@ -47,11 +51,12 @@ function Install-DictationShortcut {
     $link = $shell.CreateShortcut($state.path)
     $link.TargetPath = $Wscript
     $link.Arguments = '"' + $Launcher + '"'
+    $link.IconLocation = [IO.Path]::GetFullPath($Icon) + ',0'
     $link.WorkingDirectory = $Root
     $link.Description = 'Start local ChineseASR Win+H dictation.'
     $link.Save()
     $after = Get-DictationShortcutState
-    if (-not $after.owned) { throw 'ChineseASR Start Menu shortcut readback failed.' }
+    if (-not $after.owned -or -not $after.icon_match) { throw 'ChineseASR Start Menu shortcut readback failed.' }
 }
 
 function Remove-DictationShortcut {
@@ -160,6 +165,8 @@ try {
         shortcut_path = $Shortcut.path
         shortcut_present = $Shortcut.present
         shortcut_owned = $Shortcut.owned
+        shortcut_icon = $Shortcut.icon
+        shortcut_icon_match = $Shortcut.icon_match
     } | ConvertTo-Json
 } finally {
     Pop-Location

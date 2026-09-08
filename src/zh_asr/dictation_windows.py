@@ -8,6 +8,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
+from pathlib import Path
 import queue
 import sys
 import threading
@@ -1841,11 +1842,18 @@ class WindowsHost:
         import pystray
         from PIL import Image, ImageDraw
 
-        image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle((8, 5, 56, 59), radius=13, fill=(38, 132, 255, 255))
-        draw.ellipse((25, 13, 39, 37), fill=(255, 255, 255, 255))
-        draw.rectangle((29, 35, 35, 48), fill=(255, 255, 255, 255))
+        icon_path = Path(__file__).resolve().parents[2] / "assets" / "chinese-dictation.ico"
+        try:
+            image = Image.open(icon_path).convert("RGBA")
+            image.load()
+        except Exception:
+            # Keep the tray available when a source checkout is incomplete or
+            # an installed asset is unreadable.
+            image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            draw.rounded_rectangle((8, 5, 56, 59), radius=13, fill=(38, 132, 255, 255))
+            draw.ellipse((25, 13, 39, 37), fill=(255, 255, 255, 255))
+            draw.rectangle((29, 35, 35, 48), fill=(255, 255, 255, 255))
         menu = pystray.Menu(
             pystray.MenuItem("显示/隐藏听写", lambda *_: self._events.put("toggle")),
             pystray.MenuItem("取消本次听写", lambda *_: self._events.put("cancel")),
