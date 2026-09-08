@@ -12,7 +12,8 @@ import json
 import numpy as np
 
 from zh_asr.dictation import (
-    DictationController, DictationSettings, PauseSegmenter, QwenDictationEngine, Recording,
+    DictationController, DictationSettings, PauseSegmenter, QwenDictationEngine, Recording, main,
+    resample_audio,
 )
 
 
@@ -83,6 +84,12 @@ def recording_with_chunks(count=2):
 
 
 class DictationTests(unittest.TestCase):
+    def test_start_command_reports_whether_an_existing_host_received_it(self):
+        with patch("zh_asr.dictation_windows.request_existing_start", return_value=True):
+            self.assertEqual(0, main(["--start"]))
+        with patch("zh_asr.dictation_windows.request_existing_start", return_value=False):
+            self.assertEqual(1, main(["--start"]))
+
     def test_monitor_targets_survive_microphone_preference(self):
         with TemporaryDirectory() as directory:
             config = Path(directory) / "dictation.yaml"
@@ -93,6 +100,13 @@ class DictationTests(unittest.TestCase):
                 settings = DictationSettings.load(config).with_preferences()
             self.assertEqual(settings.panel_monitor_ids, ["PHLC34B", "MTT1337"])
             self.assertEqual(settings.input_device, "example microphone")
+
+    def test_native_8khz_phrase_is_resampled_to_model_rate(self):
+        source = np.linspace(-0.5, 0.5, 160, dtype=np.float32)
+        converted = resample_audio(source, 8000, 16000)
+        self.assertEqual(converted.dtype, np.float32)
+        self.assertEqual(len(converted), 320)
+        self.assertTrue(np.isfinite(converted).all())
 
     def test_invalid_monitor_target_configuration_is_rejected(self):
         with TemporaryDirectory() as directory:
@@ -146,7 +160,7 @@ class DictationTests(unittest.TestCase):
     def test_cancel_during_open_closes_late_stream_without_starting_transcription(self):
         entered, release = threading.Event(), threading.Event()
         closed = []
-        def open_late(*args):
+        def open_late(*args, **kwargs):
             entered.set()
             release.wait(2)
             return SimpleNamespace(stop=lambda: closed.append("stop"), close=lambda: closed.append("close"))

@@ -21,6 +21,7 @@ from zh_asr.dictation_windows import (
     _WM_KEYUP,
     _utf16_units,
     is_running,
+    request_existing_start,
     request_existing_quit,
 )
 
@@ -416,6 +417,28 @@ class WindowsHostTests(unittest.TestCase):
         host.close()
         self.assertFalse(is_running(self.api))
         self.assertFalse(request_existing_quit(self.api))
+
+    def test_start_event_dispatches_the_same_visibility_action_as_win_h(self):
+        calls = []
+        self.api = FakeWindowsApi()
+        host = WindowsHost(
+            on_toggle=lambda: calls.append("record"),
+            on_cancel=lambda: None,
+            on_quit=lambda: None,
+            on_hotkey=lambda: calls.append("visibility"),
+            api=self.api,
+        )
+        self.assertTrue(host.acquire_single_instance())
+        host._root = FakeScheduledRoot()
+        host._running = True
+        host._render_overlay = lambda: None
+
+        self.assertTrue(request_existing_start(self.api))
+        host._poll()
+        self.assertEqual(["visibility"], calls)
+
+        host._finalize_close()
+        self.assertFalse(request_existing_start(self.api))
 
     def test_show_does_not_reopen_a_panel_after_the_user_hides_it(self):
         host = self.make_host()

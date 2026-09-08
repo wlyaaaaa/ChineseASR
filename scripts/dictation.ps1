@@ -19,6 +19,27 @@ function Test-DictationRunning {
     return (($result | Select-Object -Last 1) -eq '1')
 }
 
+function Request-DictationStart {
+    & $Python -m zh_asr.dictation --start
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Start-DictationHost {
+    # A running host owns the single instance.  Signal its existing UI instead
+    # of relying on Task Scheduler's IgnoreNew policy to discard this launch.
+    if (Request-DictationStart) { return }
+
+    Start-ScheduledTask -TaskName $TaskName -TaskPath '\'
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        if ((Test-DictationRunning) -and (Request-DictationStart)) { return }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw 'Dictation host did not expose its start command after the scheduled task launch.'
+        }
+        Start-Sleep -Milliseconds 250
+    } while ($true)
+}
+
 function Stop-DictationGracefully {
     & $Python -m zh_asr.dictation --stop
     if ($LASTEXITCODE -ne 0) { throw 'Could not request dictation shutdown.' }
@@ -66,7 +87,7 @@ try {
         Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Description 'Local ChineseASR Win+H dictation for the signed-in user. Restore with scripts\dictation.ps1 -Mode Install.' -Force | Out-Null
         Start-ScheduledTask -TaskName $TaskName -TaskPath '\'
     } elseif ($Mode -eq 'Start') {
-        Start-ScheduledTask -TaskName $TaskName -TaskPath '\'
+        Start-DictationHost
     } elseif ($Mode -eq 'Stop') {
         Stop-DictationGracefully
     } elseif ($Mode -eq 'Uninstall') {

@@ -74,6 +74,7 @@ _TOPOLOGY_REFRESH_SECONDS = 1.0
 
 _MUTEX_NAME = r"Local\ChineseASR.DictationHost.v1"
 _QUIT_EVENT_NAME = r"Local\ChineseASR.DictationHost.Quit.v1"
+_START_EVENT_NAME = r"Local\ChineseASR.DictationHost.Start.v1"
 _MODIFIER_KEYS = (
     _VK_LSHIFT,
     _VK_RSHIFT,
@@ -684,6 +685,19 @@ def request_existing_quit(api: _Platform | None = None) -> bool:
     return bool(platform.available and platform.signal_existing_event(_QUIT_EVENT_NAME))
 
 
+def request_existing_start(api: _Platform | None = None) -> bool:
+    """Ask an already-running host to perform the normal Win+H action.
+
+    The start-menu launcher uses the same visibility/recording transition as
+    the physical hotkey.  This keeps a running scheduled-task instance as the
+    single host instead of relying on ``MultipleInstances=IgnoreNew`` to make
+    a second launch a no-op.
+    """
+
+    platform = api or _WinApi()
+    return bool(platform.available and platform.signal_existing_event(_START_EVENT_NAME))
+
+
 def is_running(api: _Platform | None = None) -> bool:
     """Return whether the same-session dictation mutex is currently held."""
 
@@ -758,6 +772,7 @@ class WindowsHost:
         self._hook_stop = threading.Event()
         self._hook_error = ""
         self._quit_event_handle = 0
+        self._start_event_handle = 0
         self._quit_notified = False
         self._running = False
         self._close_requested = False
@@ -936,8 +951,16 @@ class WindowsHost:
             return False
         if not self._quit_event_handle:
             self._quit_event_handle = self._api.create_quit_event(_QUIT_EVENT_NAME)
-        if self._quit_event_handle:
+        if not self._start_event_handle:
+            self._start_event_handle = self._api.create_quit_event(_START_EVENT_NAME)
+        if self._quit_event_handle and self._start_event_handle:
             return True
+        if self._start_event_handle:
+            self._api.close_handle(self._start_event_handle)
+            self._start_event_handle = 0
+        if self._quit_event_handle:
+            self._api.close_handle(self._quit_event_handle)
+            self._quit_event_handle = 0
         self._guard.release()
         return False
 
@@ -1633,6 +1656,8 @@ class WindowsHost:
         self._drain_ui_calls()
         if self._quit_event_handle and self._api.event_is_signaled(self._quit_event_handle):
             self._events.put("quit")
+        elif self._start_event_handle and self._api.event_is_signaled(self._start_event_handle):
+            self._events.put("toggle")
         self._dispatch_pending_events()
         if self._close_requested:
             self._finalize_close()
@@ -1875,4 +1900,7 @@ class WindowsHost:
         if self._quit_event_handle:
             self._api.close_handle(self._quit_event_handle)
             self._quit_event_handle = 0
+        if self._start_event_handle:
+            self._api.close_handle(self._start_event_handle)
+            self._start_event_handle = 0
         self._guard.release()

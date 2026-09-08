@@ -48,12 +48,13 @@ class FakeSoundDevice:
         return list(self.hostapis)
 
 
-def device(name, index, hostapi, channels=1):
+def device(name, index, hostapi, channels=1, default_samplerate=16000):
     return {
         "name": name,
         "index": index,
         "hostapi": hostapi,
         "max_input_channels": channels,
+        "default_samplerate": default_samplerate,
     }
 
 
@@ -97,6 +98,27 @@ class DictationAudioTests(unittest.TestCase):
         self.assertEqual(second.kwargs["device"], 55)
         self.assertEqual(fake._terminate.call_count, 2)
         self.assertEqual(fake._initialize.call_count, 2)
+
+    def test_uses_named_device_native_rate_when_16khz_is_unavailable(self):
+        fake = FakeSoundDevice([device("DJI Mic Mini-FB7E6B", 49, 3, default_samplerate=8000)])
+
+        def check_input_settings(**kwargs):
+            if kwargs["samplerate"] == 16000:
+                raise ValueError("native endpoint is 8 kHz")
+
+        fake.check_input_settings.side_effect = check_input_settings
+        observed_rates = []
+        with patch.object(dictation_audio, "sd", fake):
+            stream = dictation_audio.open_microphone(
+                self.settings,
+                self.callback,
+                on_sample_rate=observed_rates.append,
+            )
+
+        self.assertEqual(stream.kwargs["samplerate"], 8000)
+        self.assertEqual(stream.kwargs["blocksize"], 160)
+        self.assertEqual(observed_rates, [8000])
+        self.assertEqual(getattr(stream, "_zh_asr_input_sample_rate"), 8000)
 
     def test_never_falls_back_to_another_microphone(self):
         fake = FakeSoundDevice([device("Laptop microphone", 7, 2)])

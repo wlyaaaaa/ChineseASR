@@ -134,13 +134,28 @@ def list_microphones(refresh: bool = True) -> list[dict[str, str | None]]:
     return options
 
 
-def open_microphone(settings: Any, callback: Callable[..., Any]):
-    """Open and start the configured input device at 16 kHz mono float32.
+def _native_sample_rate(info: dict[str, Any]) -> int | None:
+    try:
+        value = int(round(float(info.get("default_samplerate", 0))))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if value > 0 else None
+
+
+def open_microphone(
+    settings: Any,
+    callback: Callable[..., Any],
+    *,
+    on_sample_rate: Callable[[int], Any] | None = None,
+):
+    """Open the configured input and expose its actual capture rate.
 
     A configured device name is matched as a case-insensitive substring so
     Windows endpoint suffixes such as DJI Mic Mini-FB7E6B remain reconnectable.
     Only matching input endpoints are tried; another microphone is never
-    selected as a fallback.
+    selected as a fallback.  If the endpoint cannot open at the model's 16 kHz
+    rate, its advertised native rate is tried and returned on the stream.  The
+    caller resamples the completed phrase through the existing 16 kHz path.
     """
 
     _refresh_portaudio()
@@ -151,41 +166,52 @@ def open_microphone(settings: Any, callback: Callable[..., Any]):
         raise MicrophoneOpenError(f"指定输入设备不存在或没有输入通道：{label}")
 
     sample_rate = int(getattr(settings, "sample_rate", 16000))
-    blocksize = round(sample_rate * _BLOCK_MS / 1000)
     failures: list[str] = []
     for info in candidates:
         index = int(info["index"])
         label = f"{info.get('name', '')} [{info.get('_host_name', '')}]"
-        try:
-            sd.check_input_settings(
-                device=index,
-                samplerate=sample_rate,
-                channels=1,
-                dtype="float32",
-            )
-        except Exception as exc:
-            failures.append(f"{label}: 16kHz 不支持（{type(exc).__name__}）")
-            continue
+        rates = [sample_rate]
+        native_rate = _native_sample_rate(info)
+        if native_rate is not None and native_rate not in rates:
+            rates.append(native_rate)
+        for input_rate in rates:
+            rate_label = f"{input_rate / 1000:g}kHz"
+            try:
+                sd.check_input_settings(
+                    device=index,
+                    samplerate=input_rate,
+                    channels=1,
+                    dtype="float32",
+                )
+            except Exception as exc:
+                failures.append(f"{label}: {rate_label} 不支持（{type(exc).__name__}）")
+                continue
 
-        stream = None
-        try:
-            stream = sd.InputStream(
-                samplerate=sample_rate,
-                channels=1,
-                dtype="float32",
-                blocksize=blocksize,
-                device=index,
-                callback=callback,
-            )
-            stream.start()
-            return stream
-        except Exception as exc:
-            failures.append(f"{label}: 启动失败（{type(exc).__name__}）")
-            if stream is not None:
+            stream = None
+            try:
+                stream = sd.InputStream(
+                    samplerate=input_rate,
+                    channels=1,
+                    dtype="float32",
+                    blocksize=round(input_rate * _BLOCK_MS / 1000),
+                    device=index,
+                    callback=callback,
+                )
                 try:
-                    stream.close()
+                    setattr(stream, "_zh_asr_input_sample_rate", input_rate)
                 except Exception:
                     pass
+                if on_sample_rate is not None:
+                    on_sample_rate(input_rate)
+                stream.start()
+                return stream
+            except Exception as exc:
+                failures.append(f"{label}: {rate_label} 启动失败（{type(exc).__name__}）")
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
 
     label = "Windows 默认输入设备" if requested is None else repr(requested)
     detail = "; ".join(failures) or "没有可用的输入端点"

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+from math import gcd
 import os
 from pathlib import Path
 import queue
@@ -67,6 +68,24 @@ class DictationSettings:
         return settings
 
 
+def resample_audio(audio: np.ndarray, source_sample_rate: int, target_sample_rate: int) -> np.ndarray:
+    """Convert one in-memory phrase to the model's required sample rate."""
+
+    source = int(source_sample_rate)
+    target = int(target_sample_rate)
+    if source <= 0 or target <= 0:
+        raise ValueError("Audio sample rates must be positive.")
+    values = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if source == target:
+        return values.copy()
+    divisor = gcd(source, target)
+    from scipy.signal import resample_poly
+    return np.asarray(
+        resample_poly(values, target // divisor, source // divisor),
+        dtype=np.float32,
+    )
+
+
 def preferences_path() -> Path:
     return project_root() / "outputs" / "dictation" / "preferences.json"
 
@@ -86,9 +105,10 @@ class PauseSegmenter:
     including pre-roll, unvoiced consonants and quiet word endings.
     """
 
-    def __init__(self, settings: DictationSettings, detector=None):
+    def __init__(self, settings: DictationSettings, detector=None, sample_rate: int | None = None):
         self.settings = settings
-        self.detector = detector or VoiceActivityDetector(settings.sample_rate)
+        self.sample_rate = int(sample_rate or settings.sample_rate)
+        self.detector = detector or VoiceActivityDetector(self.sample_rate)
         self.pre_roll: deque[np.ndarray] = deque(maxlen=10)  # 200 ms at 20 ms/block
         self.blocks: list[np.ndarray] = []
         self.speech_flags: list[bool] = []
@@ -114,7 +134,7 @@ class PauseSegmenter:
         self.samples += len(samples)
         self.voiced_samples += len(samples) if active else 0
         self.silent_samples = 0 if active else self.silent_samples + len(samples)
-        sr = self.settings.sample_rate
+        sr = self.sample_rate
         if self.silent_samples >= sr * self.settings.silence_ms / 1000:
             result = self.flush()
             return [result] if result is not None else []
@@ -140,7 +160,7 @@ class PauseSegmenter:
     def flush(self) -> np.ndarray | None:
         result = None
         if (self.blocks and self.voiced_samples >=
-                self.settings.sample_rate * self.settings.min_speech_ms / 1000):
+                self.sample_rate * self.settings.min_speech_ms / 1000):
             result = np.concatenate(self.blocks)
         self.blocks.clear()
         self.speech_flags.clear()
@@ -277,6 +297,7 @@ class Recording:
     error: str = ""
     settings: DictationSettings | None = None
     segmenter: PauseSegmenter | None = None
+    input_sample_rate: int = 16000
     stream: object = None
     submitted: bool = False
     audio_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -339,7 +360,7 @@ class DictationController:
             return
         recording = Recording(target or self.host.capture_target(), queue.Queue(),
                               threading.Event(), threading.Event(), settings=self.settings,
-                              segmenter=PauseSegmenter(self.settings))
+                              segmenter=None)
         self.recording = recording
         self.host.set_busy(True)
         self.host.show("正在打开麦克风", "再次按快捷键或按钮可暂停")
@@ -364,10 +385,19 @@ class DictationController:
                 if recording.stopped.is_set() or self.quit_event.is_set():
                     self._close_capture(recording)
                     continue
+                def set_input_sample_rate(sample_rate: int, r=recording) -> None:
+                    r.input_sample_rate = int(sample_rate)
+                    r.segmenter = PauseSegmenter(r.settings, sample_rate=r.input_sample_rate)
                 try:
                     recording.stream = open_microphone(
                         recording.settings,
-                        lambda data, frames, timing, status, r=recording: self._audio_callback(r, data, status))
+                        lambda data, frames, timing, status, r=recording: self._audio_callback(r, data, status),
+                        on_sample_rate=set_input_sample_rate,
+                    )
+                    if recording.segmenter is None:
+                        set_input_sample_rate(
+                            int(getattr(recording.stream, "_zh_asr_input_sample_rate", recording.settings.sample_rate))
+                        )
                     if recording.stopped.is_set() or self.quit_event.is_set():
                         self._close_capture(recording)
                         continue
@@ -416,7 +446,13 @@ class DictationController:
                 recording.error = "录音发生丢帧，请重新连接或选择其他麦克风"
                 self.host.post_to_ui(lambda: self.stop(cancel=True))
                 return
-            for chunk in recording.segmenter.feed(data[:, 0]):
+            segmenter = recording.segmenter
+            if segmenter is None:
+                recording.cancelled.set()
+                recording.error = "麦克风采样率尚未准备好，请重新开始听写"
+                self.host.post_to_ui(lambda: self.stop(cancel=True))
+                return
+            for chunk in segmenter.feed(data[:, 0]):
                 recording.chunks.put(chunk)
 
     def stop(self, cancel: bool = False) -> None:
@@ -571,6 +607,11 @@ class DictationController:
                 continue
             if audio is None:
                 break
+            audio = resample_audio(
+                audio,
+                recording.input_sample_rate,
+                int(recording.settings.sample_rate if recording.settings else self.settings.sample_rate),
+            )
             text = self.engine.transcribe(audio)
             if recording.cancelled.is_set() or self.quit_event.is_set():
                 break
@@ -609,9 +650,13 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="ChineseASR Windows Win+H dictation")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--list-devices", action="store_true")
+    parser.add_argument("--start", action="store_true", help="Show or toggle the running tray app")
     parser.add_argument("--stop", action="store_true", help="Gracefully stop the running tray app")
     parser.add_argument("--transcribe", type=Path, help="Verify the dictation engine using one named audio file")
     args = parser.parse_args(argv)
+    if args.start:
+        from .dictation_windows import request_existing_start
+        return 0 if request_existing_start() else 1
     if args.stop:
         from .dictation_windows import request_existing_quit
         request_existing_quit()
@@ -634,13 +679,9 @@ def main(argv=None) -> int:
     configure_logging()
     if args.transcribe:
         import soundfile as sf
-        from scipy.signal import resample_poly
-        from math import gcd
         audio, sample_rate = sf.read(args.transcribe, dtype="float32", always_2d=True)
         mono = audio.mean(axis=1)
-        if sample_rate != settings.sample_rate:
-            divisor = gcd(sample_rate, settings.sample_rate)
-            mono = resample_poly(mono, settings.sample_rate // divisor, sample_rate // divisor)
+        mono = resample_audio(mono, sample_rate, settings.sample_rate)
         engine = QwenDictationEngine(settings)
         try:
             started = time.perf_counter()
