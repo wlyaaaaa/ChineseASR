@@ -64,7 +64,7 @@
 ## 不适合场景
 
 - 不愿意本地安装模型权重和 Python 环境。
-- 希望普通录音或整个文件夹自动上传云端转写；云入口只接受明确的重要录音。
+- 希望普通录音或整个文件夹自动上传云端转写；云入口只接受明确的重要录音，或已授权且当前选定的存疑本地转写质量复核，两种用途都须显式授权本次上传。
 - 需要英文、多语种或字幕生产工具链作为主目标。
 
 ## 默认模型策略
@@ -78,7 +78,7 @@
 | `quick` | `sensevoice` | 单模型快速转写 |
 | 显式 GPU flagship | `fun-asr-nano` | `FunAudioLLM/Fun-ASR-Nano-2512`；需要 GPU，作为较重的 LLM-ASR 候选，不改变 quick 默认 |
 | 可选证据级词汇主引擎 | `fireredasr2-llm` | 隔离在 WSL 中运行；仅在显式选择时作为 strict 主引擎 |
-| 重要录音专业云入口 | `qwen-audio-3.0-asr-flash` | 仅由独立脚本显式调用；Key 经 Password Center SecretRef 注入，普通模式无法触发 |
+| 重要录音 / 存疑质量复核云入口 | `qwen-audio-3.0-asr-flash` | 独立脚本显式选择 `-Important` 或 `-QualityReview` 并授权本次上传；Key 经 Password Center SecretRef 注入，普通模式无法触发 |
 | 显式时间线/匿名说话人 baseline | `paraformer` | 固定 `speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4`，输出逐句 `sentence_info` 时间和 CAM++ 匿名聚类；已知两方通话的调用方可传 `--preset-spk-num 2`，省略时自动聚类；不改变 quick/strict 默认 |
 | fallback/comparison | `whisper-large-v3` | 已注册为备用/对照，不作为中文 strict 默认路径 |
 
