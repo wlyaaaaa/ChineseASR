@@ -251,6 +251,7 @@ class _OverlayPanel:
     record_canvas: object | None = None
     close_canvas: object | None = None
     device_canvas: object | None = None
+    status_canvas: object | None = None
     device_var: object | None = None
     device_menu: object | None = None
     visible: bool = False
@@ -794,6 +795,7 @@ class WindowsHost:
         self._record_canvas = None
         self._close_canvas = None
         self._device_canvas = None
+        self._status_canvas = None
         self._background_canvas = None
         self._image_cache = {}
         self._record_hover = False
@@ -802,6 +804,9 @@ class WindowsHost:
         self._tooltip = None
         self._tooltip_after = None
         self._tooltip_panel: _OverlayPanel | None = None
+        self._status_detail = None
+        self._status_detail_label = None
+        self._status_detail_panel: _OverlayPanel | None = None
         self._status_label = None
         self._microphones: list[dict[str, str | None]] = []
         self._selected_microphone: str | None = None
@@ -1171,6 +1176,14 @@ class WindowsHost:
         close.bind("<Leave>", lambda _event, current=panel: self._paint_close_button(False, current))
         panel.close_canvas = close
 
+        # The tiny status dot sits above the close button, preserving every
+        # existing control's hit area within the fixed 160 x 60 panel.
+        status = tk.Canvas(overlay, width=18, height=16, bg="#ffffff",
+                           highlightthickness=0, takefocus=False, cursor="hand2")
+        status.place(x=140, y=0, width=18, height=16)
+        status.bind("<ButtonRelease-1>", lambda _event, current=panel: self._toggle_status_detail(current))
+        panel.status_canvas = status
+
         panel.device_var = tk.StringVar(value="")
         panel.device_menu = tk.Menu(overlay, tearoff=False, bg="#ffffff",
                                    # Points follow Windows DPI; the outer panel stays in pixels.
@@ -1193,12 +1206,14 @@ class WindowsHost:
         self._record_canvas = None if panel is None else panel.record_canvas
         self._close_canvas = None if panel is None else panel.close_canvas
         self._device_canvas = None if panel is None else panel.device_canvas
+        self._status_canvas = None if panel is None else panel.status_canvas
         self._device_var = None if panel is None else panel.device_var
         self._device_menu = None if panel is None else panel.device_menu
         self._record_hover = False if panel is None else panel.record_hover
         self._painted_record_state = None if panel is None else panel.painted_record_state
 
     def _destroy_overlay_panels(self) -> None:
+        self._hide_status_detail()
         panels, self._panels = self._panels, []
         for panel in panels:
             try:
@@ -1211,6 +1226,7 @@ class WindowsHost:
 
     def _rebuild_overlay_panels(self, monitors: Sequence[_DisplayMonitor | None]) -> None:
         self._hide_tooltip()
+        self._hide_status_detail()
         self._destroy_overlay_panels()
         self._panels = [self._create_overlay_panel(monitor) for monitor in monitors]
         self._set_legacy_panel_references()
@@ -1288,6 +1304,124 @@ class WindowsHost:
         if self._close_canvas is not None:
             self._close_canvas.delete("all")
             self._close_canvas.create_image(0, 0, anchor="nw", image=self._asset("close", hover=hover))
+
+    def _status_indicator_color(self) -> str:
+        """Return the small dot's user-facing availability color."""
+
+        with self._lock:
+            status, recording, busy, error = self._status, self._recording, self._busy, self._error
+        if error:
+            return "#e5654f"
+        if status in {
+            "中文听写正在启动", "正在准备模型", "正在打开麦克风", "准备继续录音", "等待 GPU",
+        }:
+            return "#e3a008"
+        if recording or status == "准备就绪":
+            return "#16a765"
+        if busy:
+            return "#e3a008"
+        return "#16a765"
+
+    def _paint_status_indicator_ui(self, panel: _OverlayPanel | None = None) -> None:
+        color = self._status_indicator_color()
+        panels = [panel] if panel is not None else self._panels
+        if panels:
+            canvases = [current.status_canvas for current in panels]
+        else:
+            canvases = [self._status_canvas]
+        for canvas in canvases:
+            if canvas is None:
+                continue
+            canvas.delete("all")
+            canvas.create_oval(5, 4, 13, 12, fill=color, outline="#ffffff", width=1)
+
+    def _status_detail_text(self) -> str:
+        with self._lock:
+            status, detail, selected = self._status, self._detail, self._selected_microphone
+        return "\n".join((
+            f"状态：{status}",
+            f"提示：{detail or '暂无补充提示'}",
+            f"麦克风：{selected or 'Windows 默认麦克风'}",
+        ))
+
+    def _toggle_status_detail(self, panel: _OverlayPanel | None = None) -> None:
+        self._hide_tooltip()
+        if self._status_detail is not None:
+            self._hide_status_detail()
+            return
+        self._show_status_detail(panel)
+
+    def _show_status_detail(self, panel: _OverlayPanel | None = None) -> None:
+        current = panel or (self._panels[0] if self._panels else None)
+        overlay = self._overlay if current is None else current.overlay
+        if self._root is None or overlay is None or not self._panel_open:
+            return
+        tk = self._tk_module
+        detail = tk.Toplevel(self._root)
+        self._status_detail = detail
+        self._status_detail_panel = current
+        detail.withdraw()
+        detail.overrideredirect(True)
+        detail.attributes("-topmost", True)
+        label = tk.Label(
+            detail,
+            text=self._status_detail_text(),
+            font=("Microsoft YaHei UI", -12),
+            justify="left",
+            anchor="w",
+            fg="#314139",
+            bg="#f8fbf9",
+            padx=9,
+            pady=7,
+            wraplength=300,
+            takefocus=False,
+        )
+        label.pack()
+        self._status_detail_label = label
+        detail.update_idletasks()
+        detail.geometry("+0+0")
+        self._api.make_window_nonactivating(int(detail.winfo_id()), show=False)
+        detail.deiconify()
+        self._api.make_window_nonactivating(int(detail.winfo_id()))
+        detail.update_idletasks()
+        self._position_status_detail_ui()
+
+    def _position_status_detail_ui(self) -> None:
+        detail, current = self._status_detail, self._status_detail_panel
+        overlay = self._overlay if current is None else current.overlay
+        if detail is None or overlay is None:
+            return
+        width, height = int(detail.winfo_reqwidth()), int(detail.winfo_reqheight())
+        panel_x, panel_y = int(overlay.winfo_rootx()), int(overlay.winfo_rooty())
+        x = panel_x + _PANEL_WIDTH - width
+        y = panel_y - height - 6
+        monitor = None if current is None else current.monitor
+        if monitor is None:
+            x = max(0, x)
+            if y < 0:
+                y = panel_y + _PANEL_HEIGHT + 6
+        else:
+            x = min(max(monitor.left, x), monitor.left + monitor.width - width)
+            if y < monitor.top:
+                y = panel_y + _PANEL_HEIGHT + 6
+            y = min(max(monitor.top, y), monitor.top + monitor.height - height)
+        self._api.move_window(int(detail.winfo_id()), x, y)
+
+    def _refresh_status_detail_ui(self) -> None:
+        if self._status_detail_label is not None:
+            self._status_detail_label.configure(text=self._status_detail_text())
+            self._status_detail.update_idletasks()
+            self._position_status_detail_ui()
+
+    def _hide_status_detail(self) -> None:
+        if self._status_detail is not None:
+            try:
+                self._status_detail.destroy()
+            except Exception:
+                pass
+        self._status_detail = None
+        self._status_detail_label = None
+        self._status_detail_panel = None
 
     def _record_hover_changed(self, inside: bool, panel: _OverlayPanel | None = None) -> None:
         if panel is None:
@@ -1413,6 +1547,7 @@ class WindowsHost:
 
     def _hide_panel_ui(self) -> None:
         self._hide_tooltip()
+        self._hide_status_detail()
         with self._lock:
             self._panel_open = False
         if self._panels:
@@ -1746,6 +1881,8 @@ class WindowsHost:
                 should_show = self._panel_open
             try:
                 self._paint_record_button_ui()
+                self._paint_status_indicator_ui()
+                self._refresh_status_detail_ui()
                 shown_now = False
                 if should_show:
                     for panel in self._panels:
@@ -1770,6 +1907,8 @@ class WindowsHost:
             should_show = self._panel_open
         try:
             self._paint_record_button_ui()
+            self._paint_status_indicator_ui()
+            self._refresh_status_detail_ui()
             if should_show and not self._overlay_visible:
                 self._overlay.deiconify()
                 self._api.make_window_nonactivating(int(self._overlay.winfo_id()))
@@ -1869,6 +2008,7 @@ class WindowsHost:
             return
         self._finalized = True
         self._hide_tooltip()
+        self._hide_status_detail()
         self._running = False
         # Remove the user-visible panel first.  Controller/model cleanup may take
         # a while, but it must never leave an "exiting" strip in front of the user.

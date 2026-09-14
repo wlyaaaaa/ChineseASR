@@ -322,6 +322,7 @@ class DictationController:
         self.recording: Recording | None = None
         self.quit_event = threading.Event()
         self.initialization_failed = False
+        self.model_ready = False
         self.pending_start = False
         self.pending_target = None
         self.worker = threading.Thread(target=self._worker, name="dictation-asr", daemon=True)
@@ -474,7 +475,10 @@ class DictationController:
 
     def _capture_started(self, recording: Recording) -> None:
         if self.recording is recording and not recording.stopped.is_set() and not self.quit_event.is_set():
-            self.host.show("正在聆听", "点击麦克风或快捷键暂停", recording=True)
+            if self.model_ready:
+                self.host.show("正在聆听", "点击麦克风或快捷键暂停", recording=True)
+            else:
+                self.host.show("正在准备模型", "录音已开始，准备完成后自动转写", recording=True)
 
     def _close_capture(self, recording: Recording) -> None:
         # All PortAudio open/close/enumeration runs on this one audio thread.
@@ -568,7 +572,10 @@ class DictationController:
             "microphone capture stopped cancelled=%s samples=%d chunks=%d",
             recording.cancelled.is_set(), recording.captured_samples, recording.submitted_chunks,
         )
-        self.host.show("已暂停", "点击麦克风或快捷键继续")
+        if not self.model_ready and not self.initialization_failed:
+            self.host.show("正在准备模型", "录音已暂停，模型仍在准备")
+        else:
+            self.host.show("已暂停", "点击麦克风或快捷键继续")
 
     def cancel(self) -> None:
         self.pending_start = False
@@ -646,6 +653,7 @@ class DictationController:
                     except Exception:
                         LOG.exception("optional prewarm cleanup failed")
             LOG.info("ready engine=%s; idle weights in RAM", self.settings.engine)
+            self.model_ready = True
             if self.recording is None:
                 self.host.show("准备就绪", "快捷键唤出即可录音")
             while not self.quit_event.is_set():
@@ -694,6 +702,8 @@ class DictationController:
         while not recording.cancelled.is_set() and not self.quit_event.is_set():
             try:
                 self.engine.activate()
+                if not recording.stopped.is_set():
+                    self.host.show("正在聆听", "点击麦克风或快捷键暂停", recording=True)
                 break
             except GpuBrokerConflict:
                 self.host.show("等待 GPU", "录音仍在内存中，Esc 可取消",

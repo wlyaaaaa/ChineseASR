@@ -462,6 +462,49 @@ class WindowsHostTests(unittest.TestCase):
         host._render_overlay()
         self.assertEqual(1, overlay.deiconify_count)
 
+    def test_status_dot_colors_distinguish_available_waiting_and_error(self):
+        host = self.make_host()
+        host._status = "准备就绪"
+        self.assertEqual("#16a765", host._status_indicator_color())
+        host._status = "正在打开麦克风"
+        self.assertEqual("#e3a008", host._status_indicator_color())
+        host._recording = True
+        host._status = "正在准备模型"
+        self.assertEqual("#e3a008", host._status_indicator_color())
+        host._status = "等待 GPU"
+        self.assertEqual("#e3a008", host._status_indicator_color())
+        host._status = "正在聆听"
+        self.assertEqual("#16a765", host._status_indicator_color())
+        host._recording = False
+        host._error = True
+        self.assertEqual("#e5654f", host._status_indicator_color())
+
+    def test_status_detail_click_does_not_toggle_recording_and_hides_with_panel(self):
+        host = self.make_host()
+        host._panel_open = True
+        host._selected_microphone = "DJI Mic Mini"
+        host._status = "正在准备模型"
+        host._detail = "录音已开始，准备完成后自动转写"
+        shown: list[object] = []
+        hidden: list[object] = []
+        host._show_status_detail = lambda panel: shown.append(panel)  # type: ignore[method-assign]
+        host._hide_status_detail = lambda: hidden.append("detail")  # type: ignore[method-assign]
+        panel = _OverlayPanel(monitor=None, overlay=FakeOverlay())
+
+        host._toggle_status_detail(panel)
+        self.assertEqual([panel], shown)
+        self.assertEqual([], self.calls)
+
+        host._status_detail = object()
+        host._toggle_status_detail(panel)
+        self.assertEqual(["detail"], hidden)
+        self.assertEqual([], self.calls)
+        self.assertIn("正在准备模型", host._status_detail_text())
+        self.assertIn("DJI Mic Mini", host._status_detail_text())
+
+        host._hide_panel_ui()
+        self.assertEqual(["detail", "detail"], hidden)
+
     def test_configured_pnp_panels_follow_topology_without_using_tur_or_reopening_hidden_ui(self):
         api = FakeWindowsApi()
         calls: list[str] = []

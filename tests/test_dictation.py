@@ -84,6 +84,17 @@ def recording_with_chunks(count=2):
 
 
 class DictationTests(unittest.TestCase):
+    def test_capture_does_not_claim_ready_while_model_is_still_loading(self):
+        host = FakeHost()
+        controller = DictationController(host, DictationSettings(), FakeEngine([]))
+        recording = Recording("focus", queue.Queue(), threading.Event(), threading.Event())
+        controller.recording = recording
+        controller._capture_started(recording)
+        self.assertEqual(host.messages[-1][0], "正在准备模型")
+        controller.model_ready = True
+        controller._capture_started(recording)
+        self.assertEqual(host.messages[-1][0], "正在聆听")
+
     def test_start_command_reports_whether_an_existing_host_received_it(self):
         with patch("zh_asr.dictation_windows.request_existing_start", return_value=True):
             self.assertEqual(0, main(["--start"]))
