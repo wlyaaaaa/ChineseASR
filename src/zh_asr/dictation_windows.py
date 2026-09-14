@@ -6,6 +6,7 @@ load an ASR model, retain transcripts on disk, or alter Windows-wide shortcuts.
 from __future__ import annotations
 
 import ctypes
+import logging
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,8 @@ import sys
 import threading
 import time
 from typing import Callable, Protocol, Sequence
+
+LOG = logging.getLogger("zh_asr.dictation.windows")
 
 
 _ULONG_PTR = ctypes.c_size_t
@@ -514,8 +517,15 @@ class _WinApi:
             gdi.DeleteObject(region)
 
     def move_window(self, hwnd: int, x: int, y: int) -> None:
-        self.user32.SetWindowPos(_HWND(self.get_root_window(hwnd) or hwnd), None, x, y, 0, 0,
-                                 _SWP_NOSIZE | _SWP_NOACTIVATE | 0x0004)
+        root = _HWND(self.get_root_window(hwnd) or hwnd)
+        moved = self.user32.SetWindowPos(root, None, x, y, 0, 0,
+                                        _SWP_NOSIZE | _SWP_NOACTIVATE | 0x0004)
+        if not moved:
+            LOG.warning("panel move failed x=%d y=%d error=%d", x, y, ctypes.get_last_error())
+        rect = _RECT()
+        if self.user32.GetWindowRect(root, ctypes.byref(rect)) and (rect.left, rect.top) != (x, y):
+            LOG.warning("panel move mismatch requested=(%d,%d) actual=(%d,%d)",
+                        x, y, rect.left, rect.top)
 
     def list_monitors(self) -> list[_DisplayMonitor]:
         """Enumerate active monitors with PnP IDs instead of volatile DISPLAYn names."""
@@ -839,7 +849,7 @@ class WindowsHost:
         return any(target and target in self._normalize_monitor_id(identity) for identity in identities)
 
     def _selected_monitors(self) -> list[_DisplayMonitor | None]:
-        """Use PnP selectors when configured; do not redirect an absent target elsewhere."""
+        """Choose one screen from the configured preference order."""
 
         monitors = self._active_monitors()
         if self._monitor_ids is None:
@@ -849,24 +859,12 @@ class WindowsHost:
                 return [None]
             return [next((monitor for monitor in monitors if monitor.primary), monitors[0])]
 
-        selected: list[_DisplayMonitor] = []
         for target in self._monitor_ids:
-            selected.extend(monitor for monitor in monitors if self._monitor_matches(monitor, target))
-        seen: set[tuple[str, str, int, int, int, int]] = set()
-        unique: list[_DisplayMonitor] = []
-        for monitor in selected:
-            key = (
-                monitor.pnp_id,
-                monitor.friendly_name,
-                monitor.left,
-                monitor.top,
-                monitor.width,
-                monitor.height,
-            )
-            if key not in seen:
-                seen.add(key)
-                unique.append(monitor)
-        return unique
+            match = next((monitor for monitor in monitors
+                          if self._monitor_matches(monitor, target)), None)
+            if match is not None:
+                return [match]
+        return []
 
     @staticmethod
     def _monitor_signature(monitors: Sequence[_DisplayMonitor | None]) -> tuple[object, ...]:
@@ -1225,6 +1223,8 @@ class WindowsHost:
         self._set_legacy_panel_references()
 
     def _rebuild_overlay_panels(self, monitors: Sequence[_DisplayMonitor | None]) -> None:
+        LOG.info("panel screens selected=%s", [(m.pnp_id, m.left, m.top, m.width, m.height)
+                                               if m is not None else None for m in monitors])
         self._hide_tooltip()
         self._hide_status_detail()
         self._destroy_overlay_panels()
@@ -1528,7 +1528,9 @@ class WindowsHost:
         if overlay is None or offset is None:
             return
         offset_x, offset_y = offset
-        self._api.move_window(int(overlay.winfo_id()), event.x_root - offset_x, event.y_root - offset_y)
+        x, y = event.x_root - offset_x, event.y_root - offset_y
+        self._api.move_window(int(overlay.winfo_id()), x, y)
+        self._refresh_status_detail_ui()
 
     def _toggle_from_panel(self) -> None:
         self._hide_tooltip()
@@ -1960,7 +1962,7 @@ class WindowsHost:
                 self._api.round_panel(int(overlay.winfo_id()), _PANEL_WIDTH, _PANEL_HEIGHT)
             self._refresh_own_window_roots_ui()
         except Exception:
-            pass
+            LOG.exception("panel placement failed")
 
     def _start_tray(self) -> None:
         try:

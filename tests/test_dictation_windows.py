@@ -505,7 +505,7 @@ class WindowsHostTests(unittest.TestCase):
         host._hide_panel_ui()
         self.assertEqual(["detail", "detail"], hidden)
 
-    def test_configured_pnp_panels_follow_topology_without_using_tur_or_reopening_hidden_ui(self):
+    def test_one_panel_prefers_vdd_then_physical_without_reopening_hidden_ui(self):
         api = FakeWindowsApi()
         calls: list[str] = []
         physical = _DisplayMonitor("MONITOR\\PHLC34B\\001", "Philips", -1920, -200, 1920, 1080)
@@ -516,7 +516,7 @@ class WindowsHostTests(unittest.TestCase):
             on_toggle=lambda: calls.append("toggle"),
             on_cancel=lambda: None,
             on_quit=lambda: None,
-            monitor_ids=["PHLC34B", "MTT1337"],
+            monitor_ids=["MTT1337", "PHLC34B"],
             api=api,
         )
         host._root = FakeScheduledRoot()
@@ -531,18 +531,18 @@ class WindowsHostTests(unittest.TestCase):
         host._create_overlay_panel = create_panel  # type: ignore[method-assign]
         host._sync_display_topology_ui(force=True)
 
-        self.assertEqual([physical, vdd], [panel.monitor for panel in host._panels])
+        self.assertEqual([vdd], [panel.monitor for panel in host._panels])
         host._panel_open = True
         host._render_overlay()
-        self.assertEqual([1, 1], [panel.overlay.deiconify_count for panel in host._panels])
-        self.assertEqual([(900, True), (901, True)], api.nonactivation_calls)
+        self.assertEqual([1], [panel.overlay.deiconify_count for panel in host._panels])
+        self.assertEqual([(900, True)], api.nonactivation_calls)
 
         host._hide_panel_ui()
-        api.monitors = [vdd, tur]
+        api.monitors = [physical, tur]
         host._sync_display_topology_ui(force=True)
         host.show("后台状态更新", "不会重新显示")
         host._render_overlay()
-        self.assertEqual([vdd], [panel.monitor for panel in host._panels])
+        self.assertEqual([physical], [panel.monitor for panel in host._panels])
         self.assertEqual(0, host._panels[0].overlay.deiconify_count)
 
         api.monitors = [tur]
@@ -555,9 +555,23 @@ class WindowsHostTests(unittest.TestCase):
         host._sync_display_topology_ui(force=True)
         host.show("后台状态更新", "仍保持隐藏")
         host._render_overlay()
-        self.assertEqual([physical, vdd], [panel.monitor for panel in host._panels])
-        self.assertEqual([0, 0], [panel.overlay.deiconify_count for panel in host._panels])
+        self.assertEqual([vdd], [panel.monitor for panel in host._panels])
+        self.assertEqual([0], [panel.overlay.deiconify_count for panel in host._panels])
         self.assertEqual([], calls)
+
+    def test_drag_remains_free_and_is_not_reset_by_delayed_placement(self):
+        from types import SimpleNamespace
+        host = self.make_host()
+        monitor = _DisplayMonitor("MTT1337", "VDD", -1920, -200, 1920, 1080)
+        panel = _OverlayPanel(monitor=monitor, overlay=FakeOverlay(), drag_offset=(10, 10))
+        panel.visible = True
+        panel.needs_position = False  # Set by the left-hand drag grip's press handler.
+        host._drag_panel(SimpleNamespace(x_root=1000, y_root=2000), panel)
+        self.assertEqual((900, 990, 1990), self.api.move_calls[-1])
+        host._drag_panel(SimpleNamespace(x_root=-3000, y_root=-1000), panel)
+        self.assertEqual((900, -3010, -1010), self.api.move_calls[-1])
+        host._reapply_overlay_nonactivation(panel, finish_position=True)
+        self.assertEqual(2, len(self.api.move_calls))
 
     def test_monitor_geometry_preserves_negative_coordinates_and_small_work_areas(self):
         host = self.make_host()
