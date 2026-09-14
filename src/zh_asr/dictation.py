@@ -23,6 +23,7 @@ from .gpu_broker import GpuBrokerConflict, GpuBrokerLease
 
 LOG = logging.getLogger("zh_asr.dictation")
 HOTKEY_LABEL = "Win+H / Ctrl+Win+H"
+_MICROPHONE_OPEN_TIMEOUT_SEC = 8.0
 
 
 @dataclass(frozen=True)
@@ -303,6 +304,10 @@ class Recording:
     audio_lock: threading.Lock = field(default_factory=threading.Lock)
     capture_finished: threading.Event = field(default_factory=threading.Event)
     recognition_finished: threading.Event = field(default_factory=threading.Event)
+    open_timeout_timer: threading.Timer | None = None
+    open_timed_out: bool = False
+    captured_samples: int = 0
+    submitted_chunks: int = 0
 
 
 class DictationController:
@@ -338,6 +343,15 @@ class DictationController:
             self.host.show("模型加载失败", "从托盘退出后重新启动", error=True)
             return
         if self.recording is not None:
+            if self.recording.open_timed_out:
+                self.pending_start = False
+                self.pending_target = None
+                self.host.show(
+                    "麦克风打开超时",
+                    "驱动仍在处理中；请从托盘退出后重新启动听写",
+                    error=True,
+                )
+                return
             if not self.recording.stopped.is_set():
                 self.pending_start = False
                 self.stop()
@@ -364,7 +378,46 @@ class DictationController:
         self.recording = recording
         self.host.set_busy(True)
         self.host.show("正在打开麦克风", "再次按快捷键或按钮可暂停")
+        self._schedule_microphone_open_timeout(recording)
         self.audio_commands.put(("open", recording))
+
+    def _schedule_microphone_open_timeout(self, recording: Recording) -> None:
+        """Leave Tk on its own thread if an audio driver never returns from open."""
+
+        timer = threading.Timer(
+            _MICROPHONE_OPEN_TIMEOUT_SEC,
+            lambda r=recording: self.host.post_to_ui(lambda: self._microphone_open_timed_out(r)),
+        )
+        timer.daemon = True
+        recording.open_timeout_timer = timer
+        timer.start()
+
+    @staticmethod
+    def _cancel_microphone_open_timeout(recording: Recording) -> None:
+        timer, recording.open_timeout_timer = recording.open_timeout_timer, None
+        if timer is not None:
+            timer.cancel()
+
+    def _microphone_open_timed_out(self, recording: Recording) -> None:
+        """Stop waiting in the UI; a blocked native driver call cannot be cancelled here."""
+
+        if (self.recording is not recording or recording.submitted
+                or recording.capture_finished.is_set() or recording.open_timed_out):
+            return
+        recording.open_timed_out = True
+        recording.cancelled.set()
+        with recording.audio_lock:
+            recording.stopped.set()
+        recording.error = "麦克风打开超时；请从托盘退出后重新启动听写"
+        self.pending_start = False
+        self.pending_target = None
+        self.host.set_busy(False)
+        self.host.show(
+            "麦克风打开超时",
+            "驱动仍在处理中，已停止等待；请从托盘退出后重新启动听写",
+            error=True,
+        )
+        LOG.error("microphone open timed out; waiting for native call to return before cleanup")
 
     def _audio_worker(self) -> None:
         from .dictation_audio import list_microphones, open_microphone
@@ -389,6 +442,7 @@ class DictationController:
                     r.input_sample_rate = int(sample_rate)
                     r.segmenter = PauseSegmenter(r.settings, sample_rate=r.input_sample_rate)
                 try:
+                    LOG.info("microphone open requested device=%r", recording.settings.input_device)
                     recording.stream = open_microphone(
                         recording.settings,
                         lambda data, frames, timing, status, r=recording: self._audio_callback(r, data, status),
@@ -398,15 +452,20 @@ class DictationController:
                         set_input_sample_rate(
                             int(getattr(recording.stream, "_zh_asr_input_sample_rate", recording.settings.sample_rate))
                         )
-                    if recording.stopped.is_set() or self.quit_event.is_set():
+                    self._cancel_microphone_open_timeout(recording)
+                    if recording.stopped.is_set() or recording.cancelled.is_set() or self.quit_event.is_set():
+                        LOG.warning("microphone open returned after recording was stopped; closing without submission")
                         self._close_capture(recording)
                         continue
                     recording.submitted = True
+                    LOG.info("microphone capture started sample_rate=%d", recording.input_sample_rate)
                     self.commands.put(recording)
                     self.host.post_to_ui(lambda r=recording: self._capture_started(r))
                 except Exception:
                     LOG.exception("microphone open failed")
-                    recording.error = "请连接所选麦克风，或右键选择其他设备"
+                    self._cancel_microphone_open_timeout(recording)
+                    if not recording.open_timed_out:
+                        recording.error = "请连接所选麦克风，或右键选择其他设备"
                     recording.cancelled.set()
                     recording.stopped.set()
                     self._close_capture(recording)
@@ -419,6 +478,11 @@ class DictationController:
 
     def _close_capture(self, recording: Recording) -> None:
         # All PortAudio open/close/enumeration runs on this one audio thread.
+        self._cancel_microphone_open_timeout(recording)
+        LOG.info(
+            "microphone capture closing cancelled=%s samples=%d chunks=%d",
+            recording.cancelled.is_set(), recording.captured_samples, recording.submitted_chunks,
+        )
         stream, recording.stream = recording.stream, None
         if stream is not None:
             try:
@@ -441,34 +505,69 @@ class DictationController:
         with recording.audio_lock:
             if recording.stopped.is_set() or recording.cancelled.is_set():
                 return
-            if status:
+            try:
+                if status:
+                    recording.cancelled.set()
+                    recording.error = "录音发生丢帧，请重新连接或选择其他麦克风"
+                    self.host.post_to_ui(
+                        lambda r=recording: self._stop_failed_callback_recording(r)
+                    )
+                    return
+                segmenter = recording.segmenter
+                if segmenter is None:
+                    recording.cancelled.set()
+                    recording.error = "麦克风采样率尚未准备好，请重新开始听写"
+                    self.host.post_to_ui(
+                        lambda r=recording: self._stop_failed_callback_recording(r)
+                    )
+                    return
+                recording.captured_samples += len(data)
+                for chunk in segmenter.feed(data[:, 0]):
+                    recording.submitted_chunks += 1
+                    recording.chunks.put(chunk)
+            except Exception:
+                LOG.exception("microphone callback failed")
                 recording.cancelled.set()
-                recording.error = "录音发生丢帧，请重新连接或选择其他麦克风"
-                self.host.post_to_ui(lambda: self.stop(cancel=True))
-                return
-            segmenter = recording.segmenter
-            if segmenter is None:
-                recording.cancelled.set()
-                recording.error = "麦克风采样率尚未准备好，请重新开始听写"
-                self.host.post_to_ui(lambda: self.stop(cancel=True))
-                return
-            for chunk in segmenter.feed(data[:, 0]):
-                recording.chunks.put(chunk)
+                recording.error = "录音处理发生错误，请重新开始听写"
+                self.host.post_to_ui(
+                    lambda r=recording: self._stop_failed_callback_recording(r)
+                )
+
+    def _stop_failed_callback_recording(self, recording: Recording) -> None:
+        """A stale PortAudio callback must never stop the following recording."""
+
+        if self.recording is not recording:
+            return
+        self.stop(cancel=True)
+        if self.recording is recording:
+            self.host.show("录音发生错误", recording.error, error=True)
 
     def stop(self, cancel: bool = False) -> None:
         recording = self.recording
         if recording is None:
+            return
+        if recording.open_timed_out:
+            if cancel:
+                recording.cancelled.set()
             return
         if cancel:
             recording.cancelled.set()
         with recording.audio_lock:
             if not recording.stopped.is_set():
                 recording.stopped.set()  # Stop accepting samples before touching a driver.
-                tail = recording.segmenter.flush() if recording.segmenter is not None else None
+                tail = (
+                    recording.segmenter.flush()
+                    if not cancel and recording.segmenter is not None
+                    else None
+                )
                 if tail is not None and not cancel:
                     recording.chunks.put(tail)
                 recording.chunks.put(None)
                 self.audio_commands.put(("close", recording))
+        LOG.info(
+            "microphone capture stopped cancelled=%s samples=%d chunks=%d",
+            recording.cancelled.is_set(), recording.captured_samples, recording.submitted_chunks,
+        )
         self.host.show("已暂停", "点击麦克风或快捷键继续")
 
     def cancel(self) -> None:

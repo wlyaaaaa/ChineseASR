@@ -5,9 +5,14 @@ recordings, after the previous stream has been closed.
 """
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any, Callable
 
 import sounddevice as sd
+
+
+LOG = logging.getLogger("zh_asr.dictation.audio")
 
 
 class MicrophoneOpenError(RuntimeError):
@@ -35,9 +40,11 @@ def _refresh_portaudio() -> None:
     """
 
     try:
+        LOG.info("microphone PortAudio refresh started")
         if getattr(sd, "_initialized", 1) > 0:
             sd._terminate()
         sd._initialize()
+        LOG.info("microphone PortAudio refresh completed")
     except Exception as exc:
         raise MicrophoneOpenError(
             f"无法刷新麦克风设备枚举（PortAudio）：{type(exc).__name__}"
@@ -158,6 +165,7 @@ def open_microphone(
     caller resamples the completed phrase through the existing 16 kHz path.
     """
 
+    started = time.perf_counter()
     _refresh_portaudio()
     requested = getattr(settings, "input_device", None)
     candidates = _candidate_devices(requested)
@@ -177,6 +185,10 @@ def open_microphone(
         for input_rate in rates:
             rate_label = f"{input_rate / 1000:g}kHz"
             try:
+                LOG.info(
+                    "microphone open attempt requested=%r endpoint=%r host=%r index=%d rate=%s",
+                    requested, info.get("name", ""), info.get("_host_name", ""), index, rate_label,
+                )
                 sd.check_input_settings(
                     device=index,
                     samplerate=input_rate,
@@ -189,6 +201,10 @@ def open_microphone(
 
             stream = None
             try:
+                LOG.info(
+                    "microphone stream construct requested=%r endpoint=%r host=%r index=%d rate=%s",
+                    requested, info.get("name", ""), info.get("_host_name", ""), index, rate_label,
+                )
                 stream = sd.InputStream(
                     samplerate=input_rate,
                     channels=1,
@@ -203,7 +219,16 @@ def open_microphone(
                     pass
                 if on_sample_rate is not None:
                     on_sample_rate(input_rate)
+                LOG.info(
+                    "microphone stream start requested=%r endpoint=%r host=%r index=%d rate=%s",
+                    requested, info.get("name", ""), info.get("_host_name", ""), index, rate_label,
+                )
                 stream.start()
+                LOG.info(
+                    "microphone open succeeded requested=%r endpoint=%r host=%r index=%d rate=%s elapsed_sec=%.3f",
+                    requested, info.get("name", ""), info.get("_host_name", ""), index,
+                    rate_label, time.perf_counter() - started,
+                )
                 return stream
             except Exception as exc:
                 failures.append(f"{label}: {rate_label} 启动失败（{type(exc).__name__}）")

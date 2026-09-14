@@ -180,6 +180,73 @@ class DictationTests(unittest.TestCase):
         self.assertIsNone(controller.recording)
         self.assertFalse(host.visible)
 
+    def test_open_timeout_keeps_late_stream_out_of_recognition_and_closes_it(self):
+        entered, release = threading.Event(), threading.Event()
+        closed = []
+
+        def open_late(*args, **kwargs):
+            entered.set()
+            release.wait(2)
+            return SimpleNamespace(stop=lambda: closed.append("stop"), close=lambda: closed.append("close"))
+
+        host = FakeHost()
+        controller = DictationController(host, DictationSettings(), FakeEngine([]))
+        with patch.object(controller, "_schedule_microphone_open_timeout"), patch(
+            "zh_asr.dictation_audio.open_microphone", side_effect=open_late
+        ):
+            controller.audio_worker.start()
+            controller.toggle()
+            recording = controller.recording
+            self.assertTrue(entered.wait(1))
+            controller._microphone_open_timed_out(recording)
+            release.set()
+            controller.audio_commands.put(None)
+            controller.audio_worker.join(2)
+
+        host.pump()
+        self.assertTrue(recording.open_timed_out)
+        self.assertTrue(recording.cancelled.is_set())
+        self.assertFalse(recording.submitted)
+        self.assertEqual(["stop", "close"], closed)
+        self.assertTrue(any(status == "麦克风打开超时" for status, _detail in host.messages))
+
+    def test_stale_callback_failure_never_stops_following_recording(self):
+        host = FakeHost()
+        controller = DictationController(host, DictationSettings(), FakeEngine([]))
+        first = Recording("first", queue.Queue(), threading.Event(), threading.Event())
+        first.segmenter = SimpleNamespace(feed=lambda _samples: (_ for _ in ()).throw(ValueError("bad frame")))
+        following = Recording("following", queue.Queue(), threading.Event(), threading.Event())
+        controller.recording = first
+
+        controller._audio_callback(first, np.ones((320, 1), dtype=np.float32), None)
+        controller.recording = following
+        host.pump()
+
+        self.assertTrue(first.cancelled.is_set())
+        self.assertFalse(following.stopped.is_set())
+        self.assertFalse(following.cancelled.is_set())
+
+    def test_current_callback_failure_queues_close_without_flushing_broken_segmenter(self):
+        class BrokenSegmenter:
+            def feed(self, _samples):
+                raise ValueError("bad frame")
+
+            def flush(self):
+                raise AssertionError("cancel must not flush a failed callback")
+
+        host = FakeHost()
+        controller = DictationController(host, DictationSettings(), FakeEngine([]))
+        recording = Recording("current", queue.Queue(), threading.Event(), threading.Event())
+        recording.segmenter = BrokenSegmenter()
+        controller.recording = recording
+
+        controller._audio_callback(recording, np.ones((320, 1), dtype=np.float32), None)
+        host.pump()
+
+        self.assertTrue(recording.cancelled.is_set())
+        self.assertTrue(recording.stopped.is_set())
+        self.assertEqual(("close", recording), controller.audio_commands.get_nowait())
+
     def test_microphone_selection_is_saved_and_applies_to_next_session(self):
         host = FakeHost()
         settings = DictationSettings(input_device="DJI Mic Mini")

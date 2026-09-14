@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('Install', 'Start', 'Stop', 'Status', 'Uninstall')]
+    [ValidateSet('Install', 'Start', 'Stop', 'Restart', 'Status', 'Uninstall')]
     [string]$Mode = 'Status',
     [switch]$SkipDependencies
 )
@@ -118,6 +118,32 @@ function Stop-DictationGracefully {
     } while ($true)
 }
 
+function Restart-DictationHost {
+    try {
+        Stop-DictationGracefully
+    } catch {
+        # A native audio driver can block shutdown. Recover only this exact
+        # scheduled host; never stop all Python or Windows audio processes.
+        $task = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction Stop
+        $actions = @($task.Actions)
+        if ($actions.Count -ne 1 -or $actions[0].Execute -ine $Pythonw -or
+            $actions[0].Arguments -cne '-m zh_asr.dictation' -or
+            $actions[0].WorkingDirectory -ine $Root) {
+            throw 'Cannot recover dictation: the scheduled task action no longer matches this project.'
+        }
+        Stop-ScheduledTask -TaskName $TaskName -TaskPath '\'
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ((Test-DictationRunning) -or
+            (Get-ScheduledTask -TaskName $TaskName -TaskPath '\').State -eq 'Running') {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw 'The dictation host did not exit after its scheduled task was stopped.'
+            }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    Start-DictationHost
+}
+
 Push-Location $Root
 try {
     if ($Mode -eq 'Install') {
@@ -149,6 +175,8 @@ try {
         Start-DictationHost
     } elseif ($Mode -eq 'Stop') {
         Stop-DictationGracefully
+    } elseif ($Mode -eq 'Restart') {
+        Restart-DictationHost
     } elseif ($Mode -eq 'Uninstall') {
         Stop-DictationGracefully
         $Existing = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
