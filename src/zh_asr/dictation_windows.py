@@ -1365,14 +1365,14 @@ class WindowsHost:
         label = tk.Label(
             detail,
             text=self._status_detail_text(),
-            font=("Microsoft YaHei UI", -15),
+            font=("Microsoft YaHei UI", -20),
             justify="left",
             anchor="w",
             fg="#314139",
             bg="#f8fbf9",
             padx=12,
             pady=9,
-            wraplength=375,
+            wraplength=480,
             takefocus=False,
         )
         label.pack()
@@ -1460,7 +1460,7 @@ class WindowsHost:
         tip.withdraw()
         tip.overrideredirect(True)
         tip.attributes("-topmost", True)
-        tk.Label(tip, text=self._tooltip_text(), font=("Microsoft YaHei UI", -15),
+        tk.Label(tip, text=self._tooltip_text(), font=("Microsoft YaHei UI", -20),
                  fg="#526258", bg="#f8fbf9", padx=8, pady=5).pack()
         tip.update_idletasks()
         x = int(overlay.winfo_rootx())
