@@ -67,8 +67,8 @@ _ERROR_ALREADY_EXISTS = 183
 _EVENT_MODIFY_STATE = 0x0002
 _SYNCHRONIZE = 0x00100000
 _WAIT_OBJECT_0 = 0
-_PANEL_WIDTH = 160
-_PANEL_HEIGHT = 60
+_PANEL_WIDTH = 200
+_PANEL_HEIGHT = 75
 _PM_NOREMOVE = 0
 _MONITORINFOF_PRIMARY = 0x00000001
 _TOPOLOGY_REFRESH_SECONDS = 1.0
@@ -1152,35 +1152,35 @@ class WindowsHost:
         background.bind("<Button-3>", lambda event, current=panel: self._open_device_menu(event, current))
         panel.background_canvas = background
 
-        record = tk.Canvas(overlay, width=48, height=48, bg="#ffffff",
+        record = tk.Canvas(overlay, width=60, height=60, bg="#ffffff",
                            highlightthickness=0, takefocus=False, cursor="hand2")
-        record.place(x=48, y=6, width=48, height=48)
+        record.place(x=60, y=8, width=60, height=60)
         record.bind("<ButtonRelease-1>", lambda _event: self._toggle_from_panel())
         record.bind("<Button-3>", lambda event, current=panel: self._open_device_menu(event, current))
         record.bind("<Enter>", lambda _event, current=panel: self._record_hover_changed(True, current))
         record.bind("<Leave>", lambda _event, current=panel: self._record_hover_changed(False, current))
         panel.record_canvas = record
 
-        device = tk.Canvas(overlay, width=18, height=24, bg="#ffffff",
+        device = tk.Canvas(overlay, width=23, height=30, bg="#ffffff",
                            highlightthickness=0, takefocus=False, cursor="hand2")
-        device.place(x=98, y=18, width=18, height=24)
+        device.place(x=123, y=23, width=23, height=30)
         device.create_image(0, 0, anchor="nw", image=self._asset("device"))
         device.bind("<ButtonRelease-1>", lambda event, current=panel: self._open_device_menu(event, current))
         panel.device_canvas = device
 
-        close = tk.Canvas(overlay, width=28, height=28, bg="#ffffff",
+        close = tk.Canvas(overlay, width=35, height=35, bg="#ffffff",
                           highlightthickness=0, takefocus=False, cursor="hand2")
-        close.place(x=118, y=16, width=28, height=28)
+        close.place(x=148, y=20, width=35, height=35)
         close.bind("<ButtonRelease-1>", lambda _event: self._hide_from_panel())
         close.bind("<Enter>", lambda _event, current=panel: self._paint_close_button(True, current))
         close.bind("<Leave>", lambda _event, current=panel: self._paint_close_button(False, current))
         panel.close_canvas = close
 
-        # The tiny status dot sits above the close button, preserving every
-        # existing control's hit area within the fixed 160 x 60 panel.
-        status = tk.Canvas(overlay, width=18, height=16, bg="#ffffff",
+        # A clickable badge at the microphone's upper-right corner. Its own
+        # canvas consumes the click without toggling the recording underneath.
+        status = tk.Canvas(overlay, width=20, height=20, bg="#ffffff",
                            highlightthickness=0, takefocus=False, cursor="hand2")
-        status.place(x=140, y=0, width=18, height=16)
+        status.place(x=108, y=7, width=20, height=20)
         status.bind("<ButtonRelease-1>", lambda _event, current=panel: self._toggle_status_detail(current))
         panel.status_canvas = status
 
@@ -1257,7 +1257,7 @@ class WindowsHost:
             return self._image_cache[key]
         from PIL import Image, ImageDraw, ImageTk
         scale = 4
-        width, height = {"background": (_PANEL_WIDTH, _PANEL_HEIGHT), "record": (48, 48), "close": (28, 28), "device": (18, 24)}[kind]
+        width, height = {"background": (160, 60), "record": (48, 48), "close": (28, 28), "device": (18, 24)}[kind]
         image = Image.new("RGB", (width * scale, height * scale), "#ffffff")
         draw = ImageDraw.Draw(image)
         def box(values):
@@ -1285,9 +1285,8 @@ class WindowsHost:
             draw.line(box((33, 23, 33, 28)), fill=ink, width=2*scale)
             draw.line(box((24, 36, 24, 40)), fill=ink, width=2*scale)
             draw.line(box((19, 40, 29, 40)), fill=ink, width=2*scale)
-            if error:
-                draw.ellipse(box((37, 3, 45, 11)), fill="#e5654f", outline="#ffffff", width=scale)
-        photo = ImageTk.PhotoImage(image.resize((width, height), Image.Resampling.LANCZOS), master=self._root)
+        size = (round(width * 1.25), round(height * 1.25))
+        photo = ImageTk.PhotoImage(image.resize(size, Image.Resampling.LANCZOS), master=self._root)
         self._image_cache[key] = photo
         return photo
 
@@ -1333,7 +1332,7 @@ class WindowsHost:
             if canvas is None:
                 continue
             canvas.delete("all")
-            canvas.create_oval(5, 4, 13, 12, fill=color, outline="#ffffff", width=1)
+            canvas.create_oval(5, 5, 15, 15, fill=color, outline="#ffffff", width=1)
 
     def _status_detail_text(self) -> str:
         with self._lock:
@@ -1366,14 +1365,14 @@ class WindowsHost:
         label = tk.Label(
             detail,
             text=self._status_detail_text(),
-            font=("Microsoft YaHei UI", -12),
+            font=("Microsoft YaHei UI", -15),
             justify="left",
             anchor="w",
             fg="#314139",
             bg="#f8fbf9",
-            padx=9,
-            pady=7,
-            wraplength=300,
+            padx=12,
+            pady=9,
+            wraplength=375,
             takefocus=False,
         )
         label.pack()
@@ -1461,7 +1460,7 @@ class WindowsHost:
         tip.withdraw()
         tip.overrideredirect(True)
         tip.attributes("-topmost", True)
-        tk.Label(tip, text=self._tooltip_text(), font=("Microsoft YaHei UI", -12),
+        tk.Label(tip, text=self._tooltip_text(), font=("Microsoft YaHei UI", -15),
                  fg="#526258", bg="#f8fbf9", padx=8, pady=5).pack()
         tip.update_idletasks()
         x = int(overlay.winfo_rootx())
