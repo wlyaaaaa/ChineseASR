@@ -466,7 +466,7 @@ engines:
 
         self.assertEqual(doctor.returncode, 0, doctor.stderr)
         self.assertIn("Default engine: custom-primary", doctor.stdout)
-        self.assertIn("Available engines: custom-primary, custom-secondary", doctor.stdout)
+        self.assertIn("Integrated transcription engines: custom-primary, custom-secondary", doctor.stdout)
         self.assertNotEqual(strict.returncode, 0)
         self.assertIn("Audio file not found", strict.stderr)
         self.assertNotIn("invalid choice", strict.stderr)

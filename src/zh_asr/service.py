@@ -122,8 +122,11 @@ class JobRequest:
     resolved_secondary_engine: str | None = None
     model_config_sha256: str = ""
     audio_sha256: str = ""
+    runtime_code_sha256: str = ""
     wsl_distributions: tuple[str, ...] = ()
     caller_binding: Mapping[str, Any] | None = None
+    profile: str | None = None
+    channel_index: int | None = None
 
     @classmethod
     def from_payload(cls, payload: dict, root: Path, default_out_root: Path | None = None) -> "JobRequest":
@@ -145,6 +148,14 @@ class JobRequest:
         engine = _optional_str(payload.get("engine"))
         primary_engine = _optional_str(payload.get("primary_engine"))
         secondary_engine = _optional_str(payload.get("secondary_engine"))
+        profile = _optional_str(payload.get("profile"))
+        channel_index = payload.get("channel_index")
+        if channel_index is not None and (isinstance(channel_index, bool) or not isinstance(channel_index, int) or channel_index < 0):
+            raise ValueError("channel_index must be a nonnegative integer")
+        if mode == "quick" and channel_index is not None:
+            raise ValueError("Explicit channel selection is available for strict and long-strict")
+        if mode == "quick" and profile:
+            raise ValueError("profile applies to strict or long-strict, not quick")
         caller_value = payload.get("caller_binding")
         if caller_value is not None and not isinstance(caller_value, Mapping):
             raise ValueError("caller_binding must be a JSON object when provided")
@@ -160,8 +171,17 @@ class JobRequest:
             engine=engine,
             primary_engine=primary_engine,
             secondary_engine=secondary_engine,
+            profile=profile,
         )
-
+        if mode == "strict":
+            from .config import load_model_config
+            from .file_entry import needs_long_route
+            try:
+                if needs_long_route(audio, load_model_config(), resolved_primary_engine, resolved_secondary_engine):
+                    mode = "long-strict"
+            except (OSError, ValueError, RuntimeError, EOFError):
+                # Invalid media is classified by the existing worker, not this probe.
+                pass
         return cls(
             audio=audio,
             mode=mode,
@@ -183,6 +203,9 @@ class JobRequest:
             resolved_secondary_engine=resolved_secondary_engine,
             model_config_sha256=model_config_sha256,
             audio_sha256=_sha256_path(audio),
+            runtime_code_sha256=_current_runtime_code_sha256(),
+            profile=profile,
+            channel_index=channel_index,
             wsl_distributions=wsl_distributions,
             caller_binding=caller_binding,
         )
@@ -196,10 +219,13 @@ class JobRequest:
             "engine": self.engine,
             "primary_engine": self.primary_engine,
             "secondary_engine": self.secondary_engine,
+            "profile": self.profile,
+            "channel_index": self.channel_index,
             "resolved_engine": self.resolved_engine,
             "resolved_primary_engine": self.resolved_primary_engine,
             "resolved_secondary_engine": self.resolved_secondary_engine,
             "model_config_sha256": self.model_config_sha256,
+            "runtime_code_sha256": self.runtime_code_sha256 or "legacy_unknown",
             "wsl_distributions": self.wsl_distributions,
             "device": self.device,
             "cache_dir": str(self.cache_dir) if self.cache_dir else None,
@@ -219,10 +245,13 @@ class JobRequest:
             "engine": self.engine,
             "primary_engine": self.primary_engine,
             "secondary_engine": self.secondary_engine,
+            "profile": self.profile,
+            "channel_index": self.channel_index,
             "resolved_engine": self.resolved_engine,
             "resolved_primary_engine": self.resolved_primary_engine,
             "resolved_secondary_engine": self.resolved_secondary_engine,
             "model_config_sha256": self.model_config_sha256,
+            "runtime_code_sha256": self.runtime_code_sha256 or "legacy_unknown",
             "audio_sha256": self.audio_sha256,
             "wsl_distributions": list(self.wsl_distributions),
             "device": self.device,
@@ -286,8 +315,30 @@ class Job:
             "objective_outcome": self.objective_outcome,
             "audio_result_status": self.objective_outcome,
             "objective_execution_status": self.objective_execution_status,
+            "quality_result": _quality_review_projection(self.outputs),
             "conflicts": [conflict.to_dict() for conflict in self.conflicts],
         }
+
+
+def _quality_review_projection(outputs: Mapping[str, str]) -> dict:
+    """Expose audio-review state separately from raw-artifact integrity."""
+    unknown = {"status": "not_available", "needs_review": None, "lexical_truth_verified": False}
+    path = outputs.get("quality_review")
+    if not path:
+        return unknown
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or value.get("schema") != "zh_asr.quality_review.v1":
+            return {**unknown, "status": "invalid"}
+        status = value.get("status", "unknown")
+        if status not in {"completed", "degraded", "failed"}:
+            return {**unknown, "status": "unknown"}
+        return {"status": status, "needs_review": bool(value.get("needs_review")) or status != "completed",
+            "review_count": value.get("review_count", len(value.get("entries", []))),
+            "alignment_failed": value.get("alignment_failed", 0),
+            "supplemental_failed": value.get("supplemental_failed", 0), "lexical_truth_verified": False}
+    except (OSError, ValueError, TypeError):
+        return {**unknown, "status": "unreadable"}
 
 
 ProcessRunner = Callable[[Job], ProcessResult]
@@ -460,6 +511,9 @@ class TranscriptionService:
             ),
             model_config_sha256=str(request_data.get("model_config_sha256") or ""),
             audio_sha256=str(request_data.get("audio_sha256") or ""),
+            runtime_code_sha256=str(request_data.get("runtime_code_sha256") or ""),
+            profile=_optional_str(request_data.get("profile")),
+            channel_index=request_data.get("channel_index"),
             wsl_distributions=wsl_distributions,
             caller_binding=caller_binding,
         )
@@ -834,6 +888,9 @@ class TranscriptionService:
                 job.gpu_broker_token = str(getattr(lease, "token", "") or "")
                 try:
                     result = self._process_runner(job)
+                    complete_worker = getattr(lease, "complete_worker", None)
+                    if result.returncode == 0 and callable(complete_worker):
+                        complete_worker()
                     raise_if_lost = getattr(lease, "raise_if_lost", None)
                     if callable(raise_if_lost):
                         raise_if_lost()
@@ -1016,6 +1073,10 @@ class TranscriptionService:
             engine = request.resolved_engine or request.engine
             if engine:
                 command.extend(["--engine", engine])
+        if request.channel_index is not None:
+            command.extend(["--channel-index", str(request.channel_index)])
+        if request.profile and request.mode != "quick":
+            command.extend(["--profile", request.profile])
         if request.cache_dir:
             command.extend(["--cache-dir", str(request.cache_dir)])
         return command
@@ -1039,6 +1100,7 @@ class TranscriptionService:
                     "LocalGpuBroker lease token."
                 )
             process_env[GPU_BROKER_CHILD_TOKEN_ENV] = job.gpu_broker_token
+            process_env["ZH_ASR_SUPERVISOR_PID"] = str(os.getpid())
         process = subprocess.Popen(
             job.command,
             cwd=self.root,
@@ -1197,6 +1259,10 @@ def _collect_outputs(
         objective_matches = sorted(out_dir.glob("*.objective-result.json"))
         if objective_matches:
             outputs["objective_result"] = str(objective_matches[0])
+    for key, name in (("quality_review", "quality.review.json"), ("review_html", "quality.review.html")):
+        path = out_dir / name
+        if path.is_file():
+            outputs[key] = str(path)
     return outputs
 
 
@@ -1476,8 +1542,9 @@ def _resolve_request_models(
     engine: str | None,
     primary_engine: str | None,
     secondary_engine: str | None,
+    profile: str | None = None,
 ) -> tuple[str | None, str | None, str | None, str, tuple[str, ...]]:
-    from .config import load_model_config
+    from .config import load_model_config, resolve_profile
 
     config = load_model_config()
     config_hash = ""
@@ -1492,8 +1559,7 @@ def _resolve_request_models(
             config_hash,
             _wsl_distributions_for_engines(config, (resolved_engine,)),
         )
-    resolved_primary = primary_engine or config.strict_primary_engine
-    resolved_secondary = secondary_engine or config.strict_secondary_engine
+    resolved_primary, resolved_secondary = resolve_profile(config, profile, primary_engine, secondary_engine)
     return (
         None,
         resolved_primary,
@@ -1870,3 +1936,8 @@ def serve_api(host: str, port: int, state_dir: Path, root: Path) -> int:
         server.server_close()
         service.stop()
     return 0
+
+
+def _current_runtime_code_sha256() -> str:
+    from .long_audio import _runtime_code_identity
+    return str(_runtime_code_identity()["sha256"])

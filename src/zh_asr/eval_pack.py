@@ -18,8 +18,10 @@ from typing import Any, Callable
 from .config import ModelConfig, load_model_config
 from .metadata import capture_invocation, file_metadata, runtime_info, snapshot_model_config
 from .pipeline import strict_transcribe_audio
+from .evaluation_cache import observe_case, read_case_cache, save_case_cache
 from .risk_rules import RuleHit, evaluate_risk_rules
 from .text_normalizer import to_simplified
+from .text_comparison import normalize_comparison, critical_differences, strip_audit_markers, COMPARISON_POLICY_VERSION
 
 
 SAMPLE_RATE = 16000
@@ -95,6 +97,7 @@ class EvalCaseResult:
     false_confident: bool
     simplified_only: bool
     needs_review: bool
+    audit_needs_review: bool = False
     skipped: bool = False
     skip_reason: str = ""
 
@@ -168,6 +171,7 @@ def generate_builtin_corpus(
     cases = [_with_case_file_metadata(corpus_root, case) for case in cases]
     manifest = {
         "schema_version": 2,
+        "comparison_policy": COMPARISON_POLICY_VERSION,
         "version": 1,
         "generated": datetime.now().isoformat(timespec="seconds"),
         "description": "Built-in privacy-free ChineseASR evaluation corpus.",
@@ -202,22 +206,46 @@ def run_evaluation(
     primary = primary_engine or model_config.strict_primary_engine
     secondary = secondary_engine or model_config.strict_secondary_engine
     output_root.mkdir(parents=True, exist_ok=True)
-
+    from .long_audio import _runtime_code_identity, _runtime_artifact_identity
+    run_code = _runtime_code_identity()
+    run_config = snapshot_model_config(model_config, (primary, secondary))
+    from .pipeline import default_cache_dir
+    resolved_cache = (cache_dir or default_cache_dir()).resolve()
+    artifacts = _runtime_artifact_identity(model_config, (primary, secondary), resolved_cache)
+    cases = manifest.get("cases", [])
+    if not isinstance(cases, list) or any(not isinstance(c, dict) for c in cases):
+        raise ValueError("Evaluation cases must be an array of objects")
+    identifiers = [str(c.get("id", "")) for c in cases]
+    if len(identifiers) != len(set(identifiers)):
+        raise ValueError("Evaluation case identifiers must be unique")
+    for identifier in identifiers:
+        if not identifier or identifier in {".", ".."} or "/" in identifier or "\\" in identifier or ":" in identifier:
+            raise ValueError("Evaluation case identifiers must be single path components")
     run_started_at = datetime.now()
     run_started_perf = time.perf_counter()
     results: list[EvalCaseResult] = []
-    for case in manifest.get("cases", []):
+    for case in cases:
         case_id = str(case["id"])
         if not case.get("available", True):
             results.append(_skipped_case(case, corpus_root, str(case.get("error", "case unavailable"))))
             continue
 
+        declared_case = case
+        case, truth_text = observe_case(corpus_root, case)
         audio_path = corpus_root / str(case["audio"])
-        truth_text = _truth_text(corpus_root, case)
         case_out = output_root / "cases" / case_id
         expected_audit = case_out / f"{audio_path.stem}.strict.audit.json"
+        cache_path = case_out / "evaluation-cache.json"
+        identity = {"audio_sha256": case["audio_sha256"], "truth_sha256": case["truth_sha256"],
+            "truth_text_sha256": hashlib.sha256(truth_text.encode("utf-8")).hexdigest(),
+            "expect_empty": bool(case.get("expect_empty", False)),
+            "primary_engine": primary, "secondary_engine": secondary, "device": device,
+            "cache_dir": str(resolved_cache), "model_config": run_config,
+            "runtime_code": run_code, "runtime_artifacts": artifacts,
+            "comparison_policy": COMPARISON_POLICY_VERSION}
         case_started_perf = time.perf_counter()
-        if not expected_audit.exists() or force:
+        paths = None if force else read_case_cache(cache_path, identity)
+        if paths is None:
             paths = _call_strict_fn(
                 strict_fn,
                 audio_path=audio_path,
@@ -229,14 +257,23 @@ def run_evaluation(
                 config=model_config,
                 expect_empty=bool(case.get("expect_empty", False)),
             )
-            audit_json = paths.get("audit_json", expected_audit)
-        else:
-            audit_json = expected_audit
-            paths = {"audit_json": audit_json}
+            after_case, after_truth = observe_case(corpus_root, declared_case)
+            if any(after_case[key] != case[key] for key in ("audio_sha256", "truth_sha256")) or after_truth != truth_text:
+                raise RuntimeError("Evaluation source or reference changed during inference")
+            if snapshot_model_config(model_config, (primary, secondary)) != run_config or _runtime_code_identity() != run_code:
+                raise RuntimeError("Evaluation code or configuration changed during inference")
+            save_case_cache(cache_path, identity, paths)
+        audit_json = paths.get("audit_json", expected_audit)
         case_elapsed_sec = time.perf_counter() - case_started_perf
         audit = json.loads(Path(audit_json).read_text(encoding="utf-8"))
+        if (audit.get("primary_engine"), audit.get("secondary_engine")) != (primary, secondary):
+            raise RuntimeError("Evaluation audit belongs to a different engine pair")
         results.append(_evaluate_case(case, corpus_root, audio_path, truth_text, audit, paths, case_elapsed_sec))
 
+    if snapshot_model_config(model_config, (primary, secondary)) != run_config or _runtime_code_identity() != run_code:
+        raise RuntimeError("Evaluation code or configuration changed; results cannot be relabeled as current")
+    if _runtime_artifact_identity(model_config, (primary, secondary), resolved_cache) != artifacts:
+        raise RuntimeError("Evaluation model artifacts changed during the run")
     summary = _summary(corpus_root, output_root, results)
     run_finished_at = datetime.now()
     run_elapsed_sec = time.perf_counter() - run_started_perf
@@ -244,7 +281,8 @@ def run_evaluation(
     _write_metrics(
         output_root / "metrics.json",
         summary,
-        model_config=snapshot_model_config(model_config, selected_engines),
+        model_config=run_config,
+        runtime_code=run_code,
         invocation=dict(manifest.get("invocation") or capture_invocation()),
         runtime=runtime_info(device),
         started_at=run_started_at,
@@ -410,7 +448,9 @@ def _evaluate_case(
     if final_text != to_simplified(final_text):
         risk_flags.append("non_simplified_output")
 
-    false_confident = bool(risk_flags) and not needs_review and not audit_flags
+    if not expect_empty and critical_differences(truth_text, strip_audit_markers(final_text)):
+        risk_flags.append("critical_content_error")
+    false_confident = (empty_len > 0 or (cer is not None and cer > 0)) and not needs_review
     timing = paths.get("timing") if isinstance(paths.get("timing"), dict) else {}
     total_sec = _optional_float(timing.get("total_sec")) or elapsed_sec
     return EvalCaseResult(
@@ -442,6 +482,7 @@ def _evaluate_case(
         false_confident=false_confident,
         simplified_only=final_text == to_simplified(final_text),
         needs_review=needs_review or bool(risk_flags),
+        audit_needs_review=needs_review,
     )
 
 
@@ -535,9 +576,13 @@ def _write_metrics(
     started_at: datetime,
     finished_at: datetime,
     elapsed_sec: float,
+    runtime_code: dict[str, Any] | None = None,
 ) -> None:
+    from .long_audio import _runtime_code_identity
     payload = {
-        "schema_version": 2,
+        "runtime_code": runtime_code if runtime_code is not None else _runtime_code_identity(),
+        "schema_version": 3,
+        "comparison_policy": COMPARISON_POLICY_VERSION,
         "summary": {
             "corpus_dir": str(summary.corpus_dir),
             "out_dir": str(summary.out_dir),
@@ -549,6 +594,8 @@ def _write_metrics(
             "skipped": summary.skipped,
             "hallucination_count": summary.hallucination_count,
             "false_confident_count": summary.false_confident_count,
+            "auto_accept_count": sum(not x.skipped and not x.audit_needs_review for x in summary.cases),
+            "system_review_count": sum(not x.skipped and x.audit_needs_review for x in summary.cases),
             "generated": datetime.now().isoformat(timespec="seconds"),
         },
         "runtime": runtime,
@@ -565,6 +612,8 @@ def _write_metrics(
                 "truth_text": item.truth_text,
                 "final_text": item.final_text,
                 "cer": item.cer,
+                "standard_cer": standard_char_error_rate(item.truth_text, item.final_text) if item.cer is not None else None,
+                "critical_errors": list(critical_differences(item.truth_text, strip_audit_markers(item.final_text))) if item.cer is not None else [],
                 "disagreement_score": item.disagreement_score,
                 "audit_status": item.audit_status,
                 "models": {
@@ -580,6 +629,8 @@ def _write_metrics(
                     "primary_secondary": item.primary_secondary_similarity,
                     "disagreement_score": item.disagreement_score,
                     "cer": item.cer,
+                "standard_cer": standard_char_error_rate(item.truth_text, item.final_text) if item.cer is not None else None,
+                "critical_errors": list(critical_differences(item.truth_text, strip_audit_markers(item.final_text))) if item.cer is not None else [],
                 },
                 "timing": {
                     "total_sec": item.timing_total_sec,
@@ -592,6 +643,7 @@ def _write_metrics(
                 "false_confident": item.false_confident,
                 "simplified_only": item.simplified_only,
                 "needs_review": item.needs_review,
+                "audit_needs_review": item.audit_needs_review,
                 "skipped": item.skipped,
                 "skip_reason": item.skip_reason,
                 "paths": {
@@ -773,9 +825,15 @@ def _sha256(path: Path) -> str:
 
 
 def _normalize_metric_text(text: str) -> str:
-    simplified = to_simplified(text)
-    return re.sub(r"[\s，。！？、,.!?;；:：\"'“”‘’（）()\[\]【】<>《》|-]+", "", simplified).lower()
+    return normalize_comparison(strip_audit_markers(text))
 
+
+def standard_char_error_rate(reference: str, hypothesis: str) -> float:
+    """Punctuation-insensitive CER retained for external benchmark comparison."""
+    def normal(text):
+        return "".join(c for c in to_simplified(strip_audit_markers(text)).lower() if c.isalnum())
+    ref, hyp = normal(reference), normal(hypothesis)
+    return _levenshtein(ref, hyp) / max(1, len(ref))
 
 def _empty_audio_text_len(text: str) -> int:
     normalized = _normalize_metric_text(text)

@@ -324,6 +324,8 @@ class PipelineTests(unittest.TestCase):
                     "text": "开放时间早上九点至下午五点。",
                     "language": "zh",
                     "original_text": "開放時間早上九點至下午五點。",
+                    "generation": {"output_token_estimate": None, "max_new_tokens": None,
+                                   "finish_reason": "not_exposed_by_runtime", "truncation_suspected": False},
                 }
             ],
         )

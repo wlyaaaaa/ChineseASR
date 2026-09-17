@@ -98,6 +98,9 @@ def plan_chunks(
     *,
     recommended_chunk_sec: int | None = None,
     absolute_max_chunk_sec: int | None = None,
+    speech_segments: list[list[int]] | None = None,
+    min_chunk_sec: int = 20,
+    boundary_search_sec: int = 5,
 ) -> list[ChunkSpec]:
     if chunk_sec <= 0:
         raise ValueError("chunk_sec must be greater than 0")
@@ -120,6 +123,11 @@ def plan_chunks(
     index = 1
     while start_ms < duration_ms:
         end_ms = min(start_ms + chunk_ms, duration_ms)
+        if speech_segments:
+            from .audio_quality import choose_cut
+            end_ms = choose_cut(start_ms, end_ms, duration_ms, speech_segments,
+                min_chunk_ms=max(overlap_sec * 1000 + 1, min_chunk_sec * 1000),
+                search_ms=boundary_search_sec * 1000)
         chunk_id = f"chunk-{index:06d}"
         specs.append(
             ChunkSpec(
@@ -132,7 +140,7 @@ def plan_chunks(
         )
         if end_ms >= duration_ms:
             break
-        start_ms += step_ms
+        start_ms = end_ms - overlap_sec * 1000
         index += 1
     return specs
 
@@ -151,6 +159,8 @@ def run_long_transcription(
     strict_fn: StrictFn | None = None,
     arbiter=None,
     caller_binding: Mapping[str, Any] | None = None,
+    config=None,
+    channel_index: int | None = None,
 ) -> LongRunSummary:
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -159,9 +169,14 @@ def run_long_transcription(
     chunks_dir = out_dir / "chunks"
     out_dir.mkdir(parents=True, exist_ok=True)
     chunks_dir.mkdir(parents=True, exist_ok=True)
-    prepared_audio = prepare_pcm16_mono(audio_path.resolve(), out_dir / "_derived")
+    model_config = config or load_model_config()
+    channel_identity = None
+    selected_audio = audio_path.resolve()
+    if channel_index is not None:
+        from .audio_quality import extract_channel
+        selected_audio, channel_identity = extract_channel(selected_audio, channel_index, out_dir / "_derived" / "channels")
+    prepared_audio = prepare_pcm16_mono(selected_audio, out_dir / "_derived")
     processing_audio_path = prepared_audio.path
-    model_config = load_model_config()
     resolved_cache_dir = (cache_dir or default_cache_dir()).expanduser().resolve()
     resolved_primary_engine = primary_engine or model_config.strict_primary_engine
     resolved_secondary_engine = secondary_engine or model_config.strict_secondary_engine
@@ -182,11 +197,24 @@ def run_long_transcription(
         if strict_fn is None
         else None
     )
+    file_quality = getattr(model_config, "quality", {}) or {}
+    quality_limits = []
+    if file_quality.get("max_chunk_sec"):
+        quality_limits.append(int(file_quality["max_chunk_sec"]))
+    if file_quality.get("align") and model_config.alignment:
+        quality_limits.append(int(model_config.alignment.get("max_audio_sec", 300)))
+    if quality_limits:
+        recommended_chunk_sec = min([recommended_chunk_sec] + quality_limits) if recommended_chunk_sec else min(quality_limits)
     effective_chunk_sec = _effective_chunk_sec(
         chunk_sec,
         recommended_chunk_sec=recommended_chunk_sec,
         absolute_max_chunk_sec=absolute_max_chunk_sec,
     )
+    cut_policy = getattr(model_config, "quality", {}) or {}
+    vad = {"status": "not_requested", "segments": [], "excluded_ranges_ms": []}
+    if cut_policy.get("cut_strategy") == "vad":
+        from .audio_quality import speech_boundaries
+        vad = speech_boundaries(processing_audio_path, resolved_cache_dir, model_config, out_dir / "_derived")
     specs = plan_chunks(
         processing_audio_path,
         chunk_sec=chunk_sec,
@@ -194,9 +222,15 @@ def run_long_transcription(
         chunks_dir=chunks_dir,
         recommended_chunk_sec=recommended_chunk_sec,
         absolute_max_chunk_sec=absolute_max_chunk_sec,
+        speech_segments=vad.get("segments", []),
+        min_chunk_sec=int(cut_policy.get("min_chunk_sec", 20)),
+        boundary_search_sec=int(cut_policy.get("boundary_search_sec", 5)),
     )
     manifest_path = out_dir / "manifest.json"
     run_identity = {
+        "channel_selection": channel_identity,
+        "cut_policy": cut_policy,
+        "vad": vad,
         "requested_chunk_sec": chunk_sec,
         "effective_chunk_sec": effective_chunk_sec,
         "overlap_sec": overlap_sec,
@@ -374,6 +408,19 @@ def run_long_transcription(
             finally:
                 persist_manifest()
 
+    quality_payload = None
+    if cut_policy.get("align") or cut_policy.get("review_engine"):
+        from .quality_review import enhance_chunks
+        from .model_lifecycle import write_json_atomic
+        try:
+            quality_payload = enhance_chunks(states, config=model_config, device=device,
+                cache_dir=resolved_cache_dir, output_dir=out_dir, vad=vad)
+            persist_manifest()
+        except Exception as error:
+            quality_payload = {"schema": "zh_asr.quality_review.v1", "status": "failed",
+                "needs_review": True, "error": f"{type(error).__name__}: {error}",
+                "lexical_results_rewritten": False, "entries": []}
+            write_json_atomic(out_dir / "quality.review.json", quality_payload)
     transcript_path = out_dir / "transcript.md"
     audit_path = out_dir / "audit.md"
     metrics_path = out_dir / "metrics.json"
@@ -416,7 +463,9 @@ def run_long_transcription(
         engines=[resolved_primary_engine, resolved_secondary_engine],
         children=objective_children,
         request={
-            "requested_chunk_sec": chunk_sec,
+            "cut_policy": cut_policy,
+        "vad": vad,
+        "requested_chunk_sec": chunk_sec,
             "effective_chunk_sec": effective_chunk_sec,
             "overlap_sec": overlap_sec,
             "duration_ms": round(prepared_audio.duration_sec * 1000),
@@ -431,6 +480,7 @@ def run_long_transcription(
     manifest_payload["objective_result_reference"] = objective_path.name
     _write_manifest(manifest_path, manifest_payload)
     metrics_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics_payload["quality_review"] = quality_payload
     metrics_payload["objective_outcome"] = objective_result["objective_outcome"]
     metrics_payload["objective_result_reference"] = objective_path.name
     metrics_path.write_text(
@@ -610,6 +660,9 @@ def _runtime_code_identity(root: Path | None = None) -> dict[str, Any]:
     candidates = [
         *sorted((project / "src" / "zh_asr").rglob("*.py")),
         *sorted((project / "runtime").rglob("*.py")),
+        *sorted((project / "configs" / "model-locks").glob("*.json")),
+        *sorted(project.glob("requirements*.txt")),
+        project / "pyproject.toml",
     ]
     records: list[dict[str, str]] = []
     for path in candidates:
@@ -963,6 +1016,7 @@ def _maybe_arbitrate(state: ChunkState, arbiter) -> None:
     decision = arbiter.arbitrate(evidence)
     if decision:
         state.arbitration = decision.to_dict() if hasattr(decision, "to_dict") else decision
+        state.arbitration["policy"] = "advisory_only_never_rewrites_lexical_output"
 
 
 def _needs_arbitration(audit: dict[str, Any]) -> bool:
@@ -996,7 +1050,12 @@ def _write_merged_transcript(path: Path, audio_path: Path, states: list[ChunkSta
             and previous_raw_text
             and raw_text
         ):
-            removed_overlap_chars = _exact_boundary_overlap_size(previous_raw_text, raw_text)
+            from .alignment import timestamp_supported_overlap
+            previous_alignment = _load_alignment_sidecar(previous_state)
+            current_alignment = _load_alignment_sidecar(state)
+            removed_overlap_chars = timestamp_supported_overlap(
+                previous_raw_text, raw_text, previous_alignment, current_alignment,
+                previous_state.spec.start_ms, state.spec.start_ms, previous_state.spec.end_ms)
             text = _remove_exact_boundary_overlap(
                 previous_raw_text,
                 raw_text,
@@ -1014,7 +1073,7 @@ def _write_merged_transcript(path: Path, audio_path: Path, states: list[ChunkSta
         if removed_overlap_chars:
             lines.extend(
                 [
-                    f"<!-- exact-boundary-overlap-removed: {removed_overlap_chars} chars -->",
+                    f"<!-- timestamp-supported-overlap-removed: {removed_overlap_chars} chars -->",
                     "",
                 ]
             )
@@ -1095,8 +1154,7 @@ def _write_metrics(path: Path, audio_path: Path, states: list[ChunkState], proce
 
 
 def _chunk_text(state: ChunkState) -> str:
-    if state.arbitration and state.arbitration.get("final_text"):
-        return str(state.arbitration["final_text"]).strip()
+
     final = state.outputs.get("final")
     if not final or not Path(final).exists():
         return ""
@@ -1110,3 +1168,18 @@ def _fmt_ms(value: int) -> str:
     hours, rem = divmod(total_seconds, 3600)
     minutes, seconds = divmod(rem, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _load_alignment_sidecar(state: ChunkState) -> dict[str, Any]:
+    value = state.outputs.get("alignment_json")
+    if not value:
+        return {}
+    try:
+        payload = json.loads(Path(value).read_text(encoding="utf-8"))
+        if payload.get("audio_sha256") != sha256_file(state.spec.audio_path):
+            return {}
+        from .alignment import validate_items
+        validate_items(payload.get("items", []), state.spec.end_ms-state.spec.start_ms)
+        return payload
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}

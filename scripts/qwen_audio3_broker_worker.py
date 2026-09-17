@@ -371,21 +371,37 @@ def _response_text(response: dict[str, Any]) -> tuple[str, str]:
 
 
 def _merge_texts(texts: list[str]) -> str:
-    merged: list[str] = []
-    previous = ""
-    for raw in texts:
-        current = raw.strip()
-        overlap = 0
-        max_overlap = min(len(previous), len(current), 200)
-        for size in range(max_overlap, 1, -1):
-            if previous.endswith(current[:size]):
-                overlap = size
-                break
-        remaining = current[overlap:].strip()
-        if remaining:
-            merged.append(remaining)
-        previous = current
-    return "\n".join(merged)
+    # Without word timestamps, identical boundary words may be genuine speech.
+    # Preserve them and keep the original per-chunk time ranges available.
+    return "\n".join(text.strip() for text in texts if text.strip())
+
+
+def _json_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+        separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _cached_chunk(path: Path, identity: dict[str, Any], retry_uncertain: bool) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if cached.get("schema") != "chineseasr.cloud-chunk.v1" or cached.get("identity") != identity:
+            raise CloudPolicyError("resume_input_mismatch")
+        if cached.get("status") in {"in_flight", "outcome_unknown"}:
+            if not retry_uncertain:
+                raise CloudPolicyError("cloud_chunk_outcome_unknown_explicit_retry_required")
+            return None
+        if cached.get("status") != "succeeded":
+            return None
+        record = cached["result"]
+        if _json_digest(record) != cached.get("result_sha256"):
+            raise CloudPolicyError("cloud_checkpoint_invalid")
+        if not isinstance(record.get("text"), str) or not record["text"].strip():
+            raise CloudPolicyError("cloud_checkpoint_invalid")
+        return record
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise CloudPolicyError("cloud_checkpoint_invalid") from error
 
 
 def _base_result(
@@ -459,32 +475,58 @@ def process_request_file(
         }
         texts: list[str] = []
         chunk_results: list[dict[str, Any]] = []
+        result.update(chunks=chunk_results, reused_chunks=0, new_requests=0,
+            uploaded_audio_seconds=0.0, completion="partial",
+            boundary_policy="preserve_text_without_word_timestamps")
+        prepared_hash = _sha256_file(prepared)
         for chunk in chunks:
-            result["cloud_upload_performed"] = True
-            response = transport(
-                DEFAULT_ENDPOINT,
-                headers,
-                _payload(chunk["path"]),
-                DEFAULT_TIMEOUT_SEC,
-            )
-            text, request_id = _response_text(response)
-            texts.append(text)
-            chunk_results.append(
-                {
-                    "index": chunk["index"],
-                    "start_ms": chunk["start_ms"],
-                    "end_ms": chunk["end_ms"],
-                    "audio_sha256": _sha256_file(chunk["path"]),
-                    "provider_request_id": request_id,
-                    "text": text,
-                }
-            )
+            identity = {"source_audio_sha256": result["source_audio_sha256"],
+                "prepared_audio_sha256": prepared_hash, "audio_sha256": _sha256_file(chunk["path"]),
+                "model": MODEL, "endpoint": DEFAULT_ENDPOINT,
+                "parameters": {"format": "wav", "sample_rate": "16000"},
+                "chunk_sec": validated["chunk_sec"], "overlap_sec": validated["overlap_sec"],
+                "index": chunk["index"], "start_ms": chunk["start_ms"], "end_ms": chunk["end_ms"]}
+            checkpoint = work_dir / f"chunk-{chunk['index']:06d}.result.json"
+            record = _cached_chunk(checkpoint, identity, request.get("retry_uncertain_chunks") is True)
+            if record is not None:
+                result["reused_chunks"] += 1
+            else:
+                payload = _payload(chunk["path"])
+                pending = {"schema": "chineseasr.cloud-chunk.v1", "identity": identity,
+                    "status": "in_flight", "started_utc": _utc_now()}
+                _write_json_atomic(checkpoint, pending)
+                result["cloud_upload_performed"] = True
+                result["new_requests"] += 1
+                result["uploaded_audio_seconds"] += (chunk["end_ms"]-chunk["start_ms"])/1000
+                try:
+                    response = transport(DEFAULT_ENDPOINT, headers, payload, DEFAULT_TIMEOUT_SEC)
+                    text, request_id = _response_text(response)
+                    record = {"index": chunk["index"], "start_ms": chunk["start_ms"],
+                        "end_ms": chunk["end_ms"], "audio_sha256": identity["audio_sha256"],
+                        "provider_request_id": request_id, "text": text,
+                        "usage": response.get("usage") if isinstance(response.get("usage"), dict) else None}
+                except Exception as error:
+                    ambiguous = not isinstance(error, CloudApiError) or error.code in {
+                        "network_failure", "provider_response_invalid", "provider_transcript_missing"}
+                    pending.update(status="outcome_unknown" if ambiguous else "failed",
+                        error_code=error.code if isinstance(error, CloudApiError) else type(error).__name__,
+                        completed_utc=_utc_now())
+                    _write_json_atomic(checkpoint, pending)
+                    raise
+                pending.update(status="succeeded", result=record,
+                    result_sha256=_json_digest(record), completed_utc=_utc_now())
+                _write_json_atomic(checkpoint, pending)
+            texts.append(record["text"])
+            chunk_results.append(record)
+            result["text"] = _merge_texts(texts)
+            _write_json_atomic(work_dir / "partial-result.json", result)
         result.update(
             {
                 "status": "succeeded",
                 "credential_result": "Success",
                 "text": _merge_texts(texts),
                 "chunks": chunk_results,
+                "completion": "complete",
             }
         )
     except CloudPolicyError as exc:

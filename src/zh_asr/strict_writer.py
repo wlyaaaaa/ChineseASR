@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .audio_outcome import build_objective_result, write_objective_result
+from .inference_quality import collect_generation_warnings
 from .audit import (
     STRICT_BUNDLE_ARTIFACT_KEYS,
     STRICT_BUNDLE_RECEIPT_SCHEMA_VERSION,
@@ -37,9 +38,16 @@ def write_strict_bundle(
     primary_provenance: Mapping[str, Any] | None = None,
     secondary_provenance: Mapping[str, Any] | None = None,
     caller_binding: Mapping[str, Any] | None = None,
+    critical_terms: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = audio_path.stem
+    primary_provenance = dict(primary_provenance or {})
+    secondary_provenance = dict(secondary_provenance or {})
+    for result, provenance in ((primary_result, primary_provenance), (secondary_result, secondary_provenance)):
+        warnings = collect_generation_warnings(result)
+        if warnings:
+            provenance["generation_warnings"] = warnings
     primary_text = extract_text(primary_result)
     secondary_text = extract_text(secondary_result)
     objective_path = out_dir / f"{stem}.objective-result.json"
@@ -90,6 +98,7 @@ def write_strict_bundle(
         objective_confidence=str(objective.get("confidence") or "unknown"),
         objective_reason=str(objective.get("reason") or ""),
         objective_result_reference=objective_path.name,
+        critical_terms=critical_terms,
     )
 
     primary_json_path.write_text(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import os
 from pathlib import Path
@@ -52,6 +52,9 @@ class ModelConfig:
     model_aliases: dict[str, str]
     engines: dict[str, EngineSpec]
     speaker_verification: SpeakerVerificationSpec | None = None
+    quality: dict[str, Any] = field(default_factory=dict)
+    alignment: dict[str, Any] = field(default_factory=dict)
+    profiles: dict[str, Any] = field(default_factory=dict)
 
 
 def load_model_config(path: Path | str | None = None) -> ModelConfig:
@@ -79,6 +82,8 @@ def load_model_config(path: Path | str | None = None) -> ModelConfig:
             known = ", ".join(sorted(engines))
             raise ValueError(f"Configured ASR engine '{selected}' is not defined in {config_path}. Known engines: {known}")
 
+    quality, alignment, profiles = _parse_quality_configuration(data, engines, config_path)
+
     return ModelConfig(
         path=config_path,
         default_engine=default_engine,
@@ -87,6 +92,9 @@ def load_model_config(path: Path | str | None = None) -> ModelConfig:
         model_aliases=aliases,
         engines=engines,
         speaker_verification=speaker_verification,
+        quality=quality,
+        alignment=alignment,
+        profiles=profiles,
     )
 
 
@@ -107,7 +115,9 @@ def list_engine_names(config: ModelConfig | None = None) -> tuple[str, ...]:
 
 def list_transcription_engine_names(config: ModelConfig | None = None) -> tuple[str, ...]:
     model_config = config or MODEL_CONFIG
-    return tuple(sorted(name for name, spec in model_config.engines.items() if not spec.is_whisper))
+    from .adapters import ADAPTERS
+    return tuple(sorted(name for name, spec in model_config.engines.items()
+                        if spec.adapter in ADAPTERS and not spec.is_whisper))
 
 
 def _configured_model_config_path() -> Path:
@@ -201,6 +211,54 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _parse_quality_configuration(data, engines, path):
+    quality = dict(_mapping(data.get("quality", {}), "quality", path))
+    alignment = dict(_mapping(data.get("alignment", {}), "alignment", path))
+    profiles = dict(_mapping(data.get("profiles", {}), "profiles", path))
+    if quality.get("cut_strategy", "fixed") not in {"fixed", "vad"}:
+        raise ValueError("quality.cut_strategy must be fixed or vad")
+    for key in ("min_chunk_sec", "boundary_search_sec", "review_context_sec", "max_chunk_sec"):
+        if key in quality:
+            value = quality[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"quality.{key} must be a finite nonnegative number")
+            if key in {"min_chunk_sec", "max_chunk_sec"} and value < 1:
+                raise ValueError(f"quality.{key} must be at least one second")
+    if "align" in quality and not isinstance(quality["align"], bool):
+        raise ValueError("quality.align must be a boolean")
+    terms = quality.get("critical_terms", [])
+    if not isinstance(terms, list) or any(not isinstance(x, str) or not x.strip() for x in terms):
+        raise ValueError("quality.critical_terms must be a list of nonempty strings")
+    reviewer = quality.get("review_engine")
+    if reviewer and reviewer not in engines:
+        raise ValueError("quality.review_engine must identify a configured engine")
+    for name, profile in profiles.items():
+        profile = _mapping(profile, f"profiles.{name}", path)
+        primary, secondary = profile.get("primary_engine"), profile.get("secondary_engine")
+        if primary not in engines or secondary not in engines or primary == secondary:
+            raise ValueError(f"profiles.{name} requires two different configured engines")
+        if any(engines[x].is_whisper for x in (primary, secondary)):
+            raise ValueError(f"profiles.{name} selects an unintegrated engine")
+    return quality, alignment, profiles
+
+
+def resolve_profile(config: ModelConfig, name: str | None = None,
+                    primary: str | None = None, secondary: str | None = None) -> tuple[str, str]:
+    profile = {}
+    if name:
+        if name not in config.profiles:
+            raise ValueError(f"Unknown ASR profile: {name}")
+        profile = config.profiles[name]
+    first = primary or profile.get("primary_engine") or config.strict_primary_engine
+    second = secondary or profile.get("secondary_engine") or config.strict_secondary_engine
+    for value in (first, second):
+        if value not in config.engines or config.engines[value].is_whisper:
+            raise ValueError(f"Profile selects an unavailable transcription engine: {value}")
+    if first == second:
+        raise ValueError("Strict ASR requires two different engines")
+    return first, second
 
 
 MODEL_CONFIG = load_model_config()

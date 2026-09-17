@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 
 from .text_normalizer import to_simplified
+from .text_comparison import critical_differences
 
 
 SUSPICIOUS_STOCK_PHRASES = (
@@ -35,6 +36,7 @@ def evaluate_risk_rules(
     final_text: str,
     similarity: float,
     expect_empty: bool = False,
+    critical_terms: tuple[str, ...] = (),
 ) -> tuple[RuleHit, ...]:
     primary = primary_text or ""
     secondary = secondary_text or ""
@@ -54,7 +56,7 @@ def evaluate_risk_rules(
         )
 
     stock_phrase = _first_stock_phrase(combined)
-    if stock_phrase:
+    if stock_phrase and (expect_empty or ((stock_phrase in primary) != (stock_phrase in secondary))):
         hits.append(
             RuleHit(
                 id="suspicious_stock_phrase",
@@ -63,6 +65,12 @@ def evaluate_risk_rules(
                 evidence=f"phrase={stock_phrase}",
             )
         )
+
+    critical = critical_differences(primary, secondary, critical_terms)
+    if primary and secondary and critical:
+        hits.append(RuleHit(id="critical_content_difference", severity="high",
+            message="Numbers, negation, units or identifiers differ; replay the audio.",
+            evidence="categories=" + ",".join(critical)))
 
     repeated_span = _repeated_span(final)
     if repeated_span:

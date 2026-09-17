@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .batch import run_batch
 from .benchmark import run_benchmark
-from .config import list_engine_names, list_transcription_engine_names, load_model_config
+from .config import list_engine_names, list_transcription_engine_names, load_model_config, resolve_profile
 from .eval_pack import generate_builtin_corpus, run_evaluation
 from .arbitration import load_arbitration_config, make_arbiter
 from .gpu_broker import (
@@ -22,9 +22,11 @@ from .gpu_broker import (
     verify_inherited_gpu_lease,
 )
 from .long_audio import run_long_transcription
+from .file_entry import transcribe_file
 from .pipeline import MissingDependencyError, build_model, default_cache_dir, project_root, strict_transcribe_audio, transcribe_audio
 from .process_control import (
     managed_popen_kwargs,
+    watch_process_exit,
     tagged_process_env,
     terminate_process_tree,
     terminate_wsl_processes,
@@ -89,22 +91,24 @@ def main(argv: list[str] | None = None) -> int:
 
     strict = subparsers.add_parser("strict", help="Transcribe with two engines and write final + audit outputs.")
     strict.add_argument("audio", type=Path)
-    strict.add_argument("--primary-engine", choices=transcription_choices, default=model_config.strict_primary_engine)
-    strict.add_argument("--secondary-engine", choices=transcription_choices, default=model_config.strict_secondary_engine)
+    strict.add_argument("--primary-engine", choices=transcription_choices, default=None)
+    strict.add_argument("--secondary-engine", choices=transcription_choices, default=None)
     strict.add_argument("--device", default="cuda:0")
     strict.add_argument("--out-dir", type=Path, default=Path("outputs"))
     strict.add_argument("--cache-dir", type=Path, default=default_cache_dir())
+    strict.add_argument("--channel-index", type=int, help="Explicit zero-based channel; no speaker identity inferred.")
 
     long_cmd = subparsers.add_parser("long", help="Resumable long-audio strict transcription.")
     long_cmd.add_argument("audio", type=Path)
-    long_cmd.add_argument("--primary-engine", choices=transcription_choices, default=model_config.strict_primary_engine)
-    long_cmd.add_argument("--secondary-engine", choices=transcription_choices, default=model_config.strict_secondary_engine)
+    long_cmd.add_argument("--primary-engine", choices=transcription_choices, default=None)
+    long_cmd.add_argument("--secondary-engine", choices=transcription_choices, default=None)
     long_cmd.add_argument("--device", default="cuda:0")
     long_cmd.add_argument("--out-dir", type=Path, default=Path("outputs") / "long")
     long_cmd.add_argument("--cache-dir", type=Path, default=default_cache_dir())
     long_cmd.add_argument("--chunk-sec", type=int, default=300)
     long_cmd.add_argument("--overlap-sec", type=int, default=1)
     long_cmd.add_argument("--force", action="store_true")
+    long_cmd.add_argument("--channel-index", type=int)
 
     readback = subparsers.add_parser(
         "transcript-readback",
@@ -122,8 +126,8 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("input_dir", type=Path)
     batch.add_argument("--mode", choices=("strict", "quick"), default="strict")
     batch.add_argument("--engine", choices=transcription_choices, default=model_config.default_engine)
-    batch.add_argument("--primary-engine", choices=transcription_choices, default=model_config.strict_primary_engine)
-    batch.add_argument("--secondary-engine", choices=transcription_choices, default=model_config.strict_secondary_engine)
+    batch.add_argument("--primary-engine", choices=transcription_choices, default=None)
+    batch.add_argument("--secondary-engine", choices=transcription_choices, default=None)
     batch.add_argument("--device", default="cuda:0")
     batch.add_argument("--out-dir", type=Path, default=Path("outputs") / "batch")
     batch.add_argument("--cache-dir", type=Path, default=default_cache_dir())
@@ -135,8 +139,8 @@ def main(argv: list[str] | None = None) -> int:
     eval_cmd.add_argument("--generate", action="store_true")
     eval_cmd.add_argument("--generate-only", action="store_true")
     eval_cmd.add_argument("--no-tts", action="store_true")
-    eval_cmd.add_argument("--primary-engine", choices=transcription_choices, default=model_config.strict_primary_engine)
-    eval_cmd.add_argument("--secondary-engine", choices=transcription_choices, default=model_config.strict_secondary_engine)
+    eval_cmd.add_argument("--primary-engine", choices=transcription_choices, default=None)
+    eval_cmd.add_argument("--secondary-engine", choices=transcription_choices, default=None)
     eval_cmd.add_argument("--device", default="cuda:0")
     eval_cmd.add_argument("--cache-dir", type=Path, default=default_cache_dir())
     eval_cmd.add_argument("--force", action="store_true")
@@ -146,8 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     benchmark.add_argument("--audio-dir", type=Path, required=True)
     benchmark.add_argument("--truth-dir", type=Path, required=True)
     benchmark.add_argument("--out-dir", type=Path, default=Path("outputs") / "benchmark")
-    benchmark.add_argument("--primary-engine", choices=transcription_choices, default=model_config.strict_primary_engine)
-    benchmark.add_argument("--secondary-engine", choices=transcription_choices, default=model_config.strict_secondary_engine)
+    benchmark.add_argument("--primary-engine", choices=transcription_choices, default=None)
+    benchmark.add_argument("--secondary-engine", choices=transcription_choices, default=None)
     benchmark.add_argument("--device", default="cuda:0")
     benchmark.add_argument("--cache-dir", type=Path, default=default_cache_dir())
     benchmark.add_argument("--force", action="store_true")
@@ -253,7 +257,16 @@ def main(argv: list[str] | None = None) -> int:
     speaker_delete.add_argument("--profile", type=Path, default=default_self_speaker_profile_path())
     speaker_delete.add_argument("--confirm-delete", required=True)
 
+    for command_parser in (strict, long_cmd, batch, eval_cmd, benchmark):
+        command_parser.add_argument("--profile", choices=tuple(model_config.profiles),
+            help="Named file-transcription model pair; explicit engines override its defaults.")
     args = parser.parse_args(argv)
+    if args.command in {"strict", "long", "batch", "eval", "benchmark"}:
+        try:
+            args.primary_engine, args.secondary_engine = resolve_profile(
+                model_config, args.profile, args.primary_engine, args.secondary_engine)
+        except ValueError as exc:
+            parser.error(str(exc))
     try:
         caller_binding = _caller_binding_from_env()
     except ValueError as exc:
@@ -269,6 +282,17 @@ def main(argv: list[str] | None = None) -> int:
             if inherited_token:
                 verify_inherited_gpu_lease(inherited_token)
                 _GPU_LEASE_AUTHENTICATED.set(True)
+                supervisor_pid = os.environ.pop("ZH_ASR_SUPERVISOR_PID", "")
+                if supervisor_pid:
+                    process_token = os.environ.get("ZH_ASR_PROCESS_TOKEN", "")
+                    distributions = _cli_wsl_distributions(list(sys.argv[1:] if argv is None else argv))
+                    def parent_exited():
+                        try:
+                            if process_token:
+                                terminate_wsl_processes(distributions, process_token)
+                        finally:
+                            os._exit(71)
+                    watch_process_exit(int(supervisor_pid), parent_exited)
             else:
                 return _supervise_gpu_cli(
                     list(sys.argv[1:] if argv is None else argv)
@@ -315,8 +339,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "strict":
             paths = _run_with_gpu_lease(
                 args.device,
-                lambda: strict_transcribe_audio(
+                lambda: transcribe_file(
                     args.audio,
+                    channel_index=args.channel_index,
+                    strict_fn=strict_transcribe_audio,
                     primary_engine=args.primary_engine,
                     secondary_engine=args.secondary_engine,
                     device=args.device,
@@ -328,13 +354,15 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"Final: {paths['final']}")
             print(f"Audit: {paths['audit']}")
-            print(f"Audit JSON: {paths['audit_json']}")
-            print(f"Primary raw JSON: {paths['primary_json']}")
-            print(f"Secondary raw JSON: {paths['secondary_json']}")
+            for label, key in (("Audit JSON", "audit_json"), ("Primary raw JSON", "primary_json"),
+                               ("Secondary raw JSON", "secondary_json"), ("Manifest", "manifest"),
+                               ("Quality review", "quality_review"), ("Listen and review", "review_html")):
+                if paths.get(key):
+                    print(f"{label}: {paths[key]}")
             print(f"Objective: {paths.get('objective_outcome', 'indeterminate')}")
             if paths.get("objective_result"):
                 print(f"Objective result: {paths['objective_result']}")
-            return 0
+            return 1 if paths.get("failed_chunks") else 0
         if args.command == "long":
             arbiter = make_arbiter(load_arbitration_config(model_config.path))
             summary = _run_with_gpu_lease(
@@ -344,6 +372,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.out_dir,
                     chunk_sec=args.chunk_sec,
                     overlap_sec=args.overlap_sec,
+                    channel_index=args.channel_index,
+                    config=model_config,
                     primary_engine=args.primary_engine,
                     secondary_engine=args.secondary_engine,
                     device=args.device,
@@ -666,6 +696,7 @@ def _supervise_gpu_cli(argv: list[str]) -> int:
         env = tagged_process_env(process_token)
         env.pop("ZH_ASR_GPU_BROKER_LEASE_HELD", None)
         env[GPU_BROKER_CHILD_TOKEN_ENV] = lease.token
+        env["ZH_ASR_SUPERVISOR_PID"] = str(os.getpid())
         process = subprocess.Popen(
             [sys.executable, "-m", "zh_asr", *argv],
             cwd=project_root(),
@@ -676,6 +707,13 @@ def _supervise_gpu_cli(argv: list[str]) -> int:
         try:
             lease.raise_if_lost()
             returncode = process.wait()
+            # A finished, successful worker may already have been reclaimed by
+            # process-bound lease cleanup. That is normal completion, not a
+            # failed job. Actual lease loss kills a still-running worker.
+            if returncode == 0:
+                complete_worker = getattr(lease, "complete_worker", None)
+                if callable(complete_worker):
+                    complete_worker()
             lease.raise_if_lost()
             return int(returncode)
         finally:
@@ -694,6 +732,9 @@ def _cli_wsl_distributions(argv: list[str]) -> tuple[str, ...]:
     command = argv[0] if argv else ""
 
     def option(name: str) -> str | None:
+        for argument in argv:
+            if argument.startswith(name + "="):
+                return argument.split("=", 1)[1] or None
         try:
             index = argv.index(name)
         except ValueError:
@@ -704,11 +745,14 @@ def _cli_wsl_distributions(argv: list[str]) -> tuple[str, ...]:
         return value or None
 
     selected: list[str] = []
+    profile_pair = resolve_profile(config, option("--profile"),
+        option("--primary-engine"), option("--secondary-engine")) if command in {
+        "strict", "long", "eval", "benchmark", "batch"} else (None, None)
     if command in {"strict", "long", "eval", "benchmark"}:
         selected.extend(
             [
-                option("--primary-engine") or config.strict_primary_engine,
-                option("--secondary-engine") or config.strict_secondary_engine,
+                profile_pair[0],
+                profile_pair[1],
             ]
         )
     elif command == "batch":
@@ -717,8 +761,8 @@ def _cli_wsl_distributions(argv: list[str]) -> tuple[str, ...]:
         else:
             selected.extend(
                 [
-                    option("--primary-engine") or config.strict_primary_engine,
-                    option("--secondary-engine") or config.strict_secondary_engine,
+                    profile_pair[0],
+                    profile_pair[1],
                 ]
             )
     elif command in {"transcribe", "warmup"}:
@@ -743,7 +787,9 @@ def _doctor(model_config) -> int:
     print(f"Model config: {model_config.path}")
     print(f"Default engine: {model_config.default_engine}")
     print(f"Strict engines: {model_config.strict_primary_engine}, {model_config.strict_secondary_engine}")
-    print(f"Available engines: {', '.join(list_engine_names(model_config))}")
+    print(f"Configured engines: {', '.join(list_engine_names(model_config))}")
+    print(f"Integrated transcription engines: {', '.join(list_transcription_engine_names(model_config))}")
+    print("Configured is not installed, verified or successfully inferred; use model_lifecycle status.")
     print(f"Proxy variables: {proxy_status}")
     print(f"FunASR installed: {'yes' if importlib.util.find_spec('funasr') else 'no'}")
     print(f"Qwen ASR installed: {'yes' if importlib.util.find_spec('qwen_asr') else 'no'}")

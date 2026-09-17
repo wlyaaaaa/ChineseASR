@@ -67,7 +67,7 @@ engines:
       runtime_version: 0.0.6
       dtype: bfloat16
       max_inference_batch_size: 8
-      max_new_tokens: 256
+      max_new_tokens: 1024
       context: 请只输出简体中文转写文本，不要输出繁体字、解释、翻译或额外说明。
     note: Current accuracy-first strict primary based on public Qwen3-ASR evaluations.
 
@@ -114,3 +114,34 @@ engines:
     language: zh
     is_whisper: true
     note: Fallback/comparison only; not the primary Chinese low-hallucination path.
+
+# File transcription only. Dictation retains its own in-memory single-model path.
+quality:
+  cut_strategy: vad
+  max_chunk_sec: 60
+  min_chunk_sec: 20
+  boundary_search_sec: 5
+  align: true
+  review_engine: sensevoice
+  review_context_sec: 1.5
+  critical_terms: []
+
+alignment:
+  adapter: qwen-forced-aligner
+  model: Qwen/Qwen3-ForcedAligner-0.6B
+  model_revision: c7cbfc2048c462b0d63a45797104fc9db3ad62b7
+  model_dir: models/aligner/Qwen3-ForcedAligner-0.6B/c7cbfc2048c462b0d63a45797104fc9db3ad62b7
+  artifact_lock: configs/model-locks/qwen3-forced-aligner-0.6b.json
+  runtime_distribution: qwen-asr
+  runtime_version: 0.0.6
+  dtype: bfloat16
+  max_audio_sec: 300
+  language: Chinese
+
+profiles:
+  baseline:
+    primary_engine: qwen3-asr-1.7b
+    secondary_engine: sensevoice
+  high_quality:
+    primary_engine: fireredasr2-llm
+    secondary_engine: qwen3-asr-1.7b

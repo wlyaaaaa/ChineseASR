@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import time
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -52,7 +53,8 @@ class LeaseTests(unittest.TestCase):
                     "renew",
                     {
                         "token": "asr-token",
-                        "ttl_seconds": 21_600,
+                        "ttl_seconds": 120,
+                        "owner_pid": os.getpid(),
                     },
                 )
             ],
@@ -398,3 +400,34 @@ class ServiceLeaseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompletedWorkerLeaseTests(unittest.TestCase):
+    def test_reclaimed_successful_worker_lease_release_is_not_a_job_failure(self):
+        def transport(action, payload):
+            if action == "acquire":
+                return {"ok": True, "token": "completed-worker", "owner": "chineseasr"}
+            return {"ok": False, "reason": "lease_not_found"}
+        with GpuBrokerLease("chineseasr", transport=transport, renew_interval_seconds=0) as lease:
+            lease.complete_worker()
+
+    def test_missing_lease_without_successful_worker_exit_remains_error(self):
+        def transport(action, payload):
+            if action == "acquire":
+                return {"ok": True, "token": "live-worker", "owner": "chineseasr"}
+            return {"ok": False, "reason": "lease_not_found"}
+        with self.assertRaises(GpuBrokerError):
+            with GpuBrokerLease("chineseasr", transport=transport, renew_interval_seconds=0):
+                pass
+
+    def test_success_does_not_hide_other_authoritative_lease_loss(self):
+        with self.assertRaises(GpuBrokerLeaseLost):
+            with GpuBrokerLease("chineseasr", transport=RecordingTransport(), renew_interval_seconds=0) as lease:
+                lease._mark_lost(GpuBrokerLeaseLost("network error", reason="transport_failure"))
+                lease.complete_worker()
+
+    def test_completed_worker_tolerates_only_exit_reclamation_race(self):
+        with GpuBrokerLease("chineseasr", transport=RecordingTransport(), renew_interval_seconds=0) as lease:
+            lease._mark_lost(GpuBrokerLeaseLost("exited owner", reason="lease_not_found"))
+            lease.complete_worker()
+            lease.raise_if_lost()

@@ -107,7 +107,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(summary.total, 2)
         self.assertEqual(summary.evaluated, 1)
         self.assertEqual(summary.skipped, 1)
-        self.assertEqual(benchmark_json["schema_version"], 2)
+        self.assertEqual(benchmark_json["schema_version"], 3)
         self.assertEqual(benchmark_json["summary"]["evaluated"], 1)
         self.assertIn("manifest", benchmark_json["benchmark"])
         self.assertEqual(benchmark_json["benchmark"]["audio_dir"], str(audio_dir.resolve()))

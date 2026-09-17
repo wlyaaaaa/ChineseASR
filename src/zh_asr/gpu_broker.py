@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextvars import ContextVar
 import os
 import threading
 import urllib.error
@@ -13,16 +14,22 @@ class GpuBrokerError(RuntimeError):
 
 
 class GpuBrokerConflict(GpuBrokerError):
-    pass
+    def __init__(self, message: str, *, owner: str = "unknown", reason: str = "gpu_conflict"):
+        super().__init__(message)
+        self.owner = owner
+        self.reason = reason
 
 
 class GpuBrokerLeaseLost(GpuBrokerError):
-    pass
+    def __init__(self, message: str, *, reason: str = ""):
+        super().__init__(message)
+        self.reason = reason
 
 
 Transport = Callable[[str, dict], dict]
 GPU_BROKER_CHILD_TOKEN_ENV = "ZH_ASR_GPU_BROKER_CHILD_TOKEN"
 GPU_BROKER_OWNERS = frozenset({"chineseasr", "chineseasr-cli"})
+_VERIFIED_WORKER_TOKEN: ContextVar[str] = ContextVar("asr_verified_worker_token", default="")
 
 
 def _default_transport(base_url: str) -> Transport:
@@ -51,7 +58,7 @@ def verify_inherited_gpu_lease(
     token: str,
     *,
     base_url: str | None = None,
-    ttl_seconds: int = 21_600,
+    ttl_seconds: int = 120,
     transport: Transport | None = None,
 ) -> str:
     """Prove that a supervised worker inherited a live ChineseASR lease.
@@ -75,6 +82,7 @@ def verify_inherited_gpu_lease(
         {
             "token": inherited_token,
             "ttl_seconds": ttl_seconds,
+            "owner_pid": os.getpid(),
         },
     )
     if not result.get("ok"):
@@ -87,7 +95,16 @@ def verify_inherited_gpu_lease(
         raise GpuBrokerError(
             "Inherited GPU broker lease is not owned by ChineseASR."
         )
+    _VERIFIED_WORKER_TOKEN.set(inherited_token)
     return owner
+
+
+def require_worker_gpu_lease(device: str) -> None:
+    """Reuse the verified worker context, rechecking the live broker before loading."""
+    if not str(device).lower().startswith(("cuda", "gpu")):
+        return
+    token = _VERIFIED_WORKER_TOKEN.get() or os.environ.get(GPU_BROKER_CHILD_TOKEN_ENV, "")
+    verify_inherited_gpu_lease(token)
 
 
 class GpuBrokerLease:
@@ -96,8 +113,8 @@ class GpuBrokerLease:
         owner: str,
         *,
         base_url: str | None = None,
-        ttl_seconds: int = 21_600,
-        renew_interval_seconds: int = 60,
+        ttl_seconds: int = 120,
+        renew_interval_seconds: int = 20,
         transport: Transport | None = None,
     ) -> None:
         self.owner = owner
@@ -114,12 +131,15 @@ class GpuBrokerLease:
 
     def __enter__(self):
         result = self.transport(
-            "acquire", {"owner": self.owner, "ttl_seconds": self.ttl_seconds}
+            "acquire", {"owner": self.owner, "ttl_seconds": self.ttl_seconds, "owner_pid": os.getpid()}
         )
         if not result.get("ok"):
             active_owner = result.get("owner") or "unknown"
             reason = result.get("reason") or "gpu_conflict"
-            raise GpuBrokerConflict(f"GPU broker blocked {self.owner}: {reason}; active={active_owner}")
+            raise GpuBrokerConflict(
+                f"GPU broker blocked {self.owner}: {reason}; active={active_owner}",
+                owner=active_owner, reason=reason,
+            )
         self.token = str(result.get("token") or "")
         if not self.token:
             raise GpuBrokerError("GPU broker returned no lease token")
@@ -148,9 +168,22 @@ class GpuBrokerLease:
         if existing is not None:
             callback(existing)
 
+    def complete_worker(self) -> None:
+        """A caller proved its supervised process exited successfully.
+
+        Only that evidence makes process-exit reclamation a normal completion;
+        transport failure or rejected renewal during live work remains an error.
+        """
+        self._worker_completed = True
+        self._stop.set()
+        if self._renew_thread:
+            self._renew_thread.join(timeout=2)
+
     def raise_if_lost(self) -> None:
         error = self.loss_error
         if error is not None:
+            if getattr(self, "_worker_completed", False) and error.reason == "lease_not_found":
+                return
             raise error
 
     def _mark_lost(self, error: GpuBrokerLeaseLost) -> None:
@@ -180,7 +213,7 @@ class GpuBrokerLease:
                     self._mark_lost(
                         GpuBrokerLeaseLost(
                             f"GPU broker lease renewal failed for {self.owner}: "
-                            f"{reason}; active={active_owner}"
+                            f"{reason}; active={active_owner}", reason=reason,
                         )
                     )
                     return
@@ -203,18 +236,17 @@ class GpuBrokerLease:
                 result = self.transport("release", {"token": self.token})
                 if not result.get("ok"):
                     reason = result.get("reason") or "release_rejected"
-                    raise GpuBrokerError(
-                        f"GPU broker lease release failed for {self.owner}: {reason}"
-                    )
+                    if not (reason == "lease_not_found" and getattr(self, "_worker_completed", False)):
+                        raise GpuBrokerError(
+                            f"GPU broker lease release failed for {self.owner}: {reason}"
+                        )
             except BaseException as error:
                 release_error = error
             finally:
                 self.token = ""
         if exc_type is not None:
             return False
-        lost_error = self.loss_error
-        if lost_error is not None:
-            raise lost_error
+        self.raise_if_lost()
         if release_error is not None:
             raise release_error
         return False

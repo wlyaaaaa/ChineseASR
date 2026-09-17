@@ -20,6 +20,7 @@ import numpy as np
 from .config import get_engine_spec, load_model_config, project_root
 from .dictation_vad import VoiceActivityDetector, contains_speech
 from .gpu_broker import GpuBrokerConflict, GpuBrokerLease
+from .dictation_worker import ProcessDictationEngine, DictationWorkerFailure
 
 LOG = logging.getLogger("zh_asr.dictation")
 HOTKEY_LABEL = "Win+H / Ctrl+Win+H"
@@ -316,11 +317,11 @@ class DictationController:
     def __init__(self, host, settings: DictationSettings, engine=None):
         self.host = host
         self.settings = settings
-        self.engine = engine or QwenDictationEngine(settings)
+        self.quit_event = threading.Event()
+        self.engine = engine or ProcessDictationEngine(settings, cancel_event=self.quit_event)
         self.commands: queue.Queue = queue.Queue()
         self.audio_commands: queue.Queue = queue.Queue()
         self.recording: Recording | None = None
-        self.quit_event = threading.Event()
         self.initialization_failed = False
         self.model_ready = False
         self.pending_start = False
@@ -341,8 +342,14 @@ class DictationController:
         if self.quit_event.is_set():
             return
         if self.initialization_failed:
-            self.host.show("模型加载失败", "从托盘退出后重新启动", error=True)
-            return
+            if self.worker.is_alive():
+                self.host.show("模型正在清理", "旧进程退出后点击麦克风重试", error=True)
+                return
+            self.initialization_failed = False
+            self.model_ready = False
+            self.worker = threading.Thread(target=self._worker, name="dictation-asr", daemon=True)
+            self.host.show("正在恢复模型", "已重新启动独立模型进程，无需重启电脑")
+            self.worker.start()
         if self.recording is not None:
             if self.recording.open_timed_out:
                 self.pending_start = False
@@ -636,14 +643,27 @@ class DictationController:
     def _worker(self) -> None:
         try:
             started = time.perf_counter()
-            self.engine.load()
-            LOG.info("model loaded seconds=%.3f", time.perf_counter() - started)
+            for attempt in range(2):
+                try:
+                    self.engine.load()
+                    break
+                except DictationWorkerFailure:
+                    if attempt or self.quit_event.is_set():
+                        raise
+                    self.host.show("正在恢复模型", "首次加载未响应，已重建模型进程重试")
+            LOG.info("model loaded seconds=%.3f; worker_pid=%s", time.perf_counter() - started,
+                     getattr(self.engine, "worker_pid", None))
             if self.quit_event.is_set():
                 return
             try:
+                self.host.show("正在预热 GPU", "模型已加载，正在准备首次识别")
                 self.engine.warmup()
             except GpuBrokerConflict:
                 pass
+            except DictationWorkerFailure:
+                LOG.warning("optional GPU prewarm timed out; recovering without repeating prewarm")
+                self.host.show("正在恢复模型", "预热未响应，重新载入后按需启用 GPU")
+                self.engine.load()
             except Exception:
                 LOG.exception("optional prewarm failed")
             finally:
@@ -679,9 +699,10 @@ class DictationController:
                     recording.recognition_finished.set()
                     self.host.post_to_ui(lambda r=recording: self._recording_finished(r))
         except Exception:
-            self.initialization_failed = True
-            LOG.exception("dictation initialization failed")
-            self.host.post_to_ui(self._model_failed)
+            if not self.quit_event.is_set():
+                self.initialization_failed = True
+                LOG.exception("dictation initialization failed")
+                self.host.post_to_ui(self._model_failed)
         finally:
             started = time.perf_counter()
             try:
@@ -696,7 +717,7 @@ class DictationController:
             self.recording.recognition_finished.set()
             self._recording_finished(self.recording)
         self.host.set_busy(False)
-        self.host.show("语音模型加载失败", "请从托盘退出后重启", error=True)
+        self.host.show("语音模型加载失败", "自动恢复未成功；点击麦克风可重试，无需重启电脑", error=True)
 
     def _recognize(self, recording: Recording) -> None:
         while not recording.cancelled.is_set() and not self.quit_event.is_set():
@@ -705,8 +726,10 @@ class DictationController:
                 if not recording.stopped.is_set():
                     self.host.show("正在聆听", "点击麦克风或快捷键暂停", recording=True)
                 break
-            except GpuBrokerConflict:
-                self.host.show("等待 GPU", "录音仍在内存中，Esc 可取消",
+            except GpuBrokerConflict as error:
+                owner = {"chineseasr-cli": "文件转写任务", "chineseasr": "另一段听写",
+                         "ollama": "本地大语言模型"}.get(error.owner, error.owner)
+                self.host.show("等待 GPU", f"正在等待{owner}释放资源；录音保留在内存，Esc 可取消",
                                recording=not recording.stopped.is_set())
                 recording.cancelled.wait(0.3)
         while not recording.cancelled.is_set() and not self.quit_event.is_set():

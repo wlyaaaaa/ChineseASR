@@ -120,7 +120,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(spec.model, "Qwen/Qwen3-ASR-1.7B")
         self.assertEqual(spec.language, "Chinese")
         self.assertEqual(spec.options["dtype"], "bfloat16")
-        self.assertEqual(spec.options["max_new_tokens"], 256)
+        self.assertEqual(spec.options["max_new_tokens"], 1024)
 
     def test_firered_is_registered_as_optional_forensic_primary(self):
         from zh_asr.config import get_engine_spec, load_model_config

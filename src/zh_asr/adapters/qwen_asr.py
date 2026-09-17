@@ -14,6 +14,7 @@ from zh_asr.qwen_identity import (
     require_runtime_version,
 )
 from zh_asr.text_normalizer import to_simplified
+from zh_asr.inference_quality import isolated_batch, generation_diagnostics
 
 
 class QwenASRAdapter:
@@ -73,7 +74,19 @@ class QwenASRModelWrapper:
 
     def generate(self, input: str, **_: Any) -> list[dict[str, Any]]:
         results = self.model.transcribe(audio=input, context=self.context, language=self.language)
-        return [_normalize_qwen_result(item) for item in results]
+        normalized = [_normalize_qwen_result(item) for item in results]
+        for item in normalized:
+            item["generation"] = generation_diagnostics(self.model, item["text"])
+        return normalized
+
+    def generate_many(self, inputs: list[str], **_: Any) -> list[Any]:
+        def batch(values):
+            results = self.model.transcribe(audio=values, context=self.context, language=self.language)
+            normalized = [_normalize_qwen_result(item) for item in results]
+            for item in normalized:
+                item["generation"] = generation_diagnostics(self.model, item["text"])
+            return [[item] for item in normalized]
+        return isolated_batch(inputs, batch, self.generate)
 
 
 def ensure_qwen_asr_available(

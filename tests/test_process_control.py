@@ -1,3 +1,4 @@
+import os
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -79,3 +80,32 @@ class ProcessControlTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParentLifetimeTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows process-identity handle test")
+    def test_original_supervisor_exit_signals_watchdog(self):
+        import sys
+        import threading
+        from zh_asr.process_control import watch_process_exit
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+        event = threading.Event()
+        try:
+            watcher = watch_process_exit(child.pid, event.set)
+            self.assertFalse(event.wait(0.1))
+            child.kill()
+            child.wait(timeout=5)
+            self.assertTrue(event.wait(3))
+            watcher.join(timeout=3)
+            self.assertFalse(watcher.is_alive())
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
+    def test_invalid_supervisor_identity_is_rejected(self):
+        from zh_asr.process_control import watch_process_exit
+        for pid in (True, -1, 0, os.getpid(), "not-a-pid"):
+            with self.assertRaises(ValueError):
+                watch_process_exit(pid, lambda: None)

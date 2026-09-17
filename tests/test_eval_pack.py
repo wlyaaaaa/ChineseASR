@@ -137,7 +137,7 @@ class EvalPackTests(unittest.TestCase):
             review = (out_dir / "review.md").read_text(encoding="utf-8")
 
         self.assertGreaterEqual(summary.total, 2)
-        self.assertEqual(metrics["schema_version"], 2)
+        self.assertEqual(metrics["schema_version"], 3)
         self.assertIn("runtime", metrics)
         self.assertEqual(metrics["runtime"]["device"], "cuda:0")
         self.assertIn("model_config", metrics)

@@ -5,7 +5,9 @@ param(
   [string]$Device = 'cuda:0',
   [string]$OutDir = '',
   [string]$PrimaryEngine = '',
-  [string]$SecondaryEngine = ''
+  [string]$SecondaryEngine = '',
+  [string]$Profile = '',
+  [Nullable[int]]$ChannelIndex = $null
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,4 +39,6 @@ if (-not [string]::IsNullOrWhiteSpace($SecondaryEngine)) {
   $Args += @('-SecondaryEngine', $SecondaryEngine)
 }
 
+if ($Profile) { $Args += @('-Profile', $Profile) }
+if ($null -ne $ChannelIndex) { $Args += @('-ChannelIndex', [string]$ChannelIndex) }
 & (Join-Path $PSScriptRoot 'asr-smart.ps1') @Args

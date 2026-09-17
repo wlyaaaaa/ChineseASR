@@ -1313,6 +1313,7 @@ class WindowsHost:
             return "#e5654f"
         if status in {
             "中文听写正在启动", "正在准备模型", "正在打开麦克风", "准备继续录音", "等待 GPU",
+            "正在预热 GPU", "正在恢复模型", "模型正在清理",
         }:
             return "#e3a008"
         if recording or status == "准备就绪":

@@ -22,6 +22,7 @@ from .result_writer import (
 )
 from .risk_rules import RuleHit, evaluate_risk_rules
 from .text_normalizer import to_simplified
+from .text_comparison import normalize_comparison, critical_differences
 
 
 SELECTION_POLICY = "primary_preserving_no_majority_vote_no_semantic_rewrite"
@@ -126,6 +127,7 @@ def build_audit_report(
     objective_confidence: str = "unknown",
     objective_reason: str = "",
     objective_result_reference: str = "",
+    critical_terms: tuple[str, ...] = (),
 ) -> AuditReport:
     primary = to_simplified(primary_text.strip())
     secondary = to_simplified(secondary_text.strip())
@@ -161,6 +163,10 @@ def build_audit_report(
         secondary_segment_evidence,
         conflict_threshold,
     )
+    quality_hits = tuple(RuleHit(id="incomplete_generation", severity="high",
+        message="An engine may have reached its generation limit; replay or split the audio.",
+        evidence=f"engine={item.engine}; warnings={item.provenance['generation_warnings']}")
+        for item in engine_evidence if item.provenance.get("generation_warnings"))
     error_hits = _engine_error_hits(primary_engine, primary_error, secondary_engine, secondary_error)
     objective = classify_objective_outcome(
         primary_text=primary,
@@ -183,12 +189,13 @@ def build_audit_report(
         chosen = primary or secondary
         alternatives = tuple(text for text in (secondary, primary) if text and text != chosen)
         all_engines_failed = bool(primary_error and secondary_error)
-        rule_hits = error_hits + evaluate_risk_rules(
+        rule_hits = error_hits + quality_hits + evaluate_risk_rules(
             primary_text=primary,
             secondary_text=secondary,
             final_text=chosen,
             similarity=similarity,
             expect_empty=expect_empty,
+        critical_terms=critical_terms,
         )
         flags = tuple(sorted(hit.id for hit in rule_hits))
         return AuditReport(
@@ -254,16 +261,17 @@ def build_audit_report(
 
     chosen = primary or secondary
     alternatives = tuple(text for text in (secondary, primary) if text and text != chosen)
-    rule_hits = evaluate_risk_rules(
+    rule_hits = quality_hits + evaluate_risk_rules(
         primary_text=primary,
         secondary_text=secondary,
         final_text=chosen,
         similarity=similarity,
         expect_empty=expect_empty,
+        critical_terms=critical_terms,
     )
     flags = tuple(sorted(hit.id for hit in rule_hits))
 
-    if "model_conflict" in flags:
+    if "model_conflict" in flags or "critical_content_difference" in flags:
         return AuditReport(
             status="conflict",
             evidence_status="verified",
@@ -352,7 +360,7 @@ def build_audit_report(
             secondary_engine=secondary_engine,
             secondary_text=secondary,
             similarity=similarity,
-            needs_review=False,
+            needs_review=any(d.review_required for d in disagreements),
             flags=(),
             rule_hits=(),
             alternatives=alternatives,
@@ -1242,7 +1250,8 @@ def _build_disagreements(
                 reason=reason,
                 review_required=primary is None
                 or secondary is None
-                or similarity < conflict_threshold,
+                or similarity < conflict_threshold
+                or bool(critical_differences(primary_text, secondary_text)),
                 audio_start_ms=start_ms,
                 audio_end_ms=end_ms,
             )
@@ -1250,31 +1259,9 @@ def _build_disagreements(
     return tuple(records)
 
 
-def _align_segments(
-    primary_segments: tuple[TranscriptSegment, ...],
-    secondary_segments: tuple[TranscriptSegment, ...],
-) -> tuple[tuple[TranscriptSegment | None, TranscriptSegment | None], ...]:
-    primary_keys = [_normalize_for_compare(to_simplified(item.text)) for item in primary_segments]
-    secondary_keys = [_normalize_for_compare(to_simplified(item.text)) for item in secondary_segments]
-    matcher = SequenceMatcher(a=primary_keys, b=secondary_keys, autojunk=False)
-    pairs: list[tuple[TranscriptSegment | None, TranscriptSegment | None]] = []
-
-    for tag, p_start, p_end, s_start, s_end in matcher.get_opcodes():
-        if tag == "equal":
-            pairs.extend(
-                zip(
-                    primary_segments[p_start:p_end],
-                    secondary_segments[s_start:s_end],
-                )
-            )
-            continue
-        primary_block = primary_segments[p_start:p_end]
-        secondary_block = secondary_segments[s_start:s_end]
-        common = min(len(primary_block), len(secondary_block))
-        pairs.extend(zip(primary_block[:common], secondary_block[:common]))
-        pairs.extend((item, None) for item in primary_block[common:])
-        pairs.extend((None, item) for item in secondary_block[common:])
-    return tuple(pairs)
+def _align_segments(primary_segments, secondary_segments):
+    from .text_comparison import align_segment_evidence
+    return align_segment_evidence(primary_segments, secondary_segments)
 
 
 def _combined_audio_span(
@@ -1343,7 +1330,7 @@ def _number_or_none(value: Any) -> int | float | None:
 
 
 def _normalize_for_compare(text: str) -> str:
-    return re.sub(r"[\s，。！？、,.!?;；:：\"'“”‘’（）()\[\]【】<>《》|-]+", "", text).lower()
+    return normalize_comparison(text)
 
 
 def _similarity(left: str, right: str) -> float:
@@ -1351,7 +1338,7 @@ def _similarity(left: str, right: str) -> float:
         return 1.0
     if not left or not right:
         return 0.0
-    return SequenceMatcher(a=left, b=right).ratio()
+    return SequenceMatcher(a=left, b=right, autojunk=False).ratio()
 
 
 def _engine_error_hits(

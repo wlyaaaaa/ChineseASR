@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .adapters import get_adapter
+from .inference_quality import BatchItemFailure
 from .adapters.base import MissingDependencyError  # noqa: F401 - compatibility re-export
 from .adapters.funasr import (  # noqa: F401 - compatibility re-export
     detect_speech_segments,
@@ -162,6 +163,7 @@ def strict_transcribe_audio(
     config: ModelConfig | None = None,
     expect_empty: bool = False,
     caller_binding: Mapping[str, Any] | None = None,
+    channel_index: int | None = None,
 ) -> dict[str, Any]:
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -170,6 +172,11 @@ def strict_transcribe_audio(
     secondary_name = secondary_engine or model_config.strict_secondary_engine
     output_dir = out_dir or project_root() / "outputs"
     derived_dir = output_dir / "_derived"
+    original_audio = audio_path
+    channel_identity = None
+    if channel_index is not None:
+        from .audio_quality import extract_channel
+        audio_path, channel_identity = extract_channel(audio_path, channel_index, derived_dir / "channels")
     total_started = time.perf_counter()
     if _uses_shared_default_strict_audio(primary_name, secondary_name, model_config):
         prepared = prepare_pcm16_mono(
@@ -208,8 +215,11 @@ def strict_transcribe_audio(
         secondary_result, secondary_error, secondary_sec, secondary_provenance = _generate_for_strict(
             audio_path, secondary_name, device, cache_dir, model_config, derived_dir
         )
+    if channel_identity:
+        primary_provenance["channel_selection"] = channel_identity
+        secondary_provenance["channel_selection"] = channel_identity
     paths = write_strict_bundle(
-        audio_path=audio_path,
+        audio_path=original_audio,
         primary_engine=primary_name,
         primary_result=primary_result,
         secondary_engine=secondary_name,
@@ -223,6 +233,7 @@ def strict_transcribe_audio(
         primary_provenance=primary_provenance,
         secondary_provenance=secondary_provenance,
         caller_binding=caller_binding,
+        critical_terms=tuple((getattr(model_config, "quality", {}) or {}).get("critical_terms", [])),
     )
     paths["timing"] = {
         "total_sec": time.perf_counter() - total_started,
@@ -290,6 +301,7 @@ def strict_transcribe_many(
             primary_provenance=primary["provenance"][index],
             secondary_provenance=secondary["provenance"][index],
             caller_binding=caller_binding,
+            critical_terms=tuple((getattr(model_config, "quality", {}) or {}).get("critical_terms", [])),
         )
         paths["timing"] = {
             "total_sec": time.perf_counter() - total_started,
@@ -350,6 +362,10 @@ def _generate_many_for_strict(
                         f"for {len(valid_indices)} inputs."
                     )
                 for index, value in zip(valid_indices, generated):
+                    if isinstance(value, BatchItemFailure):
+                        errors[index] = f"{type(value.error).__name__}: {value.error}"
+                        results[index] = _engine_failure_result(engine, value.error)
+                        continue
                     normalized = value if isinstance(value, list) else [value]
                     results[index] = _attach_speech_detection_if_empty(
                         normalized,

@@ -6,9 +6,9 @@
 
 ## Win+H / Ctrl+Win+H 语音输入
 
-主界面是 **160×60 实际像素**的白绿小胶囊：麦克风控制录音，旁边的小箭头展开设备菜单，×收起。先点输入框，再按 **Win+H** 或 **Ctrl+Win+H**：显示小窗并录音，再按则隐藏并暂停。
+主界面是 **200×75 实际像素**的白绿小胶囊：麦克风控制录音，旁边的小箭头展开设备菜单，×收起。先点输入框，再按 **Win+H** 或 **Ctrl+Win+H**：显示小窗并录音，再按则隐藏并暂停。
 
-主屏与 VDD 各显示一个同步小窗，共用一次录音和识别；任一边暂停、收起或选择麦克风都会同步。屏幕接回或分辨率改变后自动更新位置。`configs/dictation.yaml` 的 `panel_monitor_ids` 用硬件型号 ID 选择目标屏，未接入的目标不显示；设为 `null` 则仅跟随 Windows 当前主屏。
+按显示器优先级只显示一个小窗：VDD 接入时优先 VDD，断开后回退主屏。屏幕接回或分辨率改变后自动更新位置，保留手动拖动位置。`configs/dictation.yaml` 的 `panel_monitor_ids` 用硬件型号 ID 选择目标屏，未接入的目标不显示；设为 `null` 则仅跟随 Windows 当前主屏。
 
 **麦克风按钮**单击录音、再单击暂停，不改变窗口显示；拖动空白处可移动小窗。点**小箭头**或右键麦克风可选择、刷新设备或复制最近文字。DJI 是默认选择，设备和长说明不占主界面；悬停可看状态，错误以小点和提示保留。
 
@@ -42,6 +42,14 @@
 
 它是本地优先而不是云转写服务：默认路径不会上传音频。只有调用独立的云入口、明确标注本次是重要录音或已授权的存疑转写质量复核、并授权本次云上传时，才会把本机切片发送给阿里云百炼；模型、输出、wheelhouse 和私人评测数据仍保留在本机。
 
+## 文件转写质量与模型维护
+
+文件转写支持 `--profile high_quality` / `-Profile high_quality`，选择 FireRedASR2-LLM 主引擎和 Qwen3-ASR-1.7B 校验；`baseline` 保留 Qwen + SenseVoice。选择配置不改变全局默认，也不影响桌面听写。短文件、长文件和文件夹使用同一时长约束，长录音自动切分；VAD 优先寻找停顿，而不是删除未被识别为语音的区域。
+
+新增 Qwen3-ForcedAligner-0.6B 的固定版本安装、校验和按需对齐，供时间范围定位、音频覆盖检查及有声学时间支持的重叠去重使用。对齐成功不代表提供的文字正确。争议片段可用独立补充识别和本地回听页面复核，不进行多数投票或无音频的 LLM 文字裁决。
+
+版本比较、明确激活、回退和输出状态说明见 [质量处理与长期模型维护](docs/quality-and-model-maintenance.md)。配置存在、文件校验通过、软件测试通过和真实推理通过分别记录；公开短样例不作为全面准确率或默认换模的证据。
+
 ## 当前状态
 
 `personal-use v0.1` 已完成收尾，进入维护态。关闭标准是：
@@ -52,7 +60,7 @@
    `scripts\smoke-evidence-asr.ps1 -Audio <path> -Json` 验收 FireRed + Qwen 完整证据链。
 4. 公开仓库只包含源码、脚本、配置、测试和文档，不包含模型权重、用户音频、生成转写、模型收据或 wheelhouse 大文件。
 
-后续真实录音 benchmark、模型组合微调、Ollama 仲裁启用、VAD 边界切片优化都属于使用阶段校准，不是当前版本的关闭阻塞项。
+VAD 边界切分和可定位复核已进入文件转写流程。真实录音 benchmark 与默认模型提升仍需同口径证据；Ollama 纯文本仲裁默认关闭，不作为词汇真相裁决。
 
 ## 适合场景
 
@@ -80,7 +88,7 @@
 | 可选证据级词汇主引擎 | `fireredasr2-llm` | 隔离在 WSL 中运行；仅在显式选择时作为 strict 主引擎 |
 | 重要录音 / 存疑质量复核云入口 | `qwen-audio-3.0-asr-flash` | 独立脚本显式选择 `-Important` 或 `-QualityReview` 并授权本次上传；Key 经 Password Center SecretRef 注入，普通模式无法触发 |
 | 显式时间线/匿名说话人 baseline | `paraformer` | 固定 `speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4`，输出逐句 `sentence_info` 时间和 CAM++ 匿名聚类；已知两方通话的调用方可传 `--preset-spk-num 2`，省略时自动聚类；不改变 quick/strict 默认 |
-| fallback/comparison | `whisper-large-v3` | 已注册为备用/对照，不作为中文 strict 默认路径 |
+| 未接通的配置占位 | `whisper-large-v3` | 配置存在，但当前没有 Whisper adapter；不能把它当作已经可运行的 fallback |
 
 strict 模式即使一路模型失败，也会保留可用输出并生成审计包。正文会标记 `[疑似]`，`strict.audit.md` 会记录失败引擎、异常摘要和复核理由。两路都失败时输出 `[听不清]`。
 

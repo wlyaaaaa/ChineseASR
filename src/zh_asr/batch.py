@@ -150,6 +150,34 @@ def run_batch(
     ) or (
         mode_key == "quick" and transcribe_fn is transcribe_audio
     )
+    if mode_key == "strict" and use_many:
+        from .file_entry import needs_long_route, transcribe_file
+        short_pending = []
+        for audio_path, item_dir, identity in pending:
+            try:
+                is_long = needs_long_route(audio_path, model_config, strict_primary, strict_secondary)
+            except (OSError, RuntimeError, ValueError, EOFError):
+                # Let the original decoder report bad media in its normal format.
+                is_long = False
+            if not is_long:
+                short_pending.append((audio_path, item_dir, identity))
+                continue
+            item_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                outputs = transcribe_file(audio_path, out_dir=item_dir, config=model_config,
+                    primary_engine=strict_primary, secondary_engine=strict_secondary,
+                    device=device, cache_dir=cache_dir, force=force, caller_binding=caller_binding)
+                if outputs.get("failed_chunks") or outputs.get("evidence_status") != "verified":
+                    raise RuntimeError("Long batch item is incomplete or provisional; completed chunks are preserved for resume")
+                outcome = _result_objective_outcome(outputs, item_dir, audio_path)
+                _write_batch_item_state(item_dir, identity, outputs, outcome)
+                items_by_audio[audio_path] = BatchItem(audio=audio_path, out_dir=item_dir,
+                    status="processed", objective_outcome=outcome)
+            except Exception as exc:
+                items_by_audio[audio_path] = BatchItem(audio=audio_path, out_dir=item_dir,
+                    status="failed", message=str(exc), objective_outcome="indeterminate")
+                _append_failure(failed_path, audio_path, item_dir, exc)
+        pending = short_pending
     if pending and use_many:
         for _, item_dir, _ in pending:
             item_dir.mkdir(parents=True, exist_ok=True)
@@ -188,6 +216,11 @@ def run_batch(
                     f"Batch transcription returned {len(outputs_many)} results for {len(pending)} inputs."
                 )
             for (audio_path, item_dir, identity), outputs in zip(pending, outputs_many):
+                if mode_key == "strict" and model_config.quality and isinstance(outputs, dict) and outputs.get("audit_json"):
+                    from .quality_review import enhance_single
+                    from .pipeline import default_cache_dir
+                    enhance_single(audio_path, outputs, config=model_config, device=device,
+                        cache_dir=cache_dir or default_cache_dir(), output_dir=item_dir)
                 objective_outcome = _result_objective_outcome(
                     outputs,
                     item_dir,
@@ -207,6 +240,8 @@ def run_batch(
                 )
         except Exception as exc:
             for audio_path, item_dir, _ in pending:
+                if audio_path in items_by_audio and items_by_audio[audio_path].status == "processed":
+                    continue
                 items_by_audio[audio_path] = BatchItem(
                     audio=audio_path,
                     out_dir=item_dir,
@@ -302,8 +337,10 @@ def _batch_item_identity(
         if mode == "quick"
         else (strict_primary, strict_secondary)
     )
+    from .long_audio import _runtime_code_identity
     source = file_metadata(audio_path)
     identity: dict[str, Any] = {
+        "runtime_code": _runtime_code_identity(),
         "audio_path": str(audio_path.resolve()),
         "audio_sha256": str(source.get("sha256") or ""),
         "audio_size_bytes": int(source.get("size_bytes") or 0),
@@ -353,7 +390,9 @@ def _cached_item_objective_outcome(
         return None
 
     output_records = state.get("outputs")
-    required = _QUICK_CACHE_OUTPUTS if mode == "quick" else _STRICT_CACHE_OUTPUTS
+    long_layout = mode == "strict" and isinstance(output_records, dict) and "manifest" in output_records
+    required = (("manifest", "objective_result", "transcript", "audit", "metrics") if long_layout
+                else (_QUICK_CACHE_OUTPUTS if mode == "quick" else _STRICT_CACHE_OUTPUTS))
     if (
         not isinstance(output_records, dict)
         or not all(key in output_records for key in required)
@@ -383,6 +422,24 @@ def _cached_item_objective_outcome(
             return None
         outputs[str(key)] = str(path)
 
+    if long_layout:
+        try:
+            from .service import _long_manifest_evidence
+            manifest = json.loads(Path(outputs["manifest"]).read_text(encoding="utf-8"))
+            if manifest.get("resolved_primary_engine") != primary_engine or manifest.get("resolved_secondary_engine") != secondary_engine:
+                return None
+            status, failures = _long_manifest_evidence(outputs["manifest"])
+            if status != "verified" or failures:
+                return None
+            objective = load_objective_result(Path(outputs["objective_result"]))
+            if validate_objective_result(objective):
+                return None
+            if objective.get("audio", {}).get("raw_sha256") != identity.get("audio_sha256"):
+                return None
+            outcome = str(objective.get("objective_outcome") or "indeterminate")
+            return outcome if state.get("objective_outcome") == outcome else None
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
     if mode == "strict":
         evidence_status, _ = validate_strict_artifact_bundle(
             outputs,

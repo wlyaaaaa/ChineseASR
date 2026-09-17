@@ -12,6 +12,16 @@ from zh_asr.strict_writer import write_strict_bundle
 
 
 class LongAudioTests(unittest.TestCase):
+    def setUp(self):
+        # Unit fixtures do not load real VAD or ASR models.
+        for target, result in (
+            ("zh_asr.audio_quality.speech_boundaries", {"status": "unavailable", "segments": [], "excluded_ranges_ms": []}),
+            ("zh_asr.quality_review.enhance_chunks", {"status": "fixture", "needs_review": False, "entries": [], "review_count": 0}),
+        ):
+            mocked = patch(target, return_value=result)
+            mocked.start()
+            self.addCleanup(mocked.stop)
+
     def test_runtime_code_identity_changes_with_operational_source_bytes(self):
         from zh_asr.long_audio import _runtime_code_identity
 
@@ -911,9 +921,9 @@ class LongAudioTests(unittest.TestCase):
             )
             transcript = (out_dir / "transcript.md").read_text(encoding="utf-8")
 
-        self.assertEqual(1, transcript.count("可以换票"))
+        self.assertEqual(2, transcript.count("可以换票"))
         self.assertIn("并携带缴费凭证", transcript)
-        self.assertIn("exact-boundary-overlap-removed: 4 chars", transcript)
+        self.assertNotIn("overlap-removed", transcript)
 
     def test_run_long_transcription_prepares_mp3_and_records_derivative_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
