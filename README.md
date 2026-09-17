@@ -1,6 +1,6 @@
 # ChineseASR
 
-`ChineseASR` 是一个本地优先的中文语音转文字项目，目标是把中文录音转成可审计、低幻觉、可复现的文本。它面向 Windows + CUDA 工作站，默认 quick 使用 `SenseVoiceSmall`，strict 使用 `Qwen3-ASR-1.7B + SenseVoiceSmall`。FunASR 官方 GPU flagship `Fun-ASR-Nano-2512` 已作为显式 `fun-asr-nano` profile 提供，但不会因为安装完成而改变 quick 默认；可选的 `FireRedASR2-LLM` 是证据级词汇主引擎，也不会自动取代默认 strict 组合。
+`ChineseASR` 是一个本地优先的中文语音转文字项目，目标是把中文录音转成可审计、低幻觉、可复现的文本。它面向 Windows + CUDA 工作站，默认 quick 使用 `SenseVoiceSmall`，strict 使用 `Qwen3-ASR-1.7B + SenseVoiceSmall`。FunASR 官方 GPU flagship `Fun-ASR-Nano-2512` 已作为显式 `fun-asr-nano` 引擎提供，但不会因为安装完成而改变 quick 默认；可选的 `FireRedASR2-LLM` 是 `high_quality` 路线的词汇主引擎，也不会自动取代默认 strict 组合。
 
 项目同时提供录音转写和 Windows 桌面语音输入。本文是使用入口；项目执行规则见 `AGENTS.md`，机器状态以 PCConfig 和 Windows 现场为准。
 
@@ -16,7 +16,7 @@
 
 **×** 隐藏并暂停，尾句继续完成，后台仍待命；**Esc** 取消尚未输入的部分，已输入文字保留。只有托盘“退出”或脚本 Stop 才退出程序并释放模型，文字不会自动按回车发送。
 
-听写使用现有 **Qwen3-ASR-1.7B**，不做双模型复核或自动润色。模型登录后在后台加载到内存，录音期间使用 GPU；暂停或收起后保留内存中的模型并释放显存及 LocalGpuBroker 租约，下一次唤出不重复冷加载。真正退出时直接释放模型，界面先收起，资源清理不挡住窗口。登录后不会自行打开麦克风。
+听写使用现有 **Qwen3-ASR-1.7B**，不做双模型复核或自动润色。模型登录后在受监督的独立进程中加载；录音期间按需取得 GPU，暂停或收起后把模型保留在 RAM 并释放显存及 LocalGpuBroker 租约，下一次唤出不重复冷加载。加载、预热、激活、推理和停放都有有界等待；模型进程失去响应时只清理这一进程，尚未返回到界面的片段最多重试一次。真正的 GPU 排队、模型准备和麦克风故障分别显示，不再用长期“模型准备中”掩盖不同故障。登录后不会自行打开麦克风。
 
 绿色麦克风表示已经开始采集声音；模型首次加载可以与录音并行，声音先留在内存，模型准备好后再识别。目前在约 600 ms 的语音停顿、最长 20 秒或手动暂停时提交整段结果，尚无逐字流式输出。轻量 WebRTC VAD 过滤无有效语音的输入，保留句内音频和前后缓冲；检测未通过或识别为空时不输入文字。默认术语提示留空，避免不清晰音频触发提示词复读。
 
@@ -52,15 +52,16 @@
 
 ## 当前状态
 
-`personal-use v0.1` 已完成收尾，进入维护态。关闭标准是：
+`personal-use v0.1` 已完成 2026-09-17 的质量、运行时和恢复收尾，进入维护态。功能交付的收尾验收基线是：482 项项目测试执行，0 失败、0 错误，1 项因可选公开中文 VAD fixture 未安装而透明跳过；公开音频实际跑通桌面听写、高质量短音频、42 秒两切片长音频、FireRed + Qwen、Qwen3-ForcedAligner 以及正常 smart/API 作业。模型监督进程退出后，进程绑定的 GPU 租约也完成了实际回收验证。
+
+这些结果证明对应版本的集成、恢复和故障边界，不是个人麦克风效果或通用中文准确率榜单。默认模型提升仍需要同口径 holdout 证据；Ollama 纯文本仲裁继续默认关闭，不作为词汇真相裁决。Skill 的调用/维护说明和 PCConfig 的机器恢复契约已同步，项目业务事实仍以本仓库配置与实现为准。
+
+维护关闭标准继续是：
 
 1. `scripts\doctor.ps1` 能确认无代理、CUDA、模型配置和依赖状态。
-2. 单元测试全通过。
-3. `scripts\smoke-asr-smart.ps1 -Json` 能完成默认 strict smart job；重要录音另用
-   `scripts\smoke-evidence-asr.ps1 -Audio <path> -Json` 验收 FireRed + Qwen 完整证据链。
+2. `python -m unittest discover -s tests` 没有未解释的失败；可选 fixture 缺失必须显式报告为 skip，而不是伪装通过。
+3. `scripts\smoke-asr-smart.ps1 -Json` 能完成默认 strict smart job；重要录音另用 `scripts\smoke-evidence-asr.ps1 -Audio <path> -Json` 验收 FireRed + Qwen 完整证据链。
 4. 公开仓库只包含源码、脚本、配置、测试和文档，不包含模型权重、用户音频、生成转写、模型收据或 wheelhouse 大文件。
-
-VAD 边界切分和可定位复核已进入文件转写流程。真实录音 benchmark 与默认模型提升仍需同口径证据；Ollama 纯文本仲裁默认关闭，不作为词汇真相裁决。
 
 ## 适合场景
 
@@ -440,24 +441,11 @@ API 会在 `outputs\api\jobs.json` 中以原子替换保存任务历史：服务
 后续新任务会被拒绝，直到一次后续状态写入成功恢复；命令已完成但终态历史不可持久时，
 job 不报告为成功，且转写输出文件可能已经存在。
 
-为了避免和受管 Ollama、LocalOCR 或其他 ChineseASR 任务抢 GPU，所有公开 CLI 和
-smart/API 路径都必须先取得 LocalGpuBroker 租约；Broker 不可用时任务失败关闭，不会
-退回到仅凭 `nvidia-smi` 判断后继续重型推理。
+所有公开 CLI 和 smart/API 路径都必须先取得 LocalGpuBroker 租约；Broker 不可用时任务失败关闭，不会退回到仅凭 `nvidia-smi` 判断后继续重型推理。当前机器策略按工作族协调：**ASR 与 OCR 可以并行，同一族任务串行，Ollama 重型请求/会话与 ASR、OCR 互斥**。因此活动的 LocalOCR 本身不是 ChineseASR 的阻断理由，阻断状态必须以 Broker 返回的实际 owner/reason 为准。
 
-默认端口是 `18666`，刻意避开 LocalOCR 的 `18665`。
+默认 API 端口是 `18666`，刻意避开 LocalOCR 的 `18665`。旧客户端的 `-AllowGpuConflicts` / `allow_gpu_conflicts=true` 仍可被解析，但只影响没有机器级 Broker 的嵌入式外部 CUDA 进程检测，不能绕过本机 LocalGpuBroker。正式 Broker 只协调已接入它的 Ollama、LocalOCR 与 ChineseASR，不声称管理 LM Studio 等未接入进程。
 
-RTX 5090D 32GB 显存较大时，这个 GPU 排他锁仍然是保守调度边界，不代表硬件不能并发。
-旧客户端的 `-AllowGpuConflicts` / `allow_gpu_conflicts=true` 仍可被解析，但只影响没有
-机器级 Broker 的嵌入式外部 CUDA 进程检测，不能绕过本机 LocalGpuBroker。正式 Broker
-只协调已接入它的 Ollama、LocalOCR 与 ChineseASR，不声称管理 LM Studio 等未接入进程。
-
-默认入口会向 `http://127.0.0.1:32100/_gpu_broker/*` 申请全机 GPU 租约。Broker
-会在 ASR 启动前卸载空闲 Ollama/LocalOCR，并在 ASR 运行期间阻止新的 Ollama 或 OCR
-重型推理。服务子进程启动时必须携带 opaque lease token 并向 Broker 验证当前 live
-owner，父进程随后持续续租；裸环境标记不能证明已持有租约。直接 CLI 同样采用“持租约
-监督进程 → 可终止工作子进程”结构。
-租约续期一旦失败，运行中的完整子进程树会被立即终止；服务任务以
-`gpu_broker_lost` 失败，不能在失去排他性的情况下继续生成貌似成功的证据。
+ChineseASR 默认向 `http://127.0.0.1:32100/_gpu_broker/*` 申请 120 秒短租约，并在工作期间每 20 秒续期。启动 ASR/OCR 前会卸载受管 Ollama 驻留模型，但不会为了 ASR 主动停止 LocalOCR；跨族 ASR/OCR 租约可以同时存在。文件转写由监督进程取得租约，工作子进程携带 opaque token 验证后把租约绑定到自己的 Windows 进程创建身份，监督进程继续续租；监督进程消失时，进程句柄 watchdog 会终止对应 worker 并清理带作业标记的 WSL 子进程。确认成功结束的 worker 可能先被 Broker 按进程退出回收，这种正常竞态不会被误报为任务失败；运行中真正的续租失败仍会终止对应进程树，并以 `gpu_broker_lost` 失败关闭。
 
 ## 长音频与断点续跑
 
@@ -621,8 +609,7 @@ strict 会跑两路模型并写审计文件，目标是低幻觉和可复核；q
 
 **为什么 smart 返回 `blocked`？**
 
-LocalGpuBroker 不可用、已有其他受管重型任务，或无法取得全机租约。等待现有任务结束并
-检查 Broker 状态；`-AllowGpuConflicts` 不会绕过机器级 Broker。
+LocalGpuBroker 不可用、同族 ChineseASR 已在运行、Ollama 重型请求/会话占用协调域，或资源释放失败时都可能被阻断。LocalOCR 与 ASR 按当前策略可以并行，不应仅凭“有 OCR 在跑”判断冲突；以 Broker 返回的 owner/reason 为准。`-AllowGpuConflicts` 不会绕过机器级 Broker。
 
 **为什么正文里有 `[疑似]` 或 `[听不清]`？**
 

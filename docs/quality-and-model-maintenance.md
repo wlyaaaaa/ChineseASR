@@ -112,3 +112,14 @@ For an approved upgrade, stop through the existing launcher, verify tests and pi
 ASR and OCR may run together; same-family work is serialized and Ollama heavy work remains mutually exclusive. Helpers are hidden. Neither workflow should call Wallpaper Engine pause/stop, suspend its process, or add broad Python/WSL playback rules. Preserve unrelated fullscreen, maximized-application and user-authored rules. Tests for native timeout/crash/cancellation and orphan leases are in `tests/test_dictation_worker.py` and the PCConfig broker suite; these do not replace actual microphone/UI or wallpaper playback observation.
 
 File-transcription workers adopt their supervisor lease through the live broker. The broker tracks the worker creation identity, not just the launcher. A process-handle watchdog cleans the job-tagged WSL descendants and exits the worker when its supervisor disappears; normal successful worker exit is not misreported as lease loss. This prevents reclaiming GPU ownership while a surviving model worker is still being cleaned up.
+
+
+## 2026-09-17 收尾审计基线
+
+本次质量/运行时改造完成后，项目进入维护态。功能提交的完整测试执行 482 项，0 失败、0 错误；1 项因可选公开中文 VAD fixture 未安装而明确跳过。公开音频实际验收覆盖单模型桌面听写、`high_quality` 短音频、42 秒两切片长音频、FireRed + Qwen、Qwen3-ForcedAligner、正常 smart/API 入口，以及监督进程异常退出后的 worker/租约回收。PCConfig 的 64 项 GPU Broker 回归和 63 项相关配置/恢复契约测试通过；`chinese-asr` Skill 的供应健康检查通过。
+
+收尾审计同时核对了文档与实现：ASR/OCR 当前允许跨族并行，同族任务串行，Ollama 重型工作与两者互斥；文件 worker 会接管短租约的进程身份，监督进程消失时 watchdog 终止对应 worker；VAD 边界切分已经落地，不再是未来计划；Whisper 仍只有配置占位，没有可运行 adapter。桌面听写的模型准备、GPU 等待和麦克风故障是不同状态，原生模型调用使用有界恢复，不允许永久停在“准备中”。
+
+Wallpaper Engine 方面，收尾检查没有发现 ASR/OCR 主动 pause/stop、挂起其进程或写入广泛 Python/WSL 暂停规则的路径，也没有修改已有播放偏好；这一结论是代码/配置路径审计，不等于逐帧证明动画连续播放。
+
+以上验收用于证明当前版本的可运行性、恢复性和契约一致性。它不把公开短样例升级成中文准确率基准，也不改变模型提升门槛：默认模型仍需同口径、带参考文本的代表性 holdout 证据后才允许切换。后续只要业务实现、模型默认、GPU 调度或恢复入口发生实质变化，应同步更新本页、`README.md`、`docs/architecture.md`，并只在相应机器事实变化时更新 PCConfig；历史 `docs/superpowers` 计划保留原样，不作为当前运行权威。

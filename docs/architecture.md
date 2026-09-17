@@ -13,13 +13,13 @@
 3. `aliases` 记录 VAD、标点、说话人等可复用模型别名；`speaker_verification` 只配置按需的本地 `person:self` CAM++ 锚，不进入默认转写。
 4. `engines.*.adapter` 决定运行时适配器；当前已实现 `funasr`、`qwen-asr` 和 `firered-worker`。
 
-当前默认策略仍然是：
+当前默认策略仍然是。命名配置 `baseline` 对应 Qwen + SenseVoice，`high_quality` 对应 FireRed + Qwen；显式配置不会自动提升为全局默认：
 
 1. `qwen3-asr-1.7b`：strict 准确率优先主线。基于 Qwen3-ASR 官方开源权重和 `qwen-asr` runtime。
 2. `sensevoice`：quick 默认和 strict 低幻觉锚点。组合 `iic/SenseVoiceSmall`、`fsmn-vad`、`ct-punc`；默认明确**不**加载 `cam++`。
 3. `fireredasr2-llm`：可选的证据级词汇主引擎，仅在显式选择时进入 strict；安装或下载不会改变默认组合。
 4. `paraformer`：显式时间线/匿名说话人备用线，固定 `iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4`，通过现有 FunASR adapter 传入 VAD、PUNC 与 `cam++`，输出逐句 `sentence_info` 时间和匿名 diarization/聚类。单文件 `transcribe --engine paraformer --preset-spk-num N` 只在调用方已知人数时把 `N` 传给 FunASR，并把 `automatic`/`preset` 与人数写入 objective-result 的 `request.speaker_diarization`；省略则保留自动聚类，其他引擎、quick、strict 和批量路径不会接受或传播该参数。它不改变 quick/strict 默认，且 cluster 仍不是用户身份确认，可能过拆或合并。
-5. `whisper-large-v3`：只记录为 fallback/comparison，不自动作为主输出。
+5. `whisper-large-v3`：当前仅保留配置占位；仓库没有 Whisper adapter，因此不是可运行的 fallback/comparison。真正接入前必须新增 adapter、依赖和测试。
 
 `speaker-enroll` / `speaker-evidence` 在真实问题需要时才按需读取有限音频片段。enroll 只允许创建一个可替换、永远为 `inferred` 的本机私有 `person:self` 向量；跨录音域模式限定 2–3 个不同来源，逐向量 L2 归一化后只保存一个再次归一化的质心、源哈希/大小、片段和证据选择绑定，不保存各参考向量、源路径或原音。held-out 模式禁止用任一 enrollment 原件回测；普通模式也会按源哈希标出同原件关系，归属投影将这种分数降为非方向性 `unknown`，防止设备、声道或背景底色泄漏。目标片段只输出源哈希、时间、模型哈希和相似度。它不建设通用声纹平台，也不让分数、匿名 cluster 或默认下混音频单独产生 `confirmed`，并且不为样本调模型固定阈值。归属投影内部可融合来源、联系人、声道、对话角色、句义、跨录音与声纹，但对外只交付匿名说话人、状态、角色、单句依据、原转写 JSON pointer 与输入哈希绑定，不下发声纹分数或逐项内部线索。当前没有独立可信 receipt adapter，`authority_ref` 仅是 caller 提供的来源指针，不能使结果变为 `confirmed`；具体的来源/语义判断可以解释性地压过相反的弱声学线索，无法合理消解的实质冲突才是 `unknown`。
 
@@ -47,7 +47,7 @@ FireRed worker 在校验大权重及装载前读取 WSL `/proc/meminfo`，同时
 audio -> VAD split -> ASR engine -> raw JSON -> Markdown transcript
 ```
 
-严格模式：
+严格模式的默认 `baseline`：
 
 ```text
 audio
@@ -57,6 +57,8 @@ audio
   -> strict.md + strict.audit.md + strict.audit.json
   -> strict.review.json + strict.receipt.json
 ```
+
+显式 `high_quality` 将两路替换为 FireRedASR2-LLM + Qwen3-ASR，并在不改写原始 strict 证据的前提下追加 VAD 边界信息、Qwen3-ForcedAligner 对齐和争议片段质量复核 sidecar。
 
 `strict.md` 是给人读的最终稿，正文尽量干净；当两个模型严重冲突、都为空、或出现常见幻觉套话时才写入 `[疑似]` / `[听不清]`。audit v2 保存两路 raw JSON 引用、逐引擎原文与 provenance、分歧、风险规则和人工复核项。选择策略是 `primary_preserving_no_majority_vote_no_semantic_rewrite`：不做多数投票，不把语义改写冒充声学证据。
 
@@ -73,9 +75,10 @@ audio
 ```text
 long audio
   -> MP3/other input -> 16 kHz, 16-bit, mono PCM WAV
-  -> capability-bounded chunks + schema 2 manifest.json
+  -> coverage-preserving VAD-guided cuts + capability bounds + schema 2 manifest.json
   -> bounded batches; each engine loads once per batch
   -> each chunk writes strict audit v2
+  -> optional forced alignment / targeted quality review
   -> skip completed chunks on resume
   -> optional uncertain-only Ollama arbitration
   -> transcript.md + audit.md + metrics.json
@@ -108,18 +111,11 @@ API 入口由 `python -m zh_asr serve --host 127.0.0.1 --port 18666` 提供，�
 
 服务层只负责调度，不在 HTTP 请求线程中加载模型。每个任务在独立 Python 子进程里运行现有 CLI，这样 API 可以快速返回、任务可以取消、模型显存也不会长期留在 API 进程里。
 
-为避免和其他本地模型互相抢 GPU，所有公开 CLI 和 smart/API 路径统一取得
-LocalGpuBroker 租约并失败关闭。服务父进程持有、续期和释放租约，工作子进程必须携带
-opaque token 并向 Broker 验证当前 live owner；裸环境标记不能绕过。直接 CLI 由持租约
-的监督进程启动可终止工作子进程。任一路径续租失败都会立即终止完整子进程树；服务任务
-写入 `gpu_broker_lost`，不会吞掉续期错误后继续运行。旧
-`allow_gpu_conflicts=true` / `scripts\asr-smart.ps1 -AllowGpuConflicts` 只保留为无
-机器级 Broker 嵌入场景的外部 CUDA 进程检测兼容字段，不能绕过正式 LocalGpuBroker。
-正式 Broker 的协调域是已接入的 Ollama、LocalOCR 与 ChineseASR，不把 LM Studio 或任意
-未接入的 CUDA 进程误报为已受管。
+所有公开 CLI 和 smart/API 路径统一通过 LocalGpuBroker，并在 Broker 不可用或授权租约丢失时失败关闭。当前 Broker 按工作族判断冲突：同族 ASR 串行、同族 OCR 串行，ASR 与 OCR 可以并行；Ollama 重型请求/会话与两族互斥。旧 `allow_gpu_conflicts=true` / `scripts\asr-smart.ps1 -AllowGpuConflicts` 只保留为无机器级 Broker 嵌入场景的外部 CUDA 进程检测兼容字段，不能绕过正式 LocalGpuBroker。
 
-当前机器是 RTX 5090D 32GB，默认排他锁属于受管工作负载之间的保守调度策略，不是硬件
-能力判断；未接入 Broker 的 CUDA 工作负载由调用者另行协调。
+文件作业的监督进程先申请 120 秒短租约并持续续期，工作子进程必须携带 opaque token 验证 live lease，随后把 owner identity 绑定到自己的 Windows 进程创建身份。这样监督进程退出不会把仍存活的 worker 错当成可回收资源；同时 worker 上的进程句柄 watchdog 会在监督进程消失时终止该 worker，并清理同作业标记的 WSL 子进程。正常成功 worker 已退出时，Broker 可能先按进程身份回收租约，这一正常竞态不会伪装成 `gpu_broker_lost`；运行中真正的续租失败仍会立即终止对应进程树。正式 Broker 只协调已接入的 Ollama、LocalOCR 与 ChineseASR，不把 LM Studio 或任意未接入 CUDA 进程误报为已受管。
+
+当前机器是 RTX 5090D 32GB；Broker 的族内串行与 Ollama 互斥属于保守调度策略，不代表硬件不能并发。ASR/OCR 跨族并行是当前显式策略；未接入 Broker 的 CUDA 工作负载由调用者另行协调。
 
 固定端到端验收入口是：
 
@@ -162,7 +158,7 @@ strict receipt、两路成功且非空、无 `engine_failure`，并检查 FireRe
 
 LLM 仲裁刻意默认关闭。这是资源和可信度边界：默认转写链路必须在没有 Ollama、没有额外 GPU 驻留、没有顶级模型猜测的情况下稳定工作；需要最终猜测时再显式打开。
 
-长音频 planner 已按引擎能力限制实际切片，并以 schema 2 manifest 支持内容寻址的断点续跑。后续如升级为 VAD 静音边界切片，应继续保留请求值、有效值、provenance、内容 hash 和 resume 判定，不得退回无来源的固定 300 秒描述。
+长音频 planner 已按引擎能力限制实际切片，并以 schema 2 manifest 支持内容寻址的断点续跑。当前 `cut_strategy=vad` 时，CPU FSMN-VAD 只用于在目标长度附近寻找更自然的停顿切口，仍覆盖整条原始时间线；VAD 不可用或失败时显式回退固定切分。manifest 继续保留请求值、有效值、VAD 状态、provenance、内容 hash 和 resume 判定，不得退回无来源的固定 300 秒描述。
 
 个人使用版关闭标准：
 
@@ -171,7 +167,7 @@ LLM 仲裁刻意默认关闭。这是资源和可信度边界：默认转写链�
 3. `smoke-asr-smart.ps1 -Json` 能完成默认 strict smart job；`smoke-evidence-asr.ps1 -Audio <path> -Json` 能对重要录音完成 FireRed + Qwen 证据验收。
 4. 公开仓库只包含源码、脚本、配置、测试和文档，不包含模型权重、用户音频、输出转写或 wheelhouse 大文件。
 
-本机已用一段超过 40 秒的真实中文电话录音完成 FireRed + Qwen 四切片验收：API、manifest 和四个 chunk 均为 `evidence_status=verified`，四个 FireRed raw 均为非空、无错误、初始装载为 BF16，逐段审计无 `engine_failure`；同一请求随后断点复用为 0 个处理、4 个跳过。默认 Qwen + SenseVoice strict smoke 另行通过，说明可选 FireRed 安装未改变默认组合。私人音频、转写正文和收据保留在 Git 忽略的本地归档，不进入公开仓库。
+2026-09-17 收尾验收使用公开音频完成桌面听写、高质量短音频、42 秒两切片长音频、FireRed + Qwen 和实际 Qwen3-ForcedAligner 推理；正常 smart/API 作业也返回 `succeeded`。该批验收只证明当前集成、切片、对齐和恢复链路在这些公开样例上可运行，不代表通用准确率或个人麦克风表现。私人音频、转写正文和收据不作为公开仓库验收材料。
 
 ## 下载策略
 
