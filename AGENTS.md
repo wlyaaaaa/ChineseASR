@@ -12,4 +12,5 @@
 - 听写复用项目适配器，绕开文件转写的作业/审计链；GPU 工作通过 LocalGpuBroker。用户选定的资源策略是 OCR 与 ASR 可并行，Ollama 大语言模型与二者互斥；同类任务仍串行，不绕过 Broker。空闲将听写模型放回内存并释放租约。录音和最近文本只放内存，用户主动复制时才写剪贴板。
 - 听写模型加载与推理须有有界恢复，区分加载、真实 GPU 排队与麦克风异常，不用永久“准备中”掩盖失败。ASR/OCR 不得主动暂停或停止 Wallpaper Engine，不得修改无关的全屏、最大化或其他程序播放规则；后台助手保持隐藏。
 - 入口：`.venv\Scripts\python.exe -m zh_asr.dictation`；登录自启由 `scripts\dictation.ps1 -Mode Install` 管理。常规验证：`python -m unittest discover -s tests`；不得用软件检查冒充用户实际语音准确率。
+- 已有文案的外部项目只需要时间位置时用 `python -m zh_asr align`，能力检查用 `alignment-info`，详见 `docs/known-text-alignment.md`；复用现有对齐器与监督进程，不默认双模型转写，不把对齐覆盖当作语音文字真实性。
 - 源音频、识别正文、模型权重、运行日志及私人评测材料不进入公开 Git。保留原始录音和已有并发工作。

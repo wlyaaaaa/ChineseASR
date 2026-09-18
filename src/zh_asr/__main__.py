@@ -69,6 +69,14 @@ def main(argv: list[str] | None = None) -> int:
 
     subparsers.add_parser("doctor", help="Check local runtime state without loading ASR models.")
 
+    subparsers.add_parser("alignment-info", help="Describe local text/audio alignment without loading a model.")
+    align = subparsers.add_parser("align", help="Align supplied text to one existing audio file; never transcribe or regenerate it.")
+    align.add_argument("audio", type=Path)
+    align.add_argument("--text-file", type=Path, required=True)
+    align.add_argument("--output", type=Path, required=True)
+    align.add_argument("--device", default="cuda:0")
+    align.add_argument("--timeout-sec", type=float, default=300)
+
     warmup = subparsers.add_parser("warmup", help="Load the selected engine and download weights if needed.")
     warmup.add_argument("--engine", choices=engine_choices, default=model_config.default_engine)
     warmup.add_argument("--device", default="cuda:0")
@@ -261,6 +269,11 @@ def main(argv: list[str] | None = None) -> int:
         command_parser.add_argument("--profile", choices=tuple(model_config.profiles),
             help="Named file-transcription model pair; explicit engines override its defaults.")
     args = parser.parse_args(argv)
+    if args.command == "align":
+        import math
+        if not math.isfinite(args.timeout_sec) or args.timeout_sec <= 0:
+            parser.error("--timeout-sec must be a finite positive number")
+
     if args.command in {"strict", "long", "batch", "eval", "benchmark"}:
         try:
             args.primary_engine, args.secondary_engine = resolve_profile(
@@ -272,6 +285,16 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"ValueError: {exc}", file=sys.stderr)
         return 1
+
+    if args.command == "align" and not str(args.device).lower().startswith(("cuda", "gpu")):
+        parent = os.environ.pop("ZH_ASR_SUPERVISOR_PID", "")
+        if not parent:
+            try:
+                return _supervise_gpu_cli(list(sys.argv[1:] if argv is None else argv), timeout_seconds=args.timeout_sec, gpu=False)
+            except Exception as exc:
+                print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+                return 1
+        watch_process_exit(int(parent), lambda: os._exit(71))
 
     if _command_requires_gpu_supervision(args):
         try:
@@ -294,14 +317,28 @@ def main(argv: list[str] | None = None) -> int:
                             os._exit(71)
                     watch_process_exit(int(supervisor_pid), parent_exited)
             else:
-                return _supervise_gpu_cli(
-                    list(sys.argv[1:] if argv is None else argv)
-                )
+                command_argv = list(sys.argv[1:] if argv is None else argv)
+                if args.command == "align":
+                    return _supervise_gpu_cli(command_argv, timeout_seconds=args.timeout_sec)
+                return _supervise_gpu_cli(command_argv)
         except Exception as exc:
             print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
 
     try:
+        if args.command == "alignment-info":
+            from .alignment_entry import describe
+            print(json.dumps(describe(model_config), ensure_ascii=True))
+            return 0
+        if args.command == "align":
+            from .alignment_entry import align_file
+            value = _run_with_gpu_lease(args.device, lambda: align_file(
+                args.audio, args.text_file, args.output,
+                device=args.device, config=model_config, timeout_sec=args.timeout_sec))
+            print(json.dumps({"schema": value["schema"], "status": value["status"],
+                "output": str(args.output.resolve()), "word_count": len(value["words"]),
+                "lexical_truth_verified": False}, ensure_ascii=True))
+            return 0
         if args.command == "doctor":
             return _doctor(model_config)
         if args.command == "warmup":
@@ -660,6 +697,7 @@ def _run_with_gpu_lease(device: str, operation):
 
 def _command_requires_gpu_supervision(args: argparse.Namespace) -> bool:
     if args.command not in {
+        "align",
         "warmup",
         "transcribe",
         "strict",
@@ -676,7 +714,7 @@ def _command_requires_gpu_supervision(args: argparse.Namespace) -> bool:
     return str(getattr(args, "device", "")).lower().startswith(("cuda", "gpu"))
 
 
-def _supervise_gpu_cli(argv: list[str]) -> int:
+def _supervise_gpu_cli(argv: list[str], *, timeout_seconds: float | None = None, gpu: bool = True) -> int:
     """Run one public GPU CLI invocation in a killable supervised worker."""
     process_holder: dict[str, subprocess.Popen] = {}
     process_token = f"chineseasr-cli-{uuid.uuid4().hex}"
@@ -690,12 +728,17 @@ def _supervise_gpu_cli(argv: list[str]) -> int:
         # outlive it, so also signal descendants carrying this exact token.
         terminate_wsl_processes(wsl_distributions, process_token)
 
-    lease = GpuBrokerLease("chineseasr-cli")
-    lease.set_on_lost(terminate_on_loss)
-    with lease:
+    from contextlib import nullcontext
+    lease = GpuBrokerLease("chineseasr-cli") if gpu else None
+    if lease:
+        lease.set_on_lost(terminate_on_loss)
+    with lease if lease else nullcontext():
         env = tagged_process_env(process_token)
         env.pop("ZH_ASR_GPU_BROKER_LEASE_HELD", None)
-        env[GPU_BROKER_CHILD_TOKEN_ENV] = lease.token
+        if lease:
+            env[GPU_BROKER_CHILD_TOKEN_ENV] = lease.token
+        else:
+            env.pop(GPU_BROKER_CHILD_TOKEN_ENV, None)
         env["ZH_ASR_SUPERVISOR_PID"] = str(os.getpid())
         process = subprocess.Popen(
             [sys.executable, "-m", "zh_asr", *argv],
@@ -705,16 +748,18 @@ def _supervise_gpu_cli(argv: list[str]) -> int:
         )
         process_holder["process"] = process
         try:
-            lease.raise_if_lost()
-            returncode = process.wait()
+            if lease:
+                lease.raise_if_lost()
+            returncode = process.wait(timeout=timeout_seconds) if timeout_seconds is not None else process.wait()
             # A finished, successful worker may already have been reclaimed by
             # process-bound lease cleanup. That is normal completion, not a
             # failed job. Actual lease loss kills a still-running worker.
-            if returncode == 0:
+            if lease and returncode == 0:
                 complete_worker = getattr(lease, "complete_worker", None)
                 if callable(complete_worker):
                     complete_worker()
-            lease.raise_if_lost()
+            if lease:
+                lease.raise_if_lost()
             return int(returncode)
         finally:
             if process.poll() is None:
