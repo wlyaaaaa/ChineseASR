@@ -11,6 +11,7 @@ param(
   [string]$Device = 'cuda:0',
   [string]$OutRoot = '',
   [string]$CacheDir = '',
+  [ValidateSet('127.0.0.1')]
   [string]$HostName = '127.0.0.1',
   [int]$Port = 18666,
   [int]$WaitSec = 15,

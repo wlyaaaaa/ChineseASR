@@ -214,7 +214,7 @@ def open_microphone(
                     callback=callback,
                 )
                 try:
-                    setattr(stream, "_zh_asr_input_sample_rate", input_rate)
+                    stream._zh_asr_input_sample_rate = input_rate
                 except Exception:
                     pass
                 if on_sample_rate is not None:

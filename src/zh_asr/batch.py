@@ -215,7 +215,7 @@ def run_batch(
                 raise RuntimeError(
                     f"Batch transcription returned {len(outputs_many)} results for {len(pending)} inputs."
                 )
-            for (audio_path, item_dir, identity), outputs in zip(pending, outputs_many):
+            for (audio_path, item_dir, identity), outputs in zip(pending, outputs_many, strict=True):
                 if mode_key == "strict" and model_config.quality and isinstance(outputs, dict) and outputs.get("audit_json"):
                     from .quality_review import enhance_single
                     from .pipeline import default_cache_dir

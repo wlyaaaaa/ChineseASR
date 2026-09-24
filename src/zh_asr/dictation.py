@@ -148,12 +148,12 @@ class PauseSegmenter:
                       key=lambda i: float(np.mean(self.blocks[i] ** 2))) + 1
             head, tail = self.blocks[:cut], self.blocks[cut:]
             head_voiced = sum(len(block) for block, voiced in
-                              zip(head, self.speech_flags[:cut]) if voiced)
+                              zip(head, self.speech_flags[:cut], strict=False) if voiced)
             self.blocks = tail
             self.speech_flags = self.speech_flags[cut:]
             self.samples = sum(len(block) for block in tail)
             self.voiced_samples = sum(len(block) for block, voiced in
-                                      zip(tail, self.speech_flags) if voiced)
+                                      zip(tail, self.speech_flags, strict=False) if voiced)
             self.silent_samples = 0
             return ([np.concatenate(head)] if head_voiced >=
                     sr * self.settings.min_speech_ms / 1000 else [])

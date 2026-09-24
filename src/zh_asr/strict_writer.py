@@ -382,7 +382,7 @@ def _strict_bundle_receipt(
             "raw_artifact": raw_key,
             "raw_sha256": artifacts[raw_key]["sha256"],
         }
-        for item, raw_key in zip(report.engine_evidence, raw_artifacts)
+        for item, raw_key in zip(report.engine_evidence, raw_artifacts, strict=False)
     ]
     claims = {
         "status": report.status,

@@ -876,7 +876,7 @@ def _cosine_similarity(left: Any, right: Any) -> float:
     right_values = _profile_embedding(right)
     if len(left_values) != len(right_values):
         raise SpeakerEvidenceError("Profile and target speaker embeddings have different dimensions.")
-    numerator = sum(a * b for a, b in zip(left_values, right_values))
+    numerator = sum(a * b for a, b in zip(left_values, right_values, strict=True))
     left_norm = math.sqrt(sum(a * a for a in left_values))
     right_norm = math.sqrt(sum(b * b for b in right_values))
     if left_norm == 0 or right_norm == 0:

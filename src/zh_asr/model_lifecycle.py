@@ -299,11 +299,11 @@ def _replace_strict_pair(text: str, pair: tuple[str, str]) -> str:
     if match is None:
         raise ValueError("A top-level strict mapping is required")
     body = match.group("body")
-    for key, value in zip(("primary_engine", "secondary_engine"), pair):
+    for key, value in zip(("primary_engine", "secondary_engine"), pair, strict=True):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
             raise ValueError("Engine name cannot be represented as a plain YAML scalar")
         pattern = rf"(?m)^(  {key}:)[^\n#]*(?P<comment>#[^\n]*)?$"
-        body, count = re.subn(pattern, lambda m: m[1] + " " + value + (" " + m["comment"] if m["comment"] else ""), body)
+        body, count = re.subn(pattern, lambda m, value=value: m[1] + " " + value + (" " + m["comment"] if m["comment"] else ""), body)
         if count != 1:
             raise ValueError(f"Exactly one strict.{key} declaration is required")
     result = text[:match.start("body")] + body + text[match.end("body"):]

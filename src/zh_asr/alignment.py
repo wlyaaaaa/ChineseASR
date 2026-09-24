@@ -2,7 +2,6 @@
 from __future__ import annotations
 import gc
 import math
-import os
 from pathlib import Path
 import wave
 from typing import Any
@@ -44,7 +43,7 @@ def align_many(
     options, directory, _ = alignment_contract(config)
     outcomes: list[dict[str, Any]] = []
     valid = []
-    for index, (audio, raw_text, target) in enumerate(jobs):
+    for index, (audio, raw_text, _target) in enumerate(jobs):
         text = strip_audit_markers(raw_text).strip()
         result = {"schema": "zh_asr.forced_alignment.v1", "status": "pending",
             "audio": str(audio.resolve()), "text": text, "text_sha256": text_sha256(text),
@@ -97,7 +96,7 @@ def align_many(
             if str(device).startswith("cuda"):
                 import torch
                 torch.cuda.empty_cache()
-    for (_, _, target), result in zip(jobs, outcomes):
+    for (_, _, target), result in zip(jobs, outcomes, strict=True):
         write_json_atomic(target, result)
     return outcomes
 
@@ -137,7 +136,7 @@ def timestamp_supported_overlap(
         key = normalize_comparison(prefix)
         if not (left.endswith(prefix) and key and left_chars.endswith(key) and right_chars.startswith(key)):
             continue
-        matched = zip(left_times[-len(key):], right_times[:len(key)])
+        matched = zip(left_times[-len(key):], right_times[:len(key)], strict=False)
         supported = True
         for (a, b), (c, d) in matched:
             # Match the same sound, not separate repetitions in a shared clip.

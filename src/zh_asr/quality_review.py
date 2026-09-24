@@ -151,7 +151,7 @@ def enhance_chunks(states, *, config: ModelConfig, device: str, cache_dir: Path,
         aligned_results = align_fn(jobs, device=device, config=config)
         if not isinstance(aligned_results, list) or len(aligned_results) != len(pending):
             raise RuntimeError("Forced alignment result count does not match submitted clips")
-        for index, aligned in zip(pending, aligned_results):
+        for index, aligned in zip(pending, aligned_results, strict=True):
             records[index]["alignment"] = aligned
     entries = []
     review_inputs = []
@@ -211,7 +211,7 @@ def enhance_chunks(states, *, config: ModelConfig, device: str, cache_dir: Path,
         model_identity = _runtime_artifact_identity(config, (review_engine,), cache_dir)
         code_identity = _runtime_code_identity()["sha256"]
         pending_inputs, pending_indices, cache_keys = [], [], {}
-        for index, clip in zip(review_indices, review_inputs):
+        for index, clip in zip(review_indices, review_inputs, strict=True):
             entry = entries[index]
             key = canonical_json_sha256({"clip_sha256": entry["clip_sha256"],
                 "engine": review_engine, "artifacts": model_identity, "code": code_identity,
@@ -243,7 +243,7 @@ def enhance_chunks(states, *, config: ModelConfig, device: str, cache_dir: Path,
                 engine=review_engine, device=device, cache_dir=cache_dir, config=config)
             if len(generated["results"]) != len(pending_indices) or len(generated["errors"]) != len(pending_indices):
                 raise RuntimeError("Supplemental ASR result count does not match review windows")
-            for index, raw, error in zip(pending_indices, generated["results"], generated["errors"]):
+            for index, raw, error in zip(pending_indices, generated["results"], generated["errors"], strict=True):
                 entry = entries[index]
                 key, raw_path, cache_path = cache_keys[index]
                 write_json_atomic(raw_path, raw)
@@ -277,7 +277,6 @@ def write_review_html(path: Path, payload: dict[str, Any]) -> None:
     for item in payload.get("entries", []):
         def escape(value):
             return html.escape(str(value), quote=True)
-        import os
         from urllib.parse import quote
         source = quote(os.path.relpath(item["clip"], path.parent).replace("\\", "/"), safe="/")
         cards.append(f'<section><h2>{escape(item["id"])} · {item["audio_start_ms"]/1000:.2f}–{item["audio_end_ms"]/1000:.2f} 秒</h2>'

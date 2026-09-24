@@ -479,6 +479,13 @@ engines:
         self.assertIn("ASR API ready", result.stdout)
         self.assertIn("127.0.0.1", result.stdout)
 
+    def test_serve_rejects_non_loopback_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli("serve", "--check", "--host", "0.0.0.0", "--state-dir", tmp)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid choice", result.stderr)
+
     def test_serve_check_uses_non_localocr_default_port(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = self.run_cli("serve", "--check", "--state-dir", tmp)

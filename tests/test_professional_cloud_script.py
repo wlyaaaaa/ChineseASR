@@ -21,6 +21,24 @@ def _write_wav(path: Path) -> None:
 
 
 class ProfessionalCloudScriptTests(unittest.TestCase):
+    def test_relocated_script_uses_its_own_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            relocated = scripts / SCRIPT.name
+            relocated.write_bytes(SCRIPT.read_bytes())
+            result = subprocess.run(
+                ["pwsh", "-NoProfile", "-File", str(relocated),
+                 "-Audio", str(root / "missing.wav"), "-Important",
+                 "-CloudUploadAuthorized", "-Json"],
+                cwd=root, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30,
+            )
+            self.assertEqual(2, result.returncode, result.stderr)
+            self.assertEqual("audio_file_missing", json.loads(result.stdout)["error_code"])
+            self.assertFalse((root / "outputs" / "cloud-jobs").exists())
+
     def test_cloud_failure_contract_is_bounded_and_recommends_local_smart(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("Get-SafeBrokerErrorCode", source)

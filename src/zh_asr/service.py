@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 from .audit import validate_strict_artifact_bundle
 from .audio_outcome import load_objective_result, validate_objective_result
@@ -1826,11 +1826,47 @@ def _utc_timestamp(value: float | None) -> str | None:
     )
 
 
-def create_handler(service: TranscriptionService) -> type[BaseHTTPRequestHandler]:
+def create_handler(
+    service: TranscriptionService
+) -> type[BaseHTTPRequestHandler]:
     class AsrRequestHandler(BaseHTTPRequestHandler):
         server_version = "ChineseASR/0.1"
 
+        def _request_origin_allowed(self) -> bool:
+            hosts = self.headers.get_all("Host", [])
+            if len(hosts) != 1:
+                return False
+            host = hosts[0].strip()
+            try:
+                parsed_host = urlsplit(f"//{host}")
+                if (parsed_host.hostname not in ("127.0.0.1", "localhost") or parsed_host.username is not None
+                        or parsed_host.password is not None or parsed_host.path or parsed_host.query
+                        or parsed_host.fragment
+                        or parsed_host.port not in (None, self.server.server_port)):
+                    return False
+            except ValueError:
+                return False
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return True
+            try:
+                parsed_origin = urlsplit(origin)
+                return (parsed_origin.scheme == "http" and parsed_origin.hostname == parsed_host.hostname
+                        and parsed_origin.port == self.server.server_port
+                        and parsed_origin.username is None and parsed_origin.password is None
+                        and not parsed_origin.path and not parsed_origin.query and not parsed_origin.fragment)
+            except ValueError:
+                return False
+
+        def _reject_untrusted_request(self) -> bool:
+            if self._request_origin_allowed():
+                return False
+            self._send_json(400, {"error": "untrusted_request_origin"})
+            return True
+
         def do_GET(self) -> None:
+            if self._reject_untrusted_request():
+                return
             path = "/"
             try:
                 parsed = urlparse(self.path)
@@ -1870,8 +1906,13 @@ def create_handler(service: TranscriptionService) -> type[BaseHTTPRequestHandler
                 self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
 
         def do_POST(self) -> None:
+            if self._reject_untrusted_request():
+                return
             try:
                 path = urlparse(self.path).path.rstrip("/") or "/"
+                if path == "/jobs/transcribe" and self.headers.get_content_type() != "application/json":
+                    self._send_json(415, {"error": "application_json_required"})
+                    return
                 payload = self._read_json()
                 if path == "/jobs/transcribe":
                     request = JobRequest.from_payload(
@@ -1925,6 +1966,8 @@ def create_handler(service: TranscriptionService) -> type[BaseHTTPRequestHandler
 
 
 def serve_api(host: str, port: int, state_dir: Path, root: Path) -> int:
+    if host != "127.0.0.1":
+        raise ValueError("ASR API only supports --host 127.0.0.1")
     state_dir.mkdir(parents=True, exist_ok=True)
     service = TranscriptionService(root=root, default_out_root=state_dir, autostart=True)
     server = ThreadingHTTPServer((host, port), create_handler(service))

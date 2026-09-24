@@ -17,7 +17,7 @@ param(
     [ValidateRange(0, 179)]
     [int] $OverlapSec = 1,
 
-    [string] $RequestRoot = 'E:\Projects\Tools\ChineseASR\outputs\cloud-jobs',
+    [string] $RequestRoot = '',
 
     [switch] $Json
 )
@@ -35,9 +35,8 @@ $importantRequestSchema = 'chineseasr.qwen-audio3-important-request.v1'
 $qualityReviewRequestSchema = 'chineseasr.qwen-audio3-quality-review-request.v1'
 $importantResultSchema = 'chineseasr.qwen-audio3-important-result.v1'
 $qualityReviewResultSchema = 'chineseasr.qwen-audio3-quality-review-result.v1'
-$canonicalRequestRoot = [IO.Path]::GetFullPath(
-    'E:\Projects\Tools\ChineseASR\outputs\cloud-jobs'
-)
+$canonicalRequestRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\outputs\cloud-jobs'))
+if ([string]::IsNullOrWhiteSpace($RequestRoot)) { $RequestRoot = $canonicalRequestRoot }
 
 function Write-BoundedReceipt {
     param(

@@ -117,7 +117,6 @@ def plan_chunks(
     duration_ms = _wav_duration_ms(audio_path)
     chunks_root = chunks_dir or audio_path.parent / "chunks"
     chunk_ms = effective_chunk_sec * 1000
-    step_ms = (effective_chunk_sec - overlap_sec) * 1000
     specs: list[ChunkSpec] = []
     start_ms = 0
     index = 1
@@ -332,7 +331,7 @@ def run_long_transcription(
                     _mark_chunk_failed(state, f"{type(exc).__name__}: {exc}")
                     failed += 1
             else:
-                for state, outputs in zip(batch_states, batch_outputs):
+                for state, outputs in zip(batch_states, batch_outputs, strict=True):
                     try:
                         state.outputs = {
                             key: str(path)

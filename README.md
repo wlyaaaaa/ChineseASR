@@ -54,6 +54,8 @@
 
 `personal-use v0.1` 已完成 2026-09-17 的质量、运行时和恢复收尾，进入维护态。功能交付的收尾验收基线是：482 项项目测试执行，0 失败、0 错误，1 项因可选公开中文 VAD fixture 未安装而透明跳过；公开音频实际跑通桌面听写、高质量短音频、42 秒两切片长音频、FireRed + Qwen、Qwen3-ForcedAligner 以及正常 smart/API 作业。模型监督进程退出后，进程绑定的 GPU 租约也完成了实际回收验证。
 
+2026-09-24 维护验证执行 495 项单元测试，0 失败、0 错误，1 项因同一可选公开 fixture 缺失而跳过；此计数是代码与接口回归，不替代上面的真实音频验收。
+
 这些结果证明对应版本的集成、恢复和故障边界，不是个人麦克风效果或通用中文准确率榜单。默认模型提升仍需要同口径 holdout 证据；Ollama 纯文本仲裁继续默认关闭，不作为词汇真相裁决。Skill 的调用/维护说明和 PCConfig 的机器恢复契约已同步，项目业务事实仍以本仓库配置与实现为准。
 
 维护关闭标准继续是：
@@ -206,6 +208,8 @@ API Key 只由 Secret Broker 注入固定、哈希绑定的子进程环境，不
 ```
 
 核心依赖文件 `requirements-core.txt` 固定 `funasr==1.4.14`。Fun-ASR-Nano 是面向 GPU 的较重模型，先完成 CUDA/PyTorch 与核心依赖安装，再按需下载；不需要 Nano 的机器无需额外安装模型。
+
+`pyproject.toml` 有意不声明运行依赖：`pip install .` 只安装项目入口，不会下载 CUDA/PyTorch、模型框架或模型权重。完整本机环境按上面的安装脚本和 `requirements-core.txt` 配置；CI 仅安装运行无模型单元测试所需的轻量依赖。
 
 下载 quick / secondary 默认需要的 SenseVoice：
 
@@ -419,6 +423,8 @@ sidecar 的正式正交字段是 `execution.status ∈ {completed, failed, unsup
 ```powershell
 .\.venv\Scripts\python.exe -m zh_asr serve --host 127.0.0.1 --port 18666 --state-dir outputs\api
 ```
+
+`--host` 仅接受 `127.0.0.1`。HTTP 请求的 Host 必须是本机地址，带 Origin 时须与服务同源；提交转写任务须使用 `application/json`。本机脚本、CLI 与智能客户端仍可传入自定义模型缓存目录和既有 GPU 兼容参数。
 
 主要端点：
 

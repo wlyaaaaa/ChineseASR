@@ -327,7 +327,7 @@ def _generate_many_for_strict(
     provenance: list[dict[str, Any]] = [_engine_provenance(engine, config) for _ in audio_paths]
     prepared: list[Path | None] = [None] * count
 
-    for index, (audio_path, out_dir) in enumerate(zip(audio_paths, out_dirs)):
+    for index, (audio_path, out_dir) in enumerate(zip(audio_paths, out_dirs, strict=True)):
         try:
             prepared[index], provenance[index] = _prepare_engine_input(
                 audio_path,
@@ -361,7 +361,7 @@ def _generate_many_for_strict(
                         f"{len(generated) if isinstance(generated, list) else type(generated).__name__} "
                         f"for {len(valid_indices)} inputs."
                     )
-                for index, value in zip(valid_indices, generated):
+                for index, value in zip(valid_indices, generated, strict=True):
                     if isinstance(value, BatchItemFailure):
                         errors[index] = f"{type(value.error).__name__}: {value.error}"
                         results[index] = _engine_failure_result(engine, value.error)

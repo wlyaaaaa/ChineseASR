@@ -5,7 +5,6 @@ import inspect
 import json
 import math
 import random
-import re
 import struct
 import subprocess
 import time
@@ -277,7 +276,6 @@ def run_evaluation(
     summary = _summary(corpus_root, output_root, results)
     run_finished_at = datetime.now()
     run_elapsed_sec = time.perf_counter() - run_started_perf
-    selected_engines = (primary, secondary)
     _write_metrics(
         output_root / "metrics.json",
         summary,

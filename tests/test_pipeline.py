@@ -378,6 +378,8 @@ class PipelineTests(unittest.TestCase):
 
             with patch(
                 "zh_asr.qwen_identity.QWEN_MODEL_FILES", required_files
+            ), patch(
+                "zh_asr.adapters.qwen_asr._torch_dtype", return_value="bfloat16"
             ):
                 kwargs = qwen_from_pretrained_kwargs(
                     spec, "cuda:0", cache, {}
@@ -387,6 +389,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(kwargs["device_map"], "cuda:0")
         self.assertEqual(kwargs["max_new_tokens"], 256)
         self.assertEqual(kwargs["max_inference_batch_size"], 8)
+        self.assertEqual(kwargs["dtype"], "bfloat16")
 
     def test_qwen_adapter_requires_prefetched_local_cache(self):
         from zh_asr.adapters.qwen_asr import qwen_from_pretrained_kwargs
