@@ -9,6 +9,7 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 
+HAS_QWEN_MODEL_CACHE = (Path(__file__).resolve().parents[1] / "models" / "modelscope" / "Qwen" / "Qwen3-ASR-1.7B").is_dir()
 
 class PipelineTests(unittest.TestCase):
     def _write_wav(
@@ -567,6 +568,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(primary_audio["format"], "wav")
             self.assertFalse(primary_audio["converted"])
 
+    @unittest.skipUnless(HAS_QWEN_MODEL_CACHE, "requires prefetched local Qwen model cache")
     def test_default_strict_converts_one_synthetic_wav_for_both_engines(self):
         from zh_asr.pipeline import strict_transcribe_audio
 

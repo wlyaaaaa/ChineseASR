@@ -4,6 +4,7 @@ import unittest
 import wave
 from pathlib import Path
 
+HAS_QWEN_MODEL_CACHE = (Path(__file__).resolve().parents[1] / "models" / "modelscope" / "Qwen" / "Qwen3-ASR-1.7B").is_dir()
 
 def write_tiny_wav(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,6 +72,7 @@ class EvalPackTests(unittest.TestCase):
         self.assertTrue(any(case["expect_empty"] for case in manifest["cases"]))
         self.assertFalse(any(case["kind"] == "tts" and case["available"] for case in manifest["cases"]))
 
+    @unittest.skipUnless(HAS_QWEN_MODEL_CACHE, "requires prefetched local Qwen model cache")
     def test_run_evaluation_writes_metrics_benchmark_and_review(self):
         from zh_asr.eval_pack import generate_builtin_corpus, run_evaluation
 

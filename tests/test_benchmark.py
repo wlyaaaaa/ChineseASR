@@ -4,6 +4,7 @@ import unittest
 import wave
 from pathlib import Path
 
+HAS_QWEN_MODEL_CACHE = (Path(__file__).resolve().parents[1] / "models" / "modelscope" / "Qwen" / "Qwen3-ASR-1.7B").is_dir()
 
 def write_tiny_wav(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -55,6 +56,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(case_002["truth_size_bytes"], 0)
         self.assertEqual(copied_audio, [])
 
+    @unittest.skipUnless(HAS_QWEN_MODEL_CACHE, "requires prefetched local Qwen model cache")
     def test_run_benchmark_writes_benchmark_json_markdown_and_review(self):
         from zh_asr.benchmark import run_benchmark
 

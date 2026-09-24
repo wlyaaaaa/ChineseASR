@@ -10,9 +10,30 @@ from zh_asr.audio_frontend import PreparedAudio
 from zh_asr.long_audio import plan_chunks, run_long_transcription
 from zh_asr.strict_writer import write_strict_bundle
 
+HAS_QWEN_MODEL_CACHE = (Path(__file__).resolve().parents[1] / "models" / "modelscope" / "Qwen" / "Qwen3-ASR-1.7B").is_dir()
+MODEL_CACHE_TESTS = {
+    "test_long_manifest_marks_primary_engine_fallback_provisional",
+    "test_long_objective_aggregate_projects_chunk_local_coverage_to_source",
+    "test_long_resume_reprocesses_chunk_when_receipt_bound_text_is_tampered",
+    "test_long_resume_reprocesses_chunk_when_required_raw_is_missing",
+    "test_merged_transcript_removes_only_exact_adjacent_overlap",
+    "test_run_long_transcription_arbitrates_only_flagged_chunks",
+    "test_run_long_transcription_bounds_batches_and_continues_after_batch_failure",
+    "test_run_long_transcription_default_batches_pending_chunks_and_preserves_resume_force",
+    "test_run_long_transcription_fingerprint_includes_device_cache_and_runtime_receipt",
+    "test_run_long_transcription_prepares_mp3_and_records_derivative_provenance",
+    "test_run_long_transcription_reprocesses_when_explicit_engine_changes",
+    "test_run_long_transcription_reprocesses_when_resolved_default_engine_changes",
+    "test_run_long_transcription_resets_stale_running_chunks",
+    "test_run_long_transcription_resumes_completed_chunks_and_merges_outputs",
+    "test_run_long_transcription_schema_one_manifest_is_explicit_cache_miss",
+    "test_run_long_transcription_uses_both_engine_capabilities_and_records_effective_chunk",
+}
 
 class LongAudioTests(unittest.TestCase):
     def setUp(self):
+        if self._testMethodName in MODEL_CACHE_TESTS and not HAS_QWEN_MODEL_CACHE:
+            self.skipTest("requires prefetched local Qwen model cache")
         # Unit fixtures do not load real VAD or ASR models.
         for target, result in (
             ("zh_asr.audio_quality.speech_boundaries", {"status": "unavailable", "segments": [], "excluded_ranges_ms": []}),
