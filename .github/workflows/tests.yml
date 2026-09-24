@@ -24,4 +24,5 @@ jobs:
         env:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
+          PYTHONUTF8: '1'
         run: python -m unittest discover -s tests
