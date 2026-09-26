@@ -323,6 +323,7 @@ class Job:
             "audio_result_status": self.objective_outcome,
             "objective_execution_status": self.objective_execution_status,
             "quality_result": _quality_review_projection(self.outputs),
+            "cloud_review": _cloud_review_projection(self.outputs),
             "conflicts": [conflict.to_dict() for conflict in self.conflicts],
         }
 
@@ -346,6 +347,21 @@ def _quality_review_projection(outputs: Mapping[str, str]) -> dict:
             "supplemental_failed": value.get("supplemental_failed", 0), "lexical_truth_verified": False}
     except (OSError, ValueError, TypeError):
         return {**unknown, "status": "unreadable"}
+
+
+def _cloud_review_projection(outputs: Mapping[str, str]) -> dict:
+    path = outputs.get("cloud_review")
+    if not path:
+        return {"status": "not_required"}
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or value.get("schema") != "zh_asr.cloud_review.v1":
+            return {"status": "unreadable"}
+        return {key: value[key] for key in (
+            "status", "message", "review_reasons", "pause_reason", "error_code",
+            "next_command", "runtime_principal_note") if key in value}
+    except (OSError, ValueError, TypeError):
+        return {"status": "unreadable"}
 
 
 ProcessRunner = Callable[[Job], ProcessResult]
@@ -372,7 +388,7 @@ class TranscriptionService:
         self._gpu_process_detector = gpu_process_detector or detect_gpu_processes
         self._current_process_ids = current_process_ids or self._owned_process_ids
         self._process_runner = process_runner or self._run_subprocess
-        self._cloud_automation_enabled = (
+        self._cloud_review_marker_enabled = (
             process_runner is None
             and self.root == Path(__file__).resolve().parents[2]
         )
@@ -388,13 +404,11 @@ class TranscriptionService:
         self._jobs: dict[str, Job] = {}
         self._fingerprints: dict[str, str] = {}
         self._queue: queue.Queue[str] = queue.Queue()
-        self._cloud_queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.RLock()
         self._active_job_id: str | None = None
         self._processes: dict[str, subprocess.Popen] = {}
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
-        self._cloud_worker: threading.Thread | None = None
         self._persistence_status = "ready"
         self._persistence_error = ""
         self._persistence_failed_at: float | None = None
@@ -422,12 +436,6 @@ class TranscriptionService:
                 daemon=True,
             )
             self._worker.start()
-            self._cloud_worker = threading.Thread(
-                target=self._cloud_worker_loop,
-                name="zh-asr-cloud-review",
-                daemon=True,
-            )
-            self._cloud_worker.start()
 
     def _load_persisted_jobs(self) -> None:
         """Restore queryable job history without restoring executable work.
@@ -701,8 +709,6 @@ class TranscriptionService:
             self.cancel(job_id)
         if self._worker:
             self._worker.join(timeout=2)
-        if self._cloud_worker:
-            self._cloud_worker.join(timeout=2)
 
     def submit(self, request: JobRequest) -> tuple[Job, bool]:
         fingerprint = request.fingerprint()
@@ -870,91 +876,65 @@ class TranscriptionService:
             finally:
                 self._queue.task_done()
 
-    def _cloud_worker_loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                job_id = self._cloud_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            try:
-                self._run_cloud_review(job_id)
-            finally:
-                self._cloud_queue.task_done()
-
-    def _queue_cloud_if_eligible(self, job_id: str) -> None:
+    def _mark_cloud_review_if_eligible(self, job: Job) -> None:
+        """Write the AI handoff before publishing the terminal job state."""
+        from .audio_quality import probe_duration_ms
         from .cloud_review import (CloudReviewError, auto_cloud_status,
-                                   load_cloud_config, local_review_signals)
+                                   free_period_expired, load_cloud_config,
+                                   local_review_signals, pause_message, select_model)
         from .model_lifecycle import write_json_atomic
 
-        if not self._cloud_automation_enabled:
+        if not self._cloud_review_marker_enabled or job.status != "succeeded":
             return
-        with self._lock:
-            job = self._jobs[job_id]
-            if job.status != "succeeded" or (job.request.mode == "quick" and not job.request.important):
-                return
-            out_dir, audio, evidence, important = (
-                job.out_dir, job.request.audio, job.evidence_status, job.request.important)
+        if job.request.mode == "quick" and not job.request.important:
+            return
+        out_dir, audio, evidence, important = (
+            job.out_dir, job.request.audio, job.evidence_status, job.request.important)
         try:
-            project_root = Path(__file__).resolve().parents[2]
-            config = load_cloud_config(project_root / "configs" / "models.yaml")
             reasons, _ = local_review_signals(out_dir, evidence_status=evidence,
                                               important=important)
-            if reasons and audio.is_file():
-                state = auto_cloud_status(project_root / "outputs" / "cloud-jobs" /
-                                          "auto-cloud-state.json", config)
-                if state["status"] == "paused":
-                    sidecar = out_dir / "cloud.review.json"
-                    write_json_atomic(sidecar, {"schema": "zh_asr.cloud_review.v1",
-                        "status": "skipped", "error_code": "auto_cloud_paused",
-                        "pause_reason": state["reason"], "cloud_upload_performed": False,
-                        "message": state.get("message") or "云端未跑",
-                        "local_text_rewritten": False})
-                    with self._lock:
-                        job.outputs["cloud_review"] = str(sidecar)
-                        self._persist_jobs_locked()
-                else:
-                    self._cloud_queue.put(job_id)
-        except (CloudReviewError, OSError, ValueError):
-            return
-
-    def _run_cloud_review(self, job_id: str) -> None:
-        """Optional sidecar: never change the terminal local transcription result."""
-        from .model_lifecycle import write_json_atomic
-
-        with self._lock:
-            job = self._jobs[job_id]
-            audio, out_dir, evidence, channel, important = (
-                job.request.audio, job.out_dir, job.evidence_status,
-                job.request.channel_index, job.request.important)
-        script = Path(__file__).resolve().parents[2] / "scripts" / "asr-professional-cloud.ps1"
-        command = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script),
-                   "-Audio", str(audio), "-Important" if important else "-QualityReview", "-AutomaticReview",
-                   "-LocalOutDir", str(out_dir), "-EvidenceStatus", evidence, "-Json"]
-        if channel is not None:
-            command.extend(["-ChannelIndex", str(channel)])
-        try:
-            done = subprocess.run(command, capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace", timeout=86500,
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            receipt = json.loads(done.stdout)
-            if not isinstance(receipt, dict):
-                raise ValueError("invalid cloud receipt")
-            status = str(receipt.get("status") or "failed")
-            error_code = str(receipt.get("error_code") or "")
-            result_path = str(receipt.get("result_path") or "")
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            status, error_code, result_path = "failed", "cloud_review_process_failed", ""
-        sidecar = out_dir / "cloud.review.json"
-        if not sidecar.is_file():
-            try:
-                write_json_atomic(sidecar, {"schema": "zh_asr.cloud_review.v1",
-                    "status": status, "error_code": error_code,
-                    "cloud_result_path": result_path, "local_text_rewritten": False})
-            except OSError:
+            if not reasons or not audio.is_file():
                 return
-        with self._lock:
+            config = load_cloud_config(self.root / "configs" / "models.yaml")
+            state = auto_cloud_status(self.root / "outputs" / "cloud-jobs" /
+                                      "auto-cloud-state.json", config)
+            payload = {"schema": "zh_asr.cloud_review.v1",
+                "review_reasons": reasons, "cloud_upload_performed": False,
+                "local_text_rewritten": False,
+                "source_audio_sha256": job.request.audio_sha256}
+            if state["status"] == "paused":
+                payload.update({"status": "skipped", "error_code": "auto_cloud_paused",
+                    "pause_reason": state["reason"],
+                    "message": state.get("message") or "云端未跑"})
+            else:
+                duration_sec = probe_duration_ms(audio) / 1000
+                profile = select_model(config, duration_sec=duration_sec)
+                model = config["models"][profile]
+                if free_period_expired(model):
+                    payload.update({"status": "skipped", "error_code": "free_period_expired",
+                        "pause_reason": "free_period_expired", "model": model["id"],
+                        "message": pause_message("free_period_expired")})
+                else:
+                    script = self.root / "scripts" / "asr-professional-cloud.ps1"
+                    quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+                    command = (f"& {quote(script)} -Audio {quote(audio)} "
+                        f"-{'Important' if important else 'QualityReview'} -AutomaticReview "
+                        f"-LocalOutDir {quote(out_dir)} -EvidenceStatus {quote(evidence)} "
+                        "-RuntimePrincipal Codex")
+                    if job.request.channel_index is not None:
+                        command += f" -ChannelIndex {job.request.channel_index}"
+                    command += " -Json"
+                    payload.update({"status": "pending_ai_session", "model": model["id"],
+                        "message": "疑难录音，等 AI 会话补跑云端复核",
+                        "next_command": command,
+                        "runtime_principal_note": (
+                            "-RuntimePrincipal 须与实际调用方一致：Codex 桌面版用 Codex（默认），"
+                            "Claude 会话及其子代理用 Claude。")})
+            sidecar = out_dir / "cloud.review.json"
+            write_json_atomic(sidecar, payload)
             job.outputs["cloud_review"] = str(sidecar)
-            self._persist_jobs_locked()
+        except (CloudReviewError, OSError, ValueError, RuntimeError):
+            return
 
     def _process_job(self, job_id: str) -> None:
         try:
@@ -1036,13 +1016,13 @@ class TranscriptionService:
                 job.message = "Completed." if result.returncode == 0 else "Transcription command failed."
                 job.finished_at = time.time()
                 job.updated_at = job.finished_at
+                if result.returncode == 0:
+                    self._mark_cloud_review_if_eligible(job)
                 if not self._persist_jobs_locked() and result.returncode == 0:
                     self._mark_job_persistence_degraded_locked(
                         job,
                         "Transcription completed, but terminal job history is not durable; transcription output files may already exist.",
                     )
-            if result.returncode == 0:
-                self._queue_cloud_if_eligible(job_id)
         except GpuBrokerConflict as exc:
             with self._lock:
                 if job.status != "canceled":

@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 sys.path.insert(0, str(ROOT / "src"))
 from zh_asr.cloud_review import (CloudReviewError, auto_cloud_status,
     compare_text, load_cloud_config, local_review_signals, pause_message)
@@ -60,12 +63,49 @@ def _link_result(group: dict, result_path: Path) -> bool:
     return True
 
 
-def candidates(jobs_file: Path) -> list[dict]:
+def _matching_source(path: Path, expected_hash: str, hashes: dict[Path, str]) -> bool:
+    if not path.is_file():
+        return False
+    if not SHA256.fullmatch(expected_hash):
+        return True  # Older job snapshots did not always retain a source digest.
+    if path not in hashes:
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            hashes[path] = digest.hexdigest()
+        except OSError:
+            return False
+    return hashes[path].casefold() == expected_hash.casefold()
+
+
+def _recover_source(audio: Path, expected_hash: str, roots: list[Path],
+                    hashes: dict[Path, str]) -> Path | None:
+    if not SHA256.fullmatch(expected_hash) or not audio.name:
+        return None
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            matches = root.rglob(audio.name)
+            for candidate in matches:
+                if _matching_source(candidate, expected_hash, hashes):
+                    return candidate.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def candidates(jobs_file: Path, *, recovery_roots: list[Path] | None = None,
+               missing_sources: list[dict] | None = None) -> list[dict]:
     data = json.loads(jobs_file.read_text(encoding="utf-8"))
     if data.get("schema") != "zh_asr.jobs.v1" or not isinstance(data.get("jobs"), list):
         raise ValueError("jobs_schema_invalid")
     groups: dict[tuple[str, int | None], dict] = {}
     retained: dict[tuple[str, int | None], tuple[str, str]] = {}
+    hashes: dict[Path, str] = {}
+    roots = recovery_roots or []
     ordered = sorted(data["jobs"], key=lambda item: (
         item.get("request", {}).get("important") is True,
         item.get("finished_at") or 0), reverse=True)
@@ -76,7 +116,7 @@ def candidates(jobs_file: Path) -> list[dict]:
             continue
         out_dir = Path(str(job.get("out_dir") or ""))
         audio = Path(str(request.get("audio") or ""))
-        if not out_dir.is_dir() or not audio.is_file():
+        if not out_dir.is_dir():
             continue
         audio_hash = str(request.get("audio_sha256") or "")
         key = ((audio_hash or str(audio)).casefold(), request.get("channel_index"))
@@ -99,6 +139,19 @@ def candidates(jobs_file: Path) -> list[dict]:
             evidence_status=str(job.get("evidence_status") or ""), important=important)
         if not reasons:
             continue
+        recovered = False
+        original_audio = str(audio)
+        if not _matching_source(audio, audio_hash, hashes):
+            replacement = _recover_source(audio, audio_hash, roots, hashes)
+            if replacement is None:
+                if missing_sources is not None:
+                    missing_sources.append({"job_id": job.get("job_id"),
+                        "out_dir": str(out_dir), "original_audio": original_audio,
+                        "audio_sha256": audio_hash,
+                        "reason": "source_missing_or_hash_mismatch"})
+                continue
+            audio = replacement
+            recovered = True
         run = {"job_id": job.get("job_id"), "out_dir": str(out_dir),
                "evidence_status": str(job.get("evidence_status") or ""),
                "important": important, "reasons": reasons}
@@ -106,6 +159,7 @@ def candidates(jobs_file: Path) -> list[dict]:
             groups[key]["local_runs"].append(run)
         else:
             groups[key] = {"job_id": run["job_id"], "audio": str(audio),
+                "original_audio": original_audio, "source_recovered": recovered,
                 "out_dir": str(out_dir), "evidence_status": run["evidence_status"],
                 "important": important, "audio_sha256": audio_hash,
                 "channel_index": request.get("channel_index"), "reasons": reasons,
@@ -122,11 +176,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--jobs", type=Path, default=ROOT / "outputs" / "api" / "jobs.json")
     parser.add_argument("--max-files", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--recover-root", type=Path, action="append",
+                        help="search matching filenames here; accept only an exact SHA-256 match")
     parser.add_argument("--runtime-principal", choices=("Codex", "Claude"), default="Codex",
                         help="real caller checked by the Secret Broker; Claude sessions pass Claude")
     args = parser.parse_args(argv)
     try:
-        selected = candidates(args.jobs)
+        missing_sources: list[dict] = []
+        recovery_roots = args.recover_root if args.recover_root is not None else [Path("E:/Music")]
+        selected = candidates(args.jobs, recovery_roots=recovery_roots,
+                              missing_sources=missing_sources)
     except (OSError, ValueError) as exc:
         print(json.dumps({"status": "blocked", "error_code": str(exc)}))
         return 2
@@ -134,7 +193,10 @@ def main(argv: list[str] | None = None) -> int:
         selected = selected[:args.max_files]
     if args.dry_run:
         print(json.dumps({"status": "preview", "count": len(selected),
-                          "jobs": selected}, ensure_ascii=False))
+                          "jobs": selected, "missing_source_count": len(missing_sources),
+                          "missing_source_jobs": missing_sources,
+                          "recovered_source_count": sum(group["source_recovered"] for group in selected)},
+                          ensure_ascii=False))
         return 0
     try:
         config = load_cloud_config(ROOT / "configs" / "models.yaml")
@@ -152,6 +214,8 @@ def main(argv: list[str] | None = None) -> int:
                 _skip_group(group, state["reason"])
         print(json.dumps({"status": "stopped", "selected": len(selected),
             "attempted": 0, "reused": reused,
+            "missing_source_count": len(missing_sources),
+            "missing_source_jobs": missing_sources,
             "pause_reason": state["reason"]}, ensure_ascii=False))
         return 3
     results = []
@@ -217,8 +281,12 @@ def main(argv: list[str] | None = None) -> int:
     status = ("stopped" if stopped else "completed" if all(
         item["status"] in {"succeeded", "reused"} for item in results)
         else "completed_with_failures")
+    if status == "completed" and missing_sources:
+        status = "completed_with_missing_sources"
     print(json.dumps({"status": status, "selected": len(selected),
-        "attempted": len(results), "results": results}, ensure_ascii=False))
+        "attempted": len(results), "results": results,
+        "missing_source_count": len(missing_sources),
+        "missing_source_jobs": missing_sources}, ensure_ascii=False))
     return 0 if status == "completed" else 3
 
 

@@ -171,6 +171,7 @@ $Result = [ordered]@{
   job_id = $FinalJob.job_id
   out_dir = $FinalJob.out_dir
   outputs = $FinalJob.outputs
+  cloud_review = $FinalJob.cloud_review
   message = $FinalJob.message
   deduplicated = [bool]$Submit.deduplicated
   next_status_command = "Invoke-RestMethod -Uri '$StatusUri'"
@@ -184,6 +185,11 @@ if ($Json) {
   Write-Host "Objective: $($Result.objective_outcome)"
   Write-Host "Job: $($Result.job_id)"
   Write-Host "Output: $($Result.out_dir)"
+  if ($Result.cloud_review.status -eq 'pending_ai_session') {
+    Write-Host "Cloud review: $($Result.cloud_review.message)"
+    Write-Host "Cloud command: $($Result.cloud_review.next_command)"
+    Write-Host $Result.cloud_review.runtime_principal_note
+  }
   if ($Result.outputs) {
     $Result.outputs.PSObject.Properties | ForEach-Object {
       Write-Host "$($_.Name): $($_.Value)"

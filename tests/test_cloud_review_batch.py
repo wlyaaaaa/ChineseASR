@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -23,6 +24,60 @@ def load_batch():
 
 
 class CloudBatchTests(unittest.TestCase):
+    def test_pending_job_remains_candidate_and_missing_source_is_reported(self):
+        batch = load_batch()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "old" / "call.wav"
+            recovered = root / "music" / "calls" / "call.wav"
+            recovered.parent.mkdir(parents=True)
+            recovered.write_bytes(b"matching recording")
+            digest = hashlib.sha256(recovered.read_bytes()).hexdigest()
+            out_dir = root / "job-1"
+            out_dir.mkdir()
+            (out_dir / "quality.review.json").write_text(
+                '{"needs_review":true}', encoding="utf-8")
+            (out_dir / "cloud.review.json").write_text(json.dumps({
+                "status": "pending_ai_session"}), encoding="utf-8")
+            jobs = root / "jobs.json"
+            jobs.write_text(json.dumps({"schema": "zh_asr.jobs.v1", "jobs": [{
+                "job_id": "job-1", "status": "succeeded", "out_dir": str(out_dir),
+                "evidence_status": "verified", "request": {"audio": str(original),
+                    "audio_sha256": digest, "mode": "strict", "important": False}}]}),
+                encoding="utf-8")
+
+            missing = []
+            self.assertEqual([], batch.candidates(jobs, missing_sources=missing))
+            self.assertEqual("job-1", missing[0]["job_id"])
+            preview = io.StringIO()
+            with redirect_stdout(preview):
+                code = batch.main(["--jobs", str(jobs), "--dry-run",
+                    "--recover-root", str(root / "absent")])
+            self.assertEqual(0, code)
+            payload = json.loads(preview.getvalue())
+            self.assertEqual(1, payload["missing_source_count"])
+            self.assertEqual("job-1", payload["missing_source_jobs"][0]["job_id"])
+
+            preview = io.StringIO()
+            with redirect_stdout(preview):
+                code = batch.main(["--jobs", str(jobs), "--dry-run",
+                    "--recover-root", str(root / "music")])
+            self.assertEqual(0, code)
+            payload = json.loads(preview.getvalue())
+            self.assertEqual(0, payload["missing_source_count"])
+            self.assertEqual(1, payload["recovered_source_count"])
+            self.assertEqual(str(recovered.resolve()), payload["jobs"][0]["audio"])
+            self.assertTrue(payload["jobs"][0]["source_recovered"])
+
+            recovered.write_bytes(b"different recording")
+            preview = io.StringIO()
+            with redirect_stdout(preview):
+                batch.main(["--jobs", str(jobs), "--dry-run",
+                    "--recover-root", str(root / "music")])
+            payload = json.loads(preview.getvalue())
+            self.assertEqual(1, payload["missing_source_count"])
+            self.assertEqual(0, payload["count"])
+
     def test_dedupes_same_audio_but_preserves_selected_channels_and_important(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
