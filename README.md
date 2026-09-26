@@ -192,6 +192,8 @@ cd <repo-root>
 
 每次尝试都在被 Git 忽略的 `outputs\cloud-jobs` 留请求、供应商原始结果、投影结果、原音哈希、模型、时间及每段 usage；这些是作业记录，本地不预留或计算剩余额度。百炼官方的 3.1 计量是 Token，3.0 是音频秒数，但本地不以此拦截调用。
 
+3.1 Flash-Message 的 WebSocket `result-generated.payload.usage` 是该段任务截至当前事件的**累计**用量，`task-finished.payload.usage` 是最终累计用量（[官方服务端事件说明](https://help.aliyun.com/zh/model-studio/qwen-asr-message-server-events)）。结果投影每段优先取最后一个非空 `task-finished` 用量；若完成事件没有用量，取最后一个非空 `result-generated` 用量，不把递增快照相加。作业级 `usage` 只在所有音频段均有相同的数值字段时逐字段相加；任何一段缺失或字段不一致则保留 `null`，不把未知当作零。这里的 `duration` 是供应商逐段报告的累计音频秒数之和，不是去重后的源音时长，也不用于本地额度计算。
+
 免费期截止日写在 `configs/models.yaml` 的每个云模型 `free_until` 中，按北京时间的带时区时刻作不含截止点的比较。3.1 两款按本人转述的 2026-12-21 暂取当日 00:00 早停；3.0 暂取 2026-09-27 02:00，均不是控制台实时核验的到期时刻。自动模式过期不上传并写 `cloud.review.json`；换成新模型或更新确有新免费期的日期后恢复。显式 `-CloudUploadAuthorized` 不受日期阻断，但过期结果标「可能计费」。这只比日期，不算用量。
 
 百炼返回免费额度用尽、欠费、余额不足、无权限或模型下线类错误时，`outputs\cloud-jobs\auto-cloud-state.json` 记录停用原因，后续疑难作业保留本地转写并在 `cloud.review.json` 写明云端未跑及原因。`python scripts/cloud-review-state.py status` 查看状态。本人说恢复时运行 `python scripts/cloud-review-state.py resume`；配置新增或替换模型 ID、更新免费期日期，或 `credit_cycle` 更新为实际新额度时，也解除旧供应商停用。网络抖动、超时、限流与服务端 5xx 只记本次失败，不触发持久停用。本人决定不启用百炼的「免费额度用完即停」，此入口不以该开关为条件。

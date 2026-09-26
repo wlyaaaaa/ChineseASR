@@ -513,6 +513,36 @@ def _provider_chunk_text(chunk: dict[str, Any], protocol: str) -> str:
     return "".join(sentences[key] for key in sorted(sentences)).strip()
 
 
+def _provider_chunk_usage(chunk: dict[str, Any], protocol: str) -> dict[str, Any] | None:
+    """Select one cumulative usage snapshot for this provider task."""
+    if protocol == "websocket":
+        events = chunk.get("raw_events") or []
+        for kind in ("task-finished", "result-generated"):
+            for event in reversed(events):
+                if (event.get("header") or {}).get("event") != kind:
+                    continue
+                usage = (event.get("payload") or {}).get("usage")
+                if isinstance(usage, dict) and usage:
+                    return usage
+    usage = chunk.get("usage")
+    return usage if isinstance(usage, dict) and usage else None
+
+
+def _job_usage(chunks: list[dict[str, Any]], expected_count: int) -> dict[str, int | float] | None:
+    """Sum final per-task snapshots only when every chunk has the same numeric fields."""
+    if not chunks or len(chunks) != expected_count:
+        return None
+    usages = [chunk.get("usage") for chunk in chunks]
+    if any(not isinstance(usage, dict) or not usage for usage in usages):
+        return None
+    fields = set(usages[0])
+    if any(set(usage) != fields for usage in usages):
+        return None
+    if any(type(usage[field]) not in (int, float) for usage in usages for field in fields):
+        return None
+    return {field: sum(usage[field] for usage in usages) for field in sorted(fields)}
+
+
 def finalize_cloud_result(intent_path: Path, root: Path, *,
                           provider_path: Path | None = None,
                           broker_error: str = "", state_path: Path | None = None,
@@ -532,7 +562,7 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
         "source_audio_bytes": intent.get("source_audio_bytes"),
         "selected_channel": intent.get("channel_index"),
         "billing_warning": intent.get("billing_warning", ""),
-        "text": "", "chunks": [], "result_path": str(result_path),
+        "text": "", "chunks": [], "usage": None, "result_path": str(result_path),
         "completed_utc": datetime.now(timezone.utc).isoformat()}
     if provider_path and provider_path.is_file():
         if not provider_path.resolve().is_relative_to(root):
@@ -562,7 +592,7 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
             chunks.append({"index": raw["index"], "start_ms": raw["start_ms"],
                 "end_ms": raw["end_ms"], "audio_sha256": raw["audio_sha256"],
                 "provider_request_id": raw.get("provider_request_id"),
-                "text": text, "usage": raw.get("usage"),
+                "text": text, "usage": _provider_chunk_usage(raw, str(provider.get("protocol"))),
                 "raw_response": raw.get("raw_response"),
                 "raw_events": raw.get("raw_events")})
         texts = [chunk["text"] for chunk in chunks if chunk["text"]]
@@ -583,6 +613,7 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
             provider_request_id=provider.get("provider_request_id"),
             provider_result_path=str(provider_path),
             chunks=chunks, text="\n".join(texts),
+            usage=_job_usage(chunks, len(expected_chunks)),
             started_utc=provider.get("started_utc"),
             completed_utc=provider.get("completed_utc"),
             reused_chunks=provider.get("reused_chunks", 0),

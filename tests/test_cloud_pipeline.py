@@ -21,16 +21,16 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs" / "models.yaml"
 
 
-def _wav(path: Path, *, stereo: bool = False) -> None:
+def _wav(path: Path, *, stereo: bool = False, frames: int = 1600) -> None:
     with wave.open(str(path), "wb") as handle:
         handle.setnchannels(2 if stereo else 1)
         handle.setsampwidth(2)
         handle.setframerate(16000)
         if stereo:
             handle.writeframes(((0).to_bytes(2, "little", signed=True) +
-                                (12000).to_bytes(2, "little", signed=True)) * 1600)
+                                (12000).to_bytes(2, "little", signed=True)) * frames)
         else:
-            handle.writeframes(b"\x00\x00" * 1600)
+            handle.writeframes(b"\x00\x00" * frames)
 
 
 class CloudPipelineTests(unittest.TestCase):
@@ -216,6 +216,90 @@ class CloudPipelineTests(unittest.TestCase):
         self.assertEqual("succeeded", final["status"])
         self.assertEqual("第一句", final["text"])
         self.assertEqual(4, final["chunks"][0]["usage"]["total_tokens"])
+
+    def test_websocket_usage_prefers_final_task_and_sums_one_snapshot_per_chunk(self) -> None:
+        _wav(self.audio, frames=32000)
+        intent = self.intent(model_profile="message", chunk_sec=1, overlap_sec=0)
+        ready = prepare_cloud_request(intent, self.root, CONFIG)
+        request = json.loads(Path(ready["request_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(2, len(request["chunks"]))
+        first_early = {"duration": 1, "input_tokens": 30,
+            "output_tokens": 1, "total_tokens": 31}
+        first_later = {"duration": 1, "input_tokens": 60,
+            "output_tokens": 3, "total_tokens": 63}
+        first_final = {"duration": 1, "input_tokens": 80,
+            "output_tokens": 4, "total_tokens": 84}
+        second_early = {"duration": 1, "input_tokens": 40,
+            "output_tokens": 1, "total_tokens": 41}
+        second_last = {"duration": 1, "input_tokens": 70,
+            "output_tokens": 3, "total_tokens": 73}
+
+        def record(binding, events):
+            return {"index": binding["index"], "start_ms": binding["start_ms"],
+                "end_ms": binding["end_ms"], "audio_sha256": binding["audio_sha256"],
+                "provider_request_id": f"task-{binding['index']}",
+                "usage": None, "raw_events": events}
+
+        def generated(sentence, usage):
+            return {"header": {"event": "result-generated"}, "payload": {
+                "output": {"sentence": {"sentence_id": 1, "sentence_end": True,
+                                         "text": sentence}}, "usage": usage}}
+
+        chunks = [record(request["chunks"][0], [
+            generated("第一段", first_early), generated("第一段", first_later),
+            {"header": {"event": "task-finished"},
+             "payload": {"usage": first_final}}]),
+            record(request["chunks"][1], [
+                generated("第二段", second_early), generated("第二段", second_last),
+                {"header": {"event": "task-finished"}, "payload": {"usage": None}}])]
+        provider = self.root / (request["job_id"] + ".provider.json")
+        body = {"schema": "zh_asr.dashscope_transport_result.v1",
+            "job_id": request["job_id"], "status": "succeeded", "model": request["model"],
+            "protocol": "websocket", "credential_result": "Success",
+            "cloud_upload_performed": True,
+            "source_audio_sha256": request["source_audio_sha256"], "chunks": chunks}
+        provider.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        final = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
+        self.assertEqual(first_final, final["chunks"][0]["usage"])
+        self.assertEqual(second_last, final["chunks"][1]["usage"])
+        self.assertEqual({"duration": 2, "input_tokens": 150,
+                          "output_tokens": 7, "total_tokens": 157}, final["usage"])
+        saved = json.loads((self.root / (request["job_id"] + ".result.json")).read_text(
+            encoding="utf-8"))
+        self.assertEqual(final["usage"], saved["usage"])
+
+        for event in body["chunks"][1]["raw_events"]:
+            event["payload"].pop("usage", None)
+        provider.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        incomplete = finalize_cloud_result(intent, self.root, provider_path=provider,
+                                           config_path=CONFIG)
+        self.assertIsNone(incomplete["chunks"][1]["usage"])
+        self.assertIsNone(incomplete["usage"])
+
+    def test_websocket_usage_from_task_finished_without_intermediate_usage(self) -> None:
+        intent = self.intent(model_profile="message")
+        ready = prepare_cloud_request(intent, self.root, CONFIG)
+        request = json.loads(Path(ready["request_path"]).read_text(encoding="utf-8"))
+        binding = request["chunks"][0]
+        usage = {"duration": 1, "input_tokens": 42,
+            "output_tokens": 2, "total_tokens": 44}
+        provider = self.root / (request["job_id"] + ".provider.json")
+        provider.write_text(json.dumps({"schema": "zh_asr.dashscope_transport_result.v1",
+            "job_id": request["job_id"], "status": "succeeded", "model": request["model"],
+            "protocol": "websocket", "credential_result": "Success",
+            "cloud_upload_performed": True,
+            "source_audio_sha256": request["source_audio_sha256"],
+            "chunks": [{"index": binding["index"], "start_ms": binding["start_ms"],
+                "end_ms": binding["end_ms"], "audio_sha256": binding["audio_sha256"],
+                "usage": None, "raw_events": [
+                    {"header": {"event": "result-generated"}, "payload": {
+                        "output": {"sentence": {"sentence_id": 1,
+                            "sentence_end": True, "text": "一句话"}}}},
+                    {"header": {"event": "task-finished"},
+                     "payload": {"usage": usage}}]}]}, ensure_ascii=False), encoding="utf-8")
+        final = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
+        self.assertEqual(usage, final["chunks"][0]["usage"])
+        self.assertEqual(usage, final["usage"])
 
     def test_cli_handoff_marks_broker_failure_without_secret_or_upload(self) -> None:
         intent = self.intent()
