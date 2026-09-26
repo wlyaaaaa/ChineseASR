@@ -200,6 +200,8 @@ cd <repo-root>
 
 本地转写的 `quality.review.json` 标 `needs_review`、两引擎分歧、`[疑似]`、`provisional` 或作业的 `-Important` 标记会触发自动复核。本地 API 服务只在 `cloud.review.json` 标记 `pending_ai_session`，并把状态放入 `asr-smart.ps1 -Json` 的 `cloud_review` 字段；服务自身不上传。`asr-smart` 若先返回运行中，AI 应按 `next_status_command` 查询终态，再读取 `cloud_review`。处理该录音的 AI 会话读到待补跑状态后，在自己的进程链中执行侧车给出的 `asr-professional-cloud.ps1 -Audio <原音> -QualityReview`（重要录音改用 `-Important`）`-AutomaticReview -LocalOutDir <结果目录> -EvidenceStatus <本地状态> -Json`。密码中心自己认出实际调用方（Codex 桌面版、Claude 会话及它们派出的子代理），不用传调用方参数。停用或所选模型免费期到期时，本地只记录原因，不安排上传。
 
+配置、音频检查或提示写入失败时，本地作业仍为 `succeeded`，原有 `cloud_review` 字段标 `failed` / `cloud_review_not_scheduled`，写明「云复核未安排成功」及异常原因；即使 `cloud.review.json` 未能写入，失败仍随作业历史保存，重启后可查询。本地稿保留，修好原因后可沿下面的批量或单次入口恢复；已恢复的侧车结果优先于历史失败提示。
+
 `python scripts/cloud-review-batch.py --dry-run` 列出现有疑难作业、待补跑状态以及源音失效的作业号；在 `E:\Music` 找到同名且 SHA-256 完全一致的源音时，预览会显示恢复的新路径。也可用 `--recover-root <目录>` 指定搜索位置；找不到的作业须由 AI 确认新源音路径后单独补跑。批量执行由 AI 会话运行 `python scripts/cloud-review-batch.py`；先用 `--dry-run` 查看候选。去掉 `--dry-run` 才上传。云结果保存在被 Git 忽略的 `outputs\cloud-jobs`，本地结果目录另写 `cloud.review.json` 并排保留文本与差异，不静默覆盖正文。云调用失败会
 明确返回失败原因，不会静默冒充本地结果。运行时重绑缺失时不上传，重绑后可按原用途重试；网络、
 限流、超时或供应商 5xx 只影响本次，不盲目自动重发同一段音频；需要时以原音和已留结果检查后再试。其它云失败明确建议改用本地

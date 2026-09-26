@@ -291,6 +291,7 @@ class Job:
     stdout_tail: str = ""
     stderr_tail: str = ""
     outputs: dict[str, str] = field(default_factory=dict)
+    cloud_review_fallback: dict = field(default_factory=dict)
     evidence_status: str = "pending"
     evidence_failures: list[dict[str, str]] = field(default_factory=list)
     objective_outcome: str = "indeterminate"
@@ -323,7 +324,7 @@ class Job:
             "audio_result_status": self.objective_outcome,
             "objective_execution_status": self.objective_execution_status,
             "quality_result": _quality_review_projection(self.outputs),
-            "cloud_review": _cloud_review_projection(self.outputs),
+            "cloud_review": _cloud_review_projection(self.outputs, self.cloud_review_fallback),
             "conflicts": [conflict.to_dict() for conflict in self.conflicts],
         }
 
@@ -349,19 +350,21 @@ def _quality_review_projection(outputs: Mapping[str, str]) -> dict:
         return {**unknown, "status": "unreadable"}
 
 
-def _cloud_review_projection(outputs: Mapping[str, str]) -> dict:
+def _cloud_review_projection(outputs: Mapping[str, str], fallback: dict | None = None) -> dict:
     path = outputs.get("cloud_review")
     if not path:
-        return {"status": "not_required"}
+        return fallback or {"status": "not_required"}
     try:
+        if fallback and Path(path).stat().st_mtime <= fallback.get("failed_at", 0):
+            return fallback
         value = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(value, dict) or value.get("schema") != "zh_asr.cloud_review.v1":
-            return {"status": "unreadable"}
+            return fallback or {"status": "unreadable"}
         return {key: value[key] for key in (
             "status", "message", "review_reasons", "pause_reason", "error_code",
             "next_command") if key in value}
     except (OSError, ValueError, TypeError):
-        return {"status": "unreadable"}
+        return fallback or {"status": "unreadable"}
 
 
 ProcessRunner = Callable[[Job], ProcessResult]
@@ -613,6 +616,12 @@ class TranscriptionService:
             }
             if isinstance(record.get("outputs"), dict)
             else {},
+            cloud_review_fallback=(
+                record["cloud_review"]
+                if isinstance(record.get("cloud_review"), dict)
+                and record["cloud_review"].get("error_code") == "cloud_review_not_scheduled"
+                else {}
+            ),
             evidence_status=str(record.get("evidence_status") or "pending"),
             evidence_failures=_coerce_failure_list(record.get("evidence_failures")),
             objective_outcome=str(record.get("objective_outcome") or "indeterminate"),
@@ -878,23 +887,26 @@ class TranscriptionService:
 
     def _mark_cloud_review_if_eligible(self, job: Job) -> None:
         """Write the AI handoff before publishing the terminal job state."""
-        from .audio_quality import probe_duration_ms
-        from .cloud_review import (CloudReviewError, auto_cloud_status,
-                                   free_period_expired, load_cloud_config,
-                                   local_review_signals, pause_message, select_model)
-        from .model_lifecycle import write_json_atomic
-
         if not self._cloud_review_marker_enabled or job.status != "succeeded":
             return
         if job.request.mode == "quick" and not job.request.important:
             return
         out_dir, audio, evidence, important = (
             job.out_dir, job.request.audio, job.evidence_status, job.request.important)
+        reasons: list[str] = []
         try:
+            from .audio_quality import probe_duration_ms
+            from .cloud_review import (auto_cloud_status, free_period_expired,
+                                       load_cloud_config, local_review_signals,
+                                       pause_message, select_model)
+            from .model_lifecycle import write_json_atomic
+
             reasons, _ = local_review_signals(out_dir, evidence_status=evidence,
                                               important=important)
-            if not reasons or not audio.is_file():
+            if not reasons:
                 return
+            if not audio.is_file():
+                raise FileNotFoundError(f"源音频不可用：{audio}")
             config = load_cloud_config(self.root / "configs" / "models.yaml")
             state = auto_cloud_status(self.root / "outputs" / "cloud-jobs" /
                                       "auto-cloud-state.json", config)
@@ -929,8 +941,19 @@ class TranscriptionService:
             sidecar = out_dir / "cloud.review.json"
             write_json_atomic(sidecar, payload)
             job.outputs["cloud_review"] = str(sidecar)
-        except (CloudReviewError, OSError, ValueError, RuntimeError):
-            return
+            job.cloud_review_fallback = {}
+        except Exception as exc:
+            # The optional handoff must not erase a successful local transcript.
+            # Persist the failure in jobs.json even when the sidecar cannot be
+            # written; a later sidecar from the existing recovery entry wins.
+            job.cloud_review_fallback = {
+                "status": "failed", "error_code": "cloud_review_not_scheduled",
+                "message": f"云复核未安排成功：{type(exc).__name__}: {exc}",
+                "failed_at": time.time(),
+                "review_reasons": reasons, "cloud_upload_performed": False,
+                "local_text_rewritten": False,
+            }
+            job.outputs["cloud_review"] = str(out_dir / "cloud.review.json")
 
     def _process_job(self, job_id: str) -> None:
         try:
