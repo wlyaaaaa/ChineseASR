@@ -221,7 +221,7 @@ cd <repo-root>
 
 核心依赖文件 `requirements-core.txt` 固定 `funasr==1.4.14`。Fun-ASR-Nano 是面向 GPU 的较重模型，先完成 CUDA/PyTorch 与核心依赖安装，再按需下载；不需要 Nano 的机器无需额外安装模型。
 
-`pyproject.toml` 有意不声明运行依赖：`pip install .` 只安装项目入口，不会下载 CUDA/PyTorch、模型框架或模型权重。完整本机环境按上面的安装脚本和 `requirements-core.txt` 配置；CI 仅安装运行无模型单元测试所需的轻量依赖。
+`pyproject.toml` 有意不声明运行依赖：`pip install .` 只安装项目入口，不会下载 CUDA/PyTorch、模型框架或模型权重。完整本机环境按上面的安装脚本和 `requirements-core.txt` 配置；CI 直接读取项目的核心、听写和 Qwen 依赖文件安装测试环境，不另列软件包清单，不下载模型权重或运行 GPU 推理。
 
 下载 quick / secondary 默认需要的 SenseVoice：
 
