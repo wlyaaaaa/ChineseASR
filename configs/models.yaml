@@ -145,3 +145,32 @@ profiles:
   high_quality:
     primary_engine: fireredasr2-llm
     secondary_engine: qwen3-asr-1.7b
+
+# File transcription cloud review only. No cloud engine is a local ASR default.
+# Change credit_cycle only when a new provider grant is confirmed; it resumes a
+# provider-error pause without calculating local credit.
+cloud_review:
+  region: cn-beijing
+  credit_cycle: '2026-09-26-initial'
+  routes:
+    short: short
+    long: message
+    speaker: short
+    dialect: short
+    hotwords: message
+  models:
+    short:
+      id: qwen-audio-3.1-asr-flash
+      api: http_base64
+      endpoint: https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
+      max_chunk_sec: 120
+    message:
+      id: qwen-audio-3.1-asr-flash-message
+      api: websocket_pcm
+      endpoint: wss://dashscope.aliyuncs.com/api-ws/v1/inference
+      max_chunk_sec: 30
+    legacy:
+      id: qwen-audio-3.0-asr-flash
+      api: legacy_http_base64
+      endpoint: https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
+      max_chunk_sec: 180

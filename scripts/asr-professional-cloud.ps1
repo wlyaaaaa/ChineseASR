@@ -11,6 +11,25 @@ param(
 
     [switch] $CloudUploadAuthorized,
 
+    [switch] $AutomaticReview,
+
+    [switch] $Legacy,
+
+    [string] $ModelProfile = '',
+
+    [string] $LocalOutDir = '',
+
+    [ValidateSet('', 'verified', 'provisional', 'unavailable', 'pending', 'not_applicable')]
+    [string] $EvidenceStatus = '',
+
+    [hashtable] $Hotwords = @{},
+
+    [switch] $SpeakerDiarization,
+
+    [switch] $KeepDialect,
+
+    [Nullable[int]] $ChannelIndex = $null,
+
     [ValidateRange(1, 180)]
     [int] $ChunkSec = 180,
 
@@ -30,7 +49,7 @@ $OutputEncoding = $utf8NoBom
 
 $brokerPath = 'C:\ProgramData\PCConfig\AuthorityHost\tools\Invoke-SecretBroker.ps1'
 # One registered, hash-pinned worker owns both explicitly labelled request purposes.
-$brokerTarget = 'qwen-audio3-asr-important-once'
+$brokerTarget = 'qwen-audio-asr-review-once'
 $importantRequestSchema = 'chineseasr.qwen-audio3-important-request.v1'
 $qualityReviewRequestSchema = 'chineseasr.qwen-audio3-quality-review-request.v1'
 $importantResultSchema = 'chineseasr.qwen-audio3-important-result.v1'
@@ -129,11 +148,26 @@ if ($Important -and $QualityReview) {
 if (-not $Important -and -not $QualityReview) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'cloud_use_purpose_required' -ExitCode 2
 }
-if (-not $CloudUploadAuthorized) {
+if (-not $CloudUploadAuthorized -and -not $AutomaticReview) {
     Write-BoundedReceipt `
         -Status 'blocked' `
         -ErrorCode 'cloud_upload_authorization_required' `
         -ExitCode 2
+}
+if ($AutomaticReview -and -not $LocalOutDir) {
+    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'local_review_required' -ExitCode 2
+}
+if ($Legacy -and ($AutomaticReview -or $ModelProfile -or $SpeakerDiarization -or $KeepDialect)) {
+    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'legacy_options_unsupported' -ExitCode 2
+}
+if ($SpeakerDiarization -and $KeepDialect) {
+    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'speaker_and_dialect_conflict' -ExitCode 2
+}
+if ($ModelProfile -and $ModelProfile -notin @('short', 'message')) {
+    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'model_profile_invalid' -ExitCode 2
+}
+if ($ModelProfile -eq 'message' -and $SpeakerDiarization) {
+    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'speaker_model_required' -ExitCode 2
 }
 if ($OverlapSec -ge $ChunkSec) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'chunk_policy_invalid' -ExitCode 2
@@ -151,17 +185,32 @@ if (-not (Test-Path -LiteralPath $brokerPath -PathType Leaf)) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'secret_broker_unavailable' -ExitCode 2
 }
 
+$cloudMutex = [Threading.Mutex]::new($false, 'Global\ChineseASRCloudUploadOnce')
+$mutexHeld = $false
+try {
+    try { $mutexHeld = $cloudMutex.WaitOne([TimeSpan]::FromHours(24)) }
+    catch [Threading.AbandonedMutexException] { $mutexHeld = $true }
+}
+catch {
+    $cloudMutex.Dispose()
+    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'cloud_upload_busy' -ExitCode 2
+}
+if (-not $mutexHeld) {
+    $cloudMutex.Dispose()
+    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'cloud_upload_busy' -ExitCode 2
+}
+try {
 $null = New-Item -ItemType Directory -Path $resolvedRequestRoot -Force
-$pending = @(Get-ChildItem -LiteralPath $resolvedRequestRoot -Filter '*.pending.json' -File)
+$pending = @(Get-ChildItem -LiteralPath $resolvedRequestRoot -File | Where-Object { $_.Name -like '*.pending.json' -or $_.Name -like '*.pending31.json' })
 if ($pending.Count -ne 0) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'pending_request_ambiguous' -ExitCode 2
 }
 
 $jobId = [Guid]::NewGuid().ToString()
-$requestPath = Join-Path $resolvedRequestRoot ($jobId + '.pending.json')
+$requestPath = Join-Path $resolvedRequestRoot ($jobId + '.pending31.json')
 $resultPath = Join-Path $resolvedRequestRoot ($jobId + '.result.json')
 $request = [ordered]@{
-    schema = $selectedRequestSchema
+    schema = 'chineseasr.qwen-audio31-request.v1'
     job_id = $jobId
     purpose = $selectedPurpose
     cloud_upload_authorized = $true
@@ -172,6 +221,21 @@ $request = [ordered]@{
 }
 if ($Important) {
     $request['importance'] = 'important'
+}
+$request['automatic_review'] = [bool]$AutomaticReview
+$request['speaker_diarization'] = [bool]$SpeakerDiarization
+$request['keep_dialect'] = [bool]$KeepDialect
+$request['hotwords'] = $Hotwords
+if ($null -ne $ChannelIndex) { $request['channel_index'] = [int]$ChannelIndex }
+if ($EvidenceStatus) { $request['evidence_status'] = $EvidenceStatus }
+if ($ModelProfile) { $request['model_profile'] = $ModelProfile }
+if ($Legacy) { $request['model_profile'] = 'legacy' }
+if ($LocalOutDir) {
+    $localPath = [IO.Path]::GetFullPath($LocalOutDir)
+    if (-not (Test-Path -LiteralPath $localPath -PathType Container)) {
+        Write-BoundedReceipt -Status 'blocked' -ErrorCode 'local_result_missing' -ExitCode 2
+    }
+    $request['local_out_dir'] = $localPath
 }
 [IO.File]::WriteAllText(
     $requestPath,
@@ -191,7 +255,7 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $requestPath -PathType Leaf) {
-        $unclaimedPath = Join-Path $resolvedRequestRoot ($jobId + '.unclaimed.json')
+        $unclaimedPath = Join-Path $resolvedRequestRoot ($jobId + '.unclaimed31.json')
         Move-Item -LiteralPath $requestPath -Destination $unclaimedPath -Force
     }
 }
@@ -307,3 +371,8 @@ if ([string]$result.status -ceq 'succeeded') {
     exit 0
 }
 exit 3
+}
+finally {
+    if ($mutexHeld) { $cloudMutex.ReleaseMutex() }
+    $cloudMutex.Dispose()
+}

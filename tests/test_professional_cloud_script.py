@@ -161,6 +161,16 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
             self.assertEqual("none", payload["local_fallback_recommendation"])
             self.assertFalse(queue.exists())
 
+    def test_automatic_review_requires_existing_local_review_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "uncertain.wav"
+            _write_wav(audio)
+            result = self._run("-Audio", str(audio), "-QualityReview", "-AutomaticReview")
+            self.assertEqual(2, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("local_review_required", payload["error_code"])
+            self.assertFalse(payload["cloud_upload_performed"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,7 +40,7 @@
 - **低幻觉和可复核**：双模型分歧、静音出字、模板废话、异常重复、繁体残留、超长无标点等都会进入 audit / metrics / review。
 - **适合 AI Agent 调用**：`scripts\asr-smart.ps1` 通过本地 API 提交任务，快速返回 job 状态，避免长时间卡住命令行或上层 Agent。
 
-它是本地优先而不是云转写服务：默认路径不会上传音频。只有调用独立的云入口、明确标注本次是重要录音或已授权的存疑转写质量复核、并授权本次云上传时，才会把本机切片发送给阿里云百炼；模型、输出、wheelhouse 和私人评测数据仍保留在本机。
+它以本地转写为主。2026-09-26 本人授权疑难录音自动加跑阿里云百炼复核，无需逐次授权；本人决定阿里云账户没有余额，不开启「免费额度用完即停」，本地不计算额度。自动路径只判断录音是否疑难；云端若报额度、欠费、余额、权限或模型下线错误，就记录原因并停止后续自动上传。网络等临时错误只记本次失败。本地正文先保存，云结果另外保存并标出分歧；普通清楚录音和桌面听写不上传。
 
 ## 文件转写质量与模型维护
 
@@ -77,7 +77,7 @@ CI 在干净 Windows 运行器上安装 FFmpeg 和无 GPU 测试依赖，仍使�
 ## 不适合场景
 
 - 不愿意本地安装模型权重和 Python 环境。
-- 希望普通录音或整个文件夹自动上传云端转写；云入口只接受明确的重要录音，或已授权且当前选定的存疑本地转写质量复核，两种用途都须显式授权本次上传。
+- 希望普通清楚录音或整个文件夹无筛选地上传云端；自动云复核仅处理本地质量信号标出的疑难录音。
 - 需要英文、多语种或字幕生产工具链作为主目标。
 
 ## 默认模型策略
@@ -91,7 +91,7 @@ CI 在干净 Windows 运行器上安装 FFmpeg 和无 GPU 测试依赖，仍使�
 | `quick` | `sensevoice` | 单模型快速转写 |
 | 显式 GPU flagship | `fun-asr-nano` | `FunAudioLLM/Fun-ASR-Nano-2512`；需要 GPU，作为较重的 LLM-ASR 候选，不改变 quick 默认 |
 | 可选证据级词汇主引擎 | `fireredasr2-llm` | 隔离在 WSL 中运行；仅在显式选择时作为 strict 主引擎 |
-| 重要录音 / 存疑质量复核云入口 | `qwen-audio-3.0-asr-flash` | 独立脚本显式选择 `-Important` 或 `-QualityReview` 并授权本次上传；Key 经 Password Center SecretRef 注入，普通模式无法触发 |
+| 疑难录音云复核 | `qwen-audio-3.1-asr-flash` / `qwen-audio-3.1-asr-flash-message` | 短录音、方言、说话人分离用 Flash；热词及较长录音用 Message 分段实时流；3.0 保留显式后备。模型与路由见 `configs/models.yaml` |
 | 显式时间线/匿名说话人 baseline | `paraformer` | 固定 `speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4`，输出逐句 `sentence_info` 时间和 CAM++ 匿名聚类；已知两方通话的调用方可传 `--preset-spk-num 2`，省略时自动聚类；不改变 quick/strict 默认 |
 | 未接通的配置占位 | `whisper-large-v3` | 配置存在，但当前没有 Whisper adapter；不能把它当作已经可运行的 fallback |
 
@@ -119,12 +119,12 @@ cd <repo-root>
 .\scripts\asr-smart.ps1 -Audio C:\path\to\long.wav -Mode long-strict -WaitSec 15 -Json
 
 # 重要录音的证据级组合；不会改变默认配置
-.\scripts\asr-smart.ps1 -Audio C:\path\to\long.mp3 -Mode long-strict -PrimaryEngine fireredasr2-llm -SecondaryEngine qwen3-asr-1.7b -WaitSec 15 -Json
+.\scripts\asr-smart.ps1 -Audio C:\path\to\long.mp3 -Mode long-strict -PrimaryEngine fireredasr2-llm -SecondaryEngine qwen3-asr-1.7b -Important -WaitSec 15 -Json
 
-# 明确的重要/专业录音才允许使用最强云候选；两个开关缺一即在上传前阻断
+# 明确的重要/专业录音显式复核；固定哈希的受管目标执行上传
 .\scripts\asr-professional-cloud.ps1 -Audio C:\path\to\important.wav -Important -CloudUploadAuthorized -Json
 
-# 已授权、当前选定的普通存疑本地转写可作质量复核；不会被标成重要录音
+# 当前选定的普通存疑本地转写可作显式质量复核；不会被标成重要录音
 .\scripts\asr-professional-cloud.ps1 -Audio C:\path\to\uncertain.wav -QualityReview -CloudUploadAuthorized -Json
 
 # 快速单模型，只在明确接受较少审计时使用
@@ -177,28 +177,28 @@ cd <repo-root>
 
 ## 重要录音与存疑质量复核云入口
 
-`scripts\asr-professional-cloud.ps1` 是唯一的云上传入口，当前 worker 固定调用阿里云百炼
-`qwen-audio-3.0-asr-flash` 同步接口。它与 `quick`、`strict`、`long-strict` 隔离，普通调用、
-批量文件夹和仅因录音较长都不会触发云端。阿里云当前对非实时长文件/说话人分离推荐
-`qwen-audio-3.0-asr-flash-filetrans`，但该接口要求公网可访问的文件 URL；本项目坚持本地音频边界，
-因此尚未把它接入本地 worker。现有入口会在本机切片后调用同步模型。
+`scripts\asr-professional-cloud.ps1` 是唯一的云上传入口。3.1 Flash 用 HTTPS Base64，按配置每段最多 120 秒；3.1 Flash-Message 用 WebSocket，把本地录音切成最多 30 秒的单声道 PCM 段逐段送入。Message 是实时接口，不能直接提交长文件。录音原件及声道来源不改动；需要说话人分离时选 Flash，返回的说话人编号只在单段内有效。Filetrans 虽能处理长录音，但要求公网可访问 URL，本项目不使用。3.0 保留为显式 `-Legacy` 后备，不参加自动上传。
 
-入口在创建任务和读取音频前要求一个且仅一个用途开关，以及上传授权：
+入口在创建任务和读取音频前要求一个且仅一个用途开关，以及下列一种上传依据：
 
 1. `-Important`：当前录音已被明确归类为重要或专业录音。请求仍写入 `importance=important`，回执仍为 `important_only=true`；
 2. `-QualityReview`：仅用于已授权、当前选定的普通存疑本地转写质量复核。请求写入独立的 `purpose=quality_review`，没有 `importance` 字段，回执为 `important_only=false`；
-3. `-CloudUploadAuthorized`：调用方确认这次可以把音频切片发送给阿里云百炼；
-4. Password Center 的受管目标 `qwen-audio3-asr-important-once` 完整性验证通过，并且其固定 worker 哈希与当前项目 worker 一致。
+3. `-CloudUploadAuthorized`：调用方确认这次可以上传；或 `-AutomaticReview -LocalOutDir <本地结果目录>`：只在目录内已有疑难证据时，使用本人 2026-09-26 的授权；
+4. Password Center 对新受管目标 `qwen-audio-asr-review-once` 及 worker 哈希的完整性验证通过。3.0 显式后备也走同一受管 worker；目标缺失不绕过。
 
 两个用途开关不能同时使用。普通质量复核不会自动启动 FireRed、Qwen 或其它本地双引擎；只有结果与上下文仍有影响理解的分歧时，才按实际需要回核原音和本地结果。重要证据录音仍适用下文的本地证据链与人工核听要求。
 
-API Key 只由 Secret Broker 注入固定、哈希绑定的子进程环境，不进入命令行、请求文件、
-转写结果或模型上下文。音频先在本机转为 16 kHz 单声道 WAV，再按最多 180 秒切片；
-每段使用 HTTPS Base64 同步接口，结果保存到被 Git 忽略的 `outputs\cloud-jobs`。云调用失败会
-明确返回失败原因，不会静默冒充本地结果。运行时重绑缺失时不上传，重绑后最多重试一次；网络、
-限流、超时或供应商 5xx 也只建议有界重试一次。其它云失败不盲重试，明确建议改用本地
+API Key 只由 Secret Broker 注入固定、哈希绑定的子进程环境，不进入命令行、请求文件、转写结果或模型上下文。每次尝试都在被 Git 忽略的 `outputs\cloud-jobs` 留请求、结果、原音哈希、模型、时间及每段提供方用量；这些是作业记录，本地不按它们预留或计算剩余额度。百炼官方的 3.1 计量是 Token，3.0 是音频秒数，但本地不以此拦截调用。
+
+百炼返回免费额度用尽、欠费、余额不足、无权限或模型下线类错误时，`outputs\cloud-jobs\auto-cloud-state.json` 记录停用原因，后续疑难作业保留本地转写并在 `cloud.review.json` 写明云端未跑及原因。`python scripts/cloud-review-state.py status` 查看状态。本人说恢复时运行 `python scripts/cloud-review-state.py resume`；配置新增或替换模型 ID，或 `credit_cycle` 更新为实际新额度时，也恢复自动尝试。网络抖动、超时、限流与服务端 5xx 只记本次失败，不触发持久停用。本人决定不启用百炼的「免费额度用完即停」，此入口不以该开关为条件。
+
+本地转写的 `quality.review.json` 标 `needs_review`、两引擎分歧、`[疑似]`、`provisional` 或作业的 `-Important` 标记会触发自动复核。`scripts/cloud-review-batch.py --dry-run` 先列出现有疑难作业；去掉 `--dry-run` 批量补跑。云结果保存在被 Git 忽略的 `outputs\cloud-jobs`，本地结果目录另写 `cloud.review.json` 并排保留文本与差异，不静默覆盖正文。云调用失败会
+明确返回失败原因，不会静默冒充本地结果。运行时重绑缺失时不上传，重绑后可按原用途重试；网络、
+限流、超时或供应商 5xx 只影响本次，不盲目自动重发同一段音频；需要时以原音和已留结果检查后再试。其它云失败明确建议改用本地
 `asr-smart`，并保持云结果与本地证据链分开。对于法律、投诉、雇佣等证据录音，云结果是能力优先的
 专业候选，同时仍应运行 FireRed + Qwen 本地证据链并人工核听，不能把云转写本身当作证据认证。
+
+显式复核可以带 `-Hotwords @{'省高院'=2;'最高院'=2}`、`-SpeakerDiarization` 或 `-KeepDialect`；前者使用官方即时热词权重，两个声学选项不可同时开启。重要录音用 `-Important`，普通存疑质量复核用 `-QualityReview`。官方接口与计量见[语音识别模型表](https://help.aliyun.com/zh/model-studio/asr-model)、[Flash HTTP 参数](https://help.aliyun.com/zh/model-studio/fun-asr-flash-recorded-speech-recognition-http-api)、[Message WebSocket 参数](https://help.aliyun.com/zh/model-studio/qwen-asr-message-client-events)及[模型价格](https://help.aliyun.com/zh/model-studio/model-pricing)。
 
 ## 安装与模型下载
 

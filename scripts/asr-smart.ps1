@@ -8,6 +8,7 @@ param(
   [string]$SecondaryEngine = '',
   [string]$Profile = '',
   [Nullable[int]]$ChannelIndex = $null,
+  [switch]$Important,
   [string]$Device = 'cuda:0',
   [string]$OutRoot = '',
   [string]$CacheDir = '',
@@ -131,6 +132,7 @@ if ($Profile) {
   $Payload.profile = $Profile
 }
 if ($null -ne $ChannelIndex) { $Payload.channel_index = [int]$ChannelIndex }
+if ($Important) { $Payload.important = $true }
 if ($OutRoot) {
   if ([System.IO.Path]::IsPathRooted($OutRoot)) {
     $OutRootPath = $OutRoot

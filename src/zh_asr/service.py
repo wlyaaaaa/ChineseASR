@@ -127,6 +127,7 @@ class JobRequest:
     caller_binding: Mapping[str, Any] | None = None
     profile: str | None = None
     channel_index: int | None = None
+    important: bool = False
 
     @classmethod
     def from_payload(cls, payload: dict, root: Path, default_out_root: Path | None = None) -> "JobRequest":
@@ -150,6 +151,9 @@ class JobRequest:
         secondary_engine = _optional_str(payload.get("secondary_engine"))
         profile = _optional_str(payload.get("profile"))
         channel_index = payload.get("channel_index")
+        important = payload.get("important", False)
+        if type(important) is not bool:
+            raise ValueError("important must be a boolean")
         if channel_index is not None and (isinstance(channel_index, bool) or not isinstance(channel_index, int) or channel_index < 0):
             raise ValueError("channel_index must be a nonnegative integer")
         if mode == "quick" and channel_index is not None:
@@ -206,6 +210,7 @@ class JobRequest:
             runtime_code_sha256=_current_runtime_code_sha256(),
             profile=profile,
             channel_index=channel_index,
+            important=important,
             wsl_distributions=wsl_distributions,
             caller_binding=caller_binding,
         )
@@ -221,6 +226,7 @@ class JobRequest:
             "secondary_engine": self.secondary_engine,
             "profile": self.profile,
             "channel_index": self.channel_index,
+            "important": self.important,
             "resolved_engine": self.resolved_engine,
             "resolved_primary_engine": self.resolved_primary_engine,
             "resolved_secondary_engine": self.resolved_secondary_engine,
@@ -247,6 +253,7 @@ class JobRequest:
             "secondary_engine": self.secondary_engine,
             "profile": self.profile,
             "channel_index": self.channel_index,
+            "important": self.important,
             "resolved_engine": self.resolved_engine,
             "resolved_primary_engine": self.resolved_primary_engine,
             "resolved_secondary_engine": self.resolved_secondary_engine,
@@ -365,6 +372,10 @@ class TranscriptionService:
         self._gpu_process_detector = gpu_process_detector or detect_gpu_processes
         self._current_process_ids = current_process_ids or self._owned_process_ids
         self._process_runner = process_runner or self._run_subprocess
+        self._cloud_automation_enabled = (
+            process_runner is None
+            and self.root == Path(__file__).resolve().parents[2]
+        )
         if gpu_lease_factory is not None:
             self._gpu_lease_factory = gpu_lease_factory
             self._gpu_broker_managed = True
@@ -377,11 +388,13 @@ class TranscriptionService:
         self._jobs: dict[str, Job] = {}
         self._fingerprints: dict[str, str] = {}
         self._queue: queue.Queue[str] = queue.Queue()
+        self._cloud_queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.RLock()
         self._active_job_id: str | None = None
         self._processes: dict[str, subprocess.Popen] = {}
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
+        self._cloud_worker: threading.Thread | None = None
         self._persistence_status = "ready"
         self._persistence_error = ""
         self._persistence_failed_at: float | None = None
@@ -409,6 +422,12 @@ class TranscriptionService:
                 daemon=True,
             )
             self._worker.start()
+            self._cloud_worker = threading.Thread(
+                target=self._cloud_worker_loop,
+                name="zh-asr-cloud-review",
+                daemon=True,
+            )
+            self._cloud_worker.start()
 
     def _load_persisted_jobs(self) -> None:
         """Restore queryable job history without restoring executable work.
@@ -514,6 +533,7 @@ class TranscriptionService:
             runtime_code_sha256=str(request_data.get("runtime_code_sha256") or ""),
             profile=_optional_str(request_data.get("profile")),
             channel_index=request_data.get("channel_index"),
+            important=bool(request_data.get("important", False)),
             wsl_distributions=wsl_distributions,
             caller_binding=caller_binding,
         )
@@ -681,6 +701,8 @@ class TranscriptionService:
             self.cancel(job_id)
         if self._worker:
             self._worker.join(timeout=2)
+        if self._cloud_worker:
+            self._cloud_worker.join(timeout=2)
 
     def submit(self, request: JobRequest) -> tuple[Job, bool]:
         fingerprint = request.fingerprint()
@@ -848,6 +870,91 @@ class TranscriptionService:
             finally:
                 self._queue.task_done()
 
+    def _cloud_worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                job_id = self._cloud_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self._run_cloud_review(job_id)
+            finally:
+                self._cloud_queue.task_done()
+
+    def _queue_cloud_if_eligible(self, job_id: str) -> None:
+        from .cloud_review import (CloudReviewError, auto_cloud_status,
+                                   load_cloud_config, local_review_signals)
+        from .model_lifecycle import write_json_atomic
+
+        if not self._cloud_automation_enabled:
+            return
+        with self._lock:
+            job = self._jobs[job_id]
+            if job.status != "succeeded" or (job.request.mode == "quick" and not job.request.important):
+                return
+            out_dir, audio, evidence, important = (
+                job.out_dir, job.request.audio, job.evidence_status, job.request.important)
+        try:
+            project_root = Path(__file__).resolve().parents[2]
+            config = load_cloud_config(project_root / "configs" / "models.yaml")
+            reasons, _ = local_review_signals(out_dir, evidence_status=evidence,
+                                              important=important)
+            if reasons and audio.is_file():
+                state = auto_cloud_status(project_root / "outputs" / "cloud-jobs" /
+                                          "auto-cloud-state.json", config)
+                if state["status"] == "paused":
+                    sidecar = out_dir / "cloud.review.json"
+                    write_json_atomic(sidecar, {"schema": "zh_asr.cloud_review.v1",
+                        "status": "skipped", "error_code": "auto_cloud_paused",
+                        "pause_reason": state["reason"], "cloud_upload_performed": False,
+                        "local_text_rewritten": False})
+                    with self._lock:
+                        job.outputs["cloud_review"] = str(sidecar)
+                        self._persist_jobs_locked()
+                else:
+                    self._cloud_queue.put(job_id)
+        except (CloudReviewError, OSError, ValueError):
+            return
+
+    def _run_cloud_review(self, job_id: str) -> None:
+        """Optional sidecar: never change the terminal local transcription result."""
+        from .model_lifecycle import write_json_atomic
+
+        with self._lock:
+            job = self._jobs[job_id]
+            audio, out_dir, evidence, channel, important = (
+                job.request.audio, job.out_dir, job.evidence_status,
+                job.request.channel_index, job.request.important)
+        script = Path(__file__).resolve().parents[2] / "scripts" / "asr-professional-cloud.ps1"
+        command = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script),
+                   "-Audio", str(audio), "-Important" if important else "-QualityReview", "-AutomaticReview",
+                   "-LocalOutDir", str(out_dir), "-EvidenceStatus", evidence, "-Json"]
+        if channel is not None:
+            command.extend(["-ChannelIndex", str(channel)])
+        try:
+            done = subprocess.run(command, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=86500,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            receipt = json.loads(done.stdout)
+            if not isinstance(receipt, dict):
+                raise ValueError("invalid cloud receipt")
+            status = str(receipt.get("status") or "failed")
+            error_code = str(receipt.get("error_code") or "")
+            result_path = str(receipt.get("result_path") or "")
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            status, error_code, result_path = "failed", "cloud_review_process_failed", ""
+        sidecar = out_dir / "cloud.review.json"
+        if not sidecar.is_file():
+            try:
+                write_json_atomic(sidecar, {"schema": "zh_asr.cloud_review.v1",
+                    "status": status, "error_code": error_code,
+                    "cloud_result_path": result_path, "local_text_rewritten": False})
+            except OSError:
+                return
+        with self._lock:
+            job.outputs["cloud_review"] = str(sidecar)
+            self._persist_jobs_locked()
+
     def _process_job(self, job_id: str) -> None:
         try:
             with self._lock:
@@ -933,6 +1040,8 @@ class TranscriptionService:
                         job,
                         "Transcription completed, but terminal job history is not durable; transcription output files may already exist.",
                     )
+            if result.returncode == 0:
+                self._queue_cloud_if_eligible(job_id)
         except GpuBrokerConflict as exc:
             with self._lock:
                 if job.status != "canceled":
@@ -1259,7 +1368,9 @@ def _collect_outputs(
         objective_matches = sorted(out_dir.glob("*.objective-result.json"))
         if objective_matches:
             outputs["objective_result"] = str(objective_matches[0])
-    for key, name in (("quality_review", "quality.review.json"), ("review_html", "quality.review.html")):
+    for key, name in (("quality_review", "quality.review.json"),
+                      ("review_html", "quality.review.html"),
+                      ("cloud_review", "cloud.review.json")):
         path = out_dir / name
         if path.is_file():
             outputs[key] = str(path)
