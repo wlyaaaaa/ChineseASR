@@ -907,6 +907,7 @@ class TranscriptionService:
                     write_json_atomic(sidecar, {"schema": "zh_asr.cloud_review.v1",
                         "status": "skipped", "error_code": "auto_cloud_paused",
                         "pause_reason": state["reason"], "cloud_upload_performed": False,
+                        "message": state.get("message") or "云端未跑",
                         "local_text_rewritten": False})
                     with self._lock:
                         job.outputs["cloud_review"] = str(sidecar)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
 import tempfile
@@ -7,7 +8,7 @@ import unittest
 
 from zh_asr.cloud_review import (
     auto_cloud_status, compare_text, load_cloud_config, local_review_signals,
-    pause_cloud, resume_cloud, select_model, stopping_error,
+    free_period_expired, pause_cloud, resume_cloud, select_model, stopping_error,
 )
 
 
@@ -31,6 +32,8 @@ class CloudReviewTests(unittest.TestCase):
         self.assertEqual("short", select_model(self.config, duration_sec=300,
                                                dialect=True))
         for item in self.config["models"].values():
+            self.assertIn(item["api"], {"http", "websocket"})
+            self.assertIn("free_until", item)
             self.assertFalse(any(key in item for key in (
                 "initial_remaining", "free_total", "free_expires_before",
                 "reserve_per_chunk", "free_only_confirmed")))
@@ -73,15 +76,29 @@ class CloudReviewTests(unittest.TestCase):
         self.assertEqual("paused", auto_cloud_status(path, rerouted)["status"])
         new_model = dict(self.config)
         new_model["models"] = dict(self.config["models"], next={
-            "id": "qwen-audio-next", "api": "http_base64", "endpoint":
-            "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
-            "max_chunk_sec": 120})
+            "id": "qwen-audio-next", "api": "http",
+            "free_until": "2027-01-01T00:00:00+08:00", "max_chunk_sec": 120})
         new_model["routes"] = dict(self.config["routes"], short="next")
         self.assertEqual("running", auto_cloud_status(path, new_model)["status"])
         resume_cloud(path, self.config)
         self.assertEqual("running", auto_cloud_status(path, self.config)["status"])
         path.write_text("{broken", encoding="utf-8")
         self.assertEqual("cloud_state_unreadable", auto_cloud_status(path, self.config)["reason"])
+
+    def test_free_period_cutoffs_are_timezone_aware_and_exclusive(self) -> None:
+        short = self.config["models"]["short"]
+        legacy = self.config["models"]["legacy"]
+        self.assertFalse(free_period_expired(short,
+            now=datetime.fromisoformat("2026-12-20T23:59:59+08:00")))
+        self.assertTrue(free_period_expired(short,
+            now=datetime.fromisoformat("2026-12-21T00:00:00+08:00")))
+        self.assertFalse(free_period_expired(legacy,
+            now=datetime.fromisoformat("2026-09-27T01:59:59+08:00")))
+        self.assertTrue(free_period_expired(legacy,
+            now=datetime.fromisoformat("2026-09-27T02:00:00+08:00")))
+        self.assertEqual("free_period_expired", auto_cloud_status(
+            self.root / "missing.json", self.config,
+            now=datetime.fromisoformat("2026-12-21T00:00:00+08:00"))["reason"])
 
     def test_provider_error_categories_pause_only_as_requested(self) -> None:
         self.assertEqual("free_quota_exhausted", stopping_error("AllocationQuota.FreeTierOnly"))

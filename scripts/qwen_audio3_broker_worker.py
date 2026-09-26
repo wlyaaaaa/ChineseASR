@@ -1,3 +1,9 @@
+"""Single-file SecretRef transport for local audio chunks sent to DashScope.
+
+The caller owns model choice, audio preparation, expiry and review policy. This
+worker owns only request-root validation, fixed provider endpoints, transport,
+and raw provider receipts. It never imports the ChineseASR package or config.
+"""
 from __future__ import annotations
 
 import argparse
@@ -5,619 +11,500 @@ import base64
 from datetime import datetime, timezone
 import hashlib
 import json
-import mimetypes
 import os
 from pathlib import Path
-import shutil
-import subprocess
+import re
+import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import (HTTPRedirectHandler, ProxyHandler, Request,
+                            build_opener)
 import uuid
 import wave
 
 
-IMPORTANT_REQUEST_SCHEMA = "chineseasr.qwen-audio3-important-request.v1"
-QUALITY_REVIEW_REQUEST_SCHEMA = "chineseasr.qwen-audio3-quality-review-request.v1"
-IMPORTANT_RESULT_SCHEMA = "chineseasr.qwen-audio3-important-result.v1"
-QUALITY_REVIEW_RESULT_SCHEMA = "chineseasr.qwen-audio3-quality-review-result.v1"
-IMPORTANT_PURPOSE = "important_evidence"
-QUALITY_REVIEW_PURPOSE = "quality_review"
-MODEL = "qwen-audio-3.0-asr-flash"
-DEFAULT_ENDPOINT = (
-    "https://dashscope.aliyuncs.com/api/v1/services/"
-    "aigc/multimodal-generation/generation"
-)
-ALLOWED_ENDPOINTS = {DEFAULT_ENDPOINT}
-DEFAULT_TIMEOUT_SEC = 180
-MAX_DATA_URI_BYTES = 10 * 1024 * 1024
-MAX_CHUNK_SEC = 180
+REQUEST_SCHEMA = "zh_asr.dashscope_transport_request.v1"
+RESULT_SCHEMA = "zh_asr.dashscope_transport_result.v1"
+HTTP_ENDPOINT = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+WEBSOCKET_ENDPOINT = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+MAX_REQUEST_BYTES = 1024 * 1024
+MAX_CHUNK_BYTES = 10 * 1024 * 1024
+MAX_CHUNKS = 2000
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
-Transport = Callable[[str, dict[str, str], dict[str, Any], int], dict[str, Any]]
-
-
-class CloudPolicyError(RuntimeError):
-    def __init__(self, code: str, message: str = "") -> None:
-        super().__init__(message or code)
+class WorkerPolicyError(RuntimeError):
+    def __init__(self, code: str):
+        super().__init__(code)
         self.code = code
 
 
-class CloudApiError(RuntimeError):
-    def __init__(
-        self,
-        code: str,
-        *,
-        credential_result: str,
-        request_id: str = "",
-        message: str = "",
-        upload_performed: bool = True,
-    ) -> None:
-        super().__init__(message or code)
+class ProviderError(RuntimeError):
+    def __init__(self, code: str, *, http_status: int | None = None,
+                 request_id: str = "", message: str = "", credential_result: str = "Provider-Unavailable"):
+        super().__init__(code)
         self.code = code
-        self.credential_result = credential_result
+        self.http_status = http_status
         self.request_id = request_id
-        self.upload_performed = upload_performed
+        self.message = message
+        self.credential_result = credential_result
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _sha256_file(path: Path) -> str:
+def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
     return digest.hexdigest()
 
 
-def _load_json_object(path: Path) -> dict[str, Any]:
-    if not path.is_file() or path.stat().st_size > 64 * 1024:
-        raise CloudPolicyError("request_file_invalid")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise CloudPolicyError("request_json_invalid") from exc
-    if not isinstance(value, dict):
-        raise CloudPolicyError("request_json_invalid")
+def _json_hash(value: Any) -> str:
+    raw = json.dumps(value, sort_keys=True, ensure_ascii=False,
+                     separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _scrub(value: Any, api_key: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(api_key, "[secret-removed]") if api_key else value
+    if isinstance(value, list):
+        return [_scrub(item, api_key) for item in value]
+    if isinstance(value, dict):
+        return {_scrub(str(key), api_key): _scrub(item, api_key)
+                for key, item in value.items()}
     return value
 
 
-def _validate_request(request: dict[str, Any]) -> dict[str, Any]:
-    request_schema = request.get("schema")
-    if request_schema == IMPORTANT_REQUEST_SCHEMA:
-        if request.get("importance") != "important":
-            raise CloudPolicyError("importance_required")
-        if request.get("purpose", IMPORTANT_PURPOSE) != IMPORTANT_PURPOSE:
-            raise CloudPolicyError("request_purpose_invalid")
-        result_schema = IMPORTANT_RESULT_SCHEMA
-        purpose = IMPORTANT_PURPOSE
-        important_only = True
-    elif request_schema == QUALITY_REVIEW_REQUEST_SCHEMA:
-        if request.get("purpose") != QUALITY_REVIEW_PURPOSE:
-            raise CloudPolicyError("quality_review_purpose_required")
-        if "importance" in request:
-            raise CloudPolicyError("quality_review_importance_forbidden")
-        result_schema = QUALITY_REVIEW_RESULT_SCHEMA
-        purpose = QUALITY_REVIEW_PURPOSE
-        important_only = False
-    else:
-        raise CloudPolicyError("request_schema_invalid")
-    if request.get("cloud_upload_authorized") is not True:
-        raise CloudPolicyError("cloud_upload_authorization_required")
+def _inside(path: Path, root: Path) -> Path:
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise WorkerPolicyError("request_root_escape")
+    return resolved
+
+
+def _parse_deadline(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
     try:
-        job_id = str(uuid.UUID(str(request.get("job_id", ""))))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError as exc:
-        raise CloudPolicyError("job_id_invalid") from exc
-    raw_audio = str(request.get("audio_path", "")).strip()
-    if not raw_audio:
-        raise CloudPolicyError("audio_path_required")
-    audio_path = Path(raw_audio)
-    if not audio_path.is_absolute():
-        raise CloudPolicyError("audio_path_must_be_absolute")
+        raise WorkerPolicyError("send_deadline_invalid") from exc
+    if parsed.tzinfo is None:
+        raise WorkerPolicyError("send_deadline_invalid")
+    return parsed
+
+
+def _text_context(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    for message in value:
+        if (not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}
+                or not isinstance(message.get("content"), list)):
+            return False
+        for item in message["content"]:
+            if (not isinstance(item, dict) or item.get("type") not in {"input_text", "text"}
+                    or not isinstance(item.get("text"), str)
+                    or set(item) != {"type", "text"}):
+                return False
+    return True
+
+
+def _has_external_media_pointer(value: Any) -> bool:
+    if isinstance(value, dict):
+        forbidden = {"input_audio", "audio_url", "file_url", "file_urls", "data_uri"}
+        if any(str(key).casefold() in forbidden for key in value):
+            return True
+        return any(_has_external_media_pointer(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_external_media_pointer(item) for item in value)
+    return False
+
+
+def _check_deadline(deadline: datetime | None) -> None:
+    if deadline is not None and datetime.now(timezone.utc) >= deadline:
+        raise WorkerPolicyError("request_send_deadline_passed")
+
+
+def _load_request(path: Path, root: Path) -> dict[str, Any]:
+    request_path = _inside(path, root)
+    if not request_path.is_file() or request_path.stat().st_size > MAX_REQUEST_BYTES:
+        raise WorkerPolicyError("request_file_invalid")
     try:
-        chunk_sec = int(request.get("chunk_sec", MAX_CHUNK_SEC))
-        overlap_sec = int(request.get("overlap_sec", 1))
-    except (TypeError, ValueError) as exc:
-        raise CloudPolicyError("chunk_policy_invalid") from exc
-    if not 1 <= chunk_sec <= MAX_CHUNK_SEC:
-        raise CloudPolicyError("chunk_policy_invalid")
-    if overlap_sec < 0 or overlap_sec >= chunk_sec:
-        raise CloudPolicyError("chunk_policy_invalid")
-    return {
-        "job_id": job_id,
-        "audio_path": audio_path.resolve(),
-        "chunk_sec": chunk_sec,
-        "overlap_sec": overlap_sec,
-        "result_schema": result_schema,
-        "purpose": purpose,
-        "important_only": important_only,
-    }
-
-
-def _wav_info(path: Path) -> tuple[int, int, int, int] | None:
-    if path.suffix.lower() != ".wav":
-        return None
+        value = json.loads(request_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise WorkerPolicyError("request_json_invalid") from exc
+    if not isinstance(value, dict) or value.get("schema") != REQUEST_SCHEMA:
+        raise WorkerPolicyError("request_schema_invalid")
+    if value.get("cloud_upload_authorized") is not True:
+        raise WorkerPolicyError("cloud_upload_authorization_required")
     try:
-        with wave.open(str(path), "rb") as handle:
-            return (
-                handle.getframerate(),
-                handle.getnchannels(),
-                handle.getsampwidth(),
-                handle.getnframes(),
-            )
-    except (EOFError, OSError, wave.Error):
-        return None
-
-
-def _prepare_pcm16_mono(source: Path, work_dir: Path) -> Path:
-    if not source.is_file():
-        raise CloudPolicyError("audio_file_missing")
-    info = _wav_info(source)
-    if info is not None and info[:3] == (16_000, 1, 2):
-        return source
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise CloudPolicyError("ffmpeg_required")
-    work_dir.mkdir(parents=True, exist_ok=True)
-    target = work_dir / "prepared.16k-mono.wav"
-    command = [
-        ffmpeg,
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(source),
-        "-map_metadata",
-        "-1",
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-c:a",
-        "pcm_s16le",
-        str(target),
-    ]
-    try:
-        subprocess.run(command, check=True, capture_output=True, timeout=3600)
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise CloudPolicyError("audio_conversion_failed") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise CloudPolicyError("audio_conversion_timeout") from exc
-    if _wav_info(target) is None or _wav_info(target)[:3] != (16_000, 1, 2):
-        raise CloudPolicyError("audio_conversion_invalid")
-    return target
-
-
-def _split_wav(
-    source: Path,
-    chunks_dir: Path,
-    *,
-    chunk_sec: int,
-    overlap_sec: int,
-) -> list[dict[str, Any]]:
-    chunks_dir.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(source), "rb") as handle:
-        frame_rate = handle.getframerate()
-        channels = handle.getnchannels()
-        sample_width = handle.getsampwidth()
-        total_frames = handle.getnframes()
-        if (frame_rate, channels, sample_width) != (16_000, 1, 2):
-            raise CloudPolicyError("prepared_audio_format_invalid")
-        chunk_frames = frame_rate * chunk_sec
-        step_frames = frame_rate * (chunk_sec - overlap_sec)
-        chunks: list[dict[str, Any]] = []
-        start_frame = 0
-        index = 1
-        while start_frame < total_frames:
-            end_frame = min(start_frame + chunk_frames, total_frames)
-            handle.setpos(start_frame)
-            frames = handle.readframes(end_frame - start_frame)
-            target = chunks_dir / f"chunk-{index:06d}.wav"
-            with wave.open(str(target), "wb") as output:
-                output.setnchannels(channels)
-                output.setsampwidth(sample_width)
-                output.setframerate(frame_rate)
-                output.writeframes(frames)
-            chunks.append(
-                {
-                    "index": index,
-                    "start_ms": round(start_frame * 1000 / frame_rate),
-                    "end_ms": round(end_frame * 1000 / frame_rate),
-                    "path": target,
-                }
-            )
-            if end_frame >= total_frames:
-                break
-            start_frame += step_frames
-            index += 1
-    if not chunks:
-        raise CloudPolicyError("audio_empty")
-    return chunks
-
-
-def _data_uri(path: Path) -> str:
-    mime_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    value = f"data:{mime_type};base64,{encoded}"
-    if len(value.encode("ascii")) > MAX_DATA_URI_BYTES:
-        raise CloudPolicyError("encoded_chunk_too_large")
+        job_id = str(uuid.UUID(str(value["job_id"])))
+    except (KeyError, ValueError) as exc:
+        raise WorkerPolicyError("job_id_invalid") from exc
+    if not request_path.name.startswith(job_id + "."):
+        raise WorkerPolicyError("request_job_binding_invalid")
+    model = value.get("model")
+    if not isinstance(model, str) or MODEL_NAME.fullmatch(model) is None:
+        raise WorkerPolicyError("model_name_invalid")
+    protocol = value.get("protocol")
+    if protocol not in {"http", "websocket"}:
+        raise WorkerPolicyError("protocol_unsupported")
+    if not isinstance(value.get("parameters"), dict):
+        raise WorkerPolicyError("parameters_invalid")
+    if _has_external_media_pointer(value["parameters"]):
+        raise WorkerPolicyError("external_audio_input_forbidden")
+    if protocol == "http" and not _text_context(value.get("messages_prefix", [])):
+        raise WorkerPolicyError("input_invalid")
+    if protocol == "websocket" and (
+        not isinstance(value.get("input", {}), dict)
+        or not isinstance(value.get("ws_task", {}), dict)
+        or any(not isinstance(value["ws_task"].get(key), str)
+               for key in ("task_group", "task", "function"))
+    ):
+        raise WorkerPolicyError("input_invalid")
+    if protocol == "websocket":
+        incoming = value.get("input", {})
+        if _has_external_media_pointer(incoming):
+            raise WorkerPolicyError("external_audio_input_forbidden")
+        if "context" in incoming and not _text_context(incoming["context"]):
+            raise WorkerPolicyError("input_invalid")
+    source_hash = value.get("source_audio_sha256")
+    if not isinstance(source_hash, str) or SHA256.fullmatch(source_hash) is None:
+        raise WorkerPolicyError("source_hash_invalid")
+    if type(value.get("source_audio_bytes")) is not int or value["source_audio_bytes"] <= 0:
+        raise WorkerPolicyError("source_size_invalid")
+    chunks = value.get("chunks")
+    if not isinstance(chunks, list) or not 1 <= len(chunks) <= MAX_CHUNKS:
+        raise WorkerPolicyError("chunks_invalid")
+    parsed_chunks = []
+    previous_end = -1
+    for expected, chunk in enumerate(chunks, 1):
+        if not isinstance(chunk, dict) or chunk.get("index") != expected:
+            raise WorkerPolicyError("chunk_sequence_invalid")
+        start, end = chunk.get("start_ms"), chunk.get("end_ms")
+        if (type(start) is not int or type(end) is not int or start < 0 or end <= start
+                or (previous_end >= 0 and start > previous_end)):
+            raise WorkerPolicyError("chunk_range_invalid")
+        raw_path = Path(str(chunk.get("path") or ""))
+        if not raw_path.is_absolute():
+            raise WorkerPolicyError("chunk_path_invalid")
+        audio = _inside(raw_path, root)
+        if not audio.is_file() or audio.suffix.lower() != ".wav" or not 44 <= audio.stat().st_size <= MAX_CHUNK_BYTES:
+            raise WorkerPolicyError("chunk_file_invalid")
+        try:
+            with wave.open(str(audio), "rb") as reader:
+                if (reader.getframerate(), reader.getnchannels(), reader.getsampwidth()) != (16000, 1, 2):
+                    raise WorkerPolicyError("chunk_audio_format_invalid")
+                actual_ms = round(reader.getnframes() * 1000 / reader.getframerate())
+        except (OSError, wave.Error, EOFError) as exc:
+            raise WorkerPolicyError("chunk_audio_format_invalid") from exc
+        if actual_ms < 1 or abs(actual_ms - (end - start)) > 4:
+            raise WorkerPolicyError("chunk_range_invalid")
+        actual_hash = _hash_file(audio)
+        if actual_hash != chunk.get("audio_sha256"):
+            raise WorkerPolicyError("chunk_hash_mismatch")
+        parsed_chunks.append({"index": expected, "start_ms": start, "end_ms": end,
+                              "path": audio, "audio_sha256": actual_hash})
+        previous_end = end
+    value["job_id"] = job_id
+    value["chunks"] = parsed_chunks
+    value["send_before_utc"] = _parse_deadline(value.get("send_before_utc"))
     return value
 
 
-def _payload(path: Path) -> dict[str, Any]:
-    return {
-        "model": MODEL,
-        "input": {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_audio",
-                            "input_audio": {"data": _data_uri(path)},
-                        }
-                    ],
-                }
-            ]
-        },
-        "parameters": {"format": "wav", "sample_rate": "16000"},
-    }
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
 
 
-def _bounded_provider_error(value: object) -> str:
-    text = str(value or "").strip().replace("\r", " ").replace("\n", " ")
-    return text[:500]
-
-
-def _provider_error_details(body: bytes) -> tuple[str, str, str]:
-    try:
-        parsed = json.loads(body.decode("utf-8", errors="replace"))
-    except json.JSONDecodeError:
-        return "", "", ""
-    if not isinstance(parsed, dict):
-        return "", "", ""
-    return (
-        _bounded_provider_error(parsed.get("code")),
-        _bounded_provider_error(parsed.get("message")),
-        _bounded_provider_error(parsed.get("request_id")),
-    )
-
-
-def _credential_result(http_status: int, provider_code: str) -> str:
-    normalized = provider_code.casefold()
-    if http_status == 401 or normalized in {
-        "invalidapikey",
-        "invalid_api_key",
-        "invalidauthentication",
-    }:
+def _credential_result(status: int | None, code: str) -> str:
+    low = code.casefold()
+    if status == 401 or low in {"invalidapikey", "invalid_api_key"}:
         return "Invalid"
-    if http_status == 403:
+    if status == 403:
         return "Permission-Denied"
-    if http_status == 429:
+    if status == 429:
         return "Rate-Limited"
-    if http_status >= 500:
+    if status is not None and status >= 500:
         return "Provider-5xx"
     return "Scope-Error"
 
 
-def _post_json(
-    url: str,
-    headers: dict[str, str],
-    payload: dict[str, Any],
-    timeout: int,
-) -> dict[str, Any]:
-    if url not in ALLOWED_ENDPOINTS:
-        raise CloudPolicyError("provider_endpoint_not_allowed")
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
-        "utf-8"
-    )
-    request = Request(url, data=body, headers=headers, method="POST")
+def _post_http(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    request = Request(HTTP_ENDPOINT, data=body, method="POST", headers={
+        "Authorization": "Bearer " + api_key,
+        "Content-Type": "application/json", "X-DashScope-SSE": "disable"})
+    opener = build_opener(ProxyHandler({}), _NoRedirect())
     try:
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read(2 * 1024 * 1024)
+        with opener.open(request, timeout=180) as response:
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+            status = response.status
     except HTTPError as exc:
         raw = exc.read(256 * 1024)
-        provider_code, message, request_id = _provider_error_details(raw)
-        raise CloudApiError(
-            provider_code or f"http_{exc.code}",
-            credential_result=_credential_result(exc.code, provider_code),
-            request_id=request_id,
-            message=message,
-        ) from exc
-    except (URLError, TimeoutError, OSError) as exc:
-        raise CloudApiError(
-            "network_failure",
-            credential_result="Network-Failure",
-            message=type(exc).__name__,
-        ) from exc
+        try:
+            error = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError:
+            error = {}
+        code = str(error.get("code") or f"http_{exc.code}")
+        raise ProviderError(code, http_status=exc.code,
+            request_id=str(error.get("request_id") or ""),
+            message=str(error.get("message") or ""),
+            credential_result=_credential_result(exc.code, code)) from exc
+    except (URLError, OSError, TimeoutError) as exc:
+        raise ProviderError("network_failure", credential_result="Network-Failure") from exc
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise ProviderError("provider_response_too_large")
     try:
         parsed = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise CloudApiError(
-            "provider_response_invalid",
-            credential_result="Provider-Unavailable",
-        ) from exc
+    except (UnicodeError, ValueError) as exc:
+        raise ProviderError("provider_response_invalid") from exc
     if not isinstance(parsed, dict):
-        raise CloudApiError(
-            "provider_response_invalid",
-            credential_result="Provider-Unavailable",
-        )
-    return parsed
+        raise ProviderError("provider_response_invalid")
+    return {"http_status": status, "raw_response": parsed,
+            "provider_request_id": parsed.get("request_id"),
+            "usage": parsed.get("usage")}
 
 
-def _response_text(response: dict[str, Any]) -> tuple[str, str]:
-    output = response.get("output")
-    text = ""
-    if isinstance(output, dict):
-        text = str(output.get("text", "")).strip()
-        nested = output.get("output")
-        if not text and isinstance(nested, dict):
-            sentence = nested.get("sentence")
-            if isinstance(sentence, dict):
-                text = str(sentence.get("text", "")).strip()
-    request_id = _bounded_provider_error(response.get("request_id"))
-    if not text:
-        raise CloudApiError(
-            "provider_transcript_missing",
-            credential_result="Provider-Unavailable",
-            request_id=request_id,
-        )
-    return text, request_id
+def _post_websocket(model: str, chunk: Path, request: dict[str, Any],
+                    api_key: str, deadline: datetime | None) -> dict[str, Any]:
+    # The stdlib has no WebSocket client. This installed library supplies the
+    # HTTPS-verified handshake and binary framing; the URI is fixed above.
+    from websockets.sync.client import connect
+
+    task_id = str(uuid.uuid4())
+    task = request["ws_task"]
+    run = {"header": {"action": "run-task", "task_id": task_id, "streaming": "duplex"},
+           "payload": {"task_group": task["task_group"], "task": task["task"],
+                       "function": task["function"], "model": model,
+                       "parameters": request["parameters"], "input": request.get("input", {})}}
+    events: list[dict[str, Any]] = []
+
+    def receive(socket, timeout: float) -> str:
+        try:
+            event = json.loads(socket.recv(timeout=timeout))
+            kind = str(event["header"]["event"])
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ProviderError("provider_event_invalid") from exc
+        if event["header"].get("task_id") != task_id:
+            raise ProviderError("provider_task_mismatch")
+        events.append(event)
+        if kind == "task-failed":
+            header = event["header"]
+            raise ProviderError(str(header.get("error_code") or "provider_task_failed"),
+                                request_id=task_id,
+                                message=str(header.get("error_message") or ""))
+        return kind
+
+    try:
+        with connect(WEBSOCKET_ENDPOINT,
+                     additional_headers={"Authorization": "Bearer " + api_key},
+                     proxy=None, open_timeout=30, close_timeout=10,
+                     max_size=MAX_RESPONSE_BYTES) as socket:
+            _check_deadline(deadline)
+            socket.send(json.dumps(run, ensure_ascii=False))
+            if receive(socket, 30) != "task-started":
+                raise ProviderError("provider_task_not_started")
+            with wave.open(str(chunk), "rb") as reader:
+                while block := reader.readframes(1600):
+                    _check_deadline(deadline)
+                    socket.send(block)
+                    try:
+                        receive(socket, 0.005)
+                    except TimeoutError:
+                        pass
+                    time.sleep(len(block) / 32000)
+            socket.send(json.dumps({"header": {"action": "finish-task", "task_id": task_id,
+                "streaming": "duplex"}, "payload": {"input": {}}}, ensure_ascii=False))
+            end = time.monotonic() + 90
+            while time.monotonic() < end:
+                try:
+                    if receive(socket, 5) == "task-finished":
+                        break
+                except TimeoutError:
+                    continue
+            else:
+                raise ProviderError("provider_task_timeout", request_id=task_id)
+    except WorkerPolicyError:
+        raise
+    except ProviderError:
+        raise
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        close = getattr(exc, "rcvd", None)
+        if (getattr(close, "code", None) == 1007 and
+                "model not found" in str(getattr(close, "reason", "")).casefold()):
+            code = "model_not_found"
+        elif getattr(close, "code", None) == 1007:
+            code = "provider_close_1007"
+        else:
+            code = f"http_{status}" if type(status) is int else "network_failure"
+        raise ProviderError(code, http_status=status if type(status) is int else None,
+                            credential_result=_credential_result(status, code) if type(status) is int
+                            else "Network-Failure") from exc
+    final_usage = next((item.get("payload", {}).get("usage") for item in reversed(events)
+                        if item.get("header", {}).get("event") == "task-finished"), None)
+    return {"http_status": 101, "raw_events": events,
+            "provider_request_id": task_id, "usage": final_usage}
 
 
-def _merge_texts(texts: list[str]) -> str:
-    # Without word timestamps, identical boundary words may be genuine speech.
-    # Preserve them and keep the original per-chunk time ranges available.
-    return "\n".join(text.strip() for text in texts if text.strip())
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
-def _json_digest(value: Any) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
-        separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
-
-
-def _cached_chunk(path: Path, identity: dict[str, Any], retry_uncertain: bool) -> dict[str, Any] | None:
+def _cached(path: Path, identity: dict[str, Any], retry_uncertain: bool) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        cached = json.loads(path.read_text(encoding="utf-8"))
-        if cached.get("schema") != "chineseasr.cloud-chunk.v1" or cached.get("identity") != identity:
-            raise CloudPolicyError("resume_input_mismatch")
-        if cached.get("status") in {"in_flight", "outcome_unknown"}:
-            if not retry_uncertain:
-                raise CloudPolicyError("cloud_chunk_outcome_unknown_explicit_retry_required")
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if value.get("schema") != "zh_asr.dashscope_chunk_checkpoint.v1" or value.get("identity") != identity:
+            raise WorkerPolicyError("cloud_checkpoint_invalid")
+        if value.get("status") in {"in_flight", "outcome_unknown"}:
+            if retry_uncertain:
+                return None
+            raise WorkerPolicyError("cloud_chunk_outcome_unknown_explicit_retry_required")
+        if value.get("status") != "succeeded":
             return None
-        if cached.get("status") != "succeeded":
-            return None
-        record = cached["result"]
-        if _json_digest(record) != cached.get("result_sha256"):
-            raise CloudPolicyError("cloud_checkpoint_invalid")
-        if not isinstance(record.get("text"), str) or not record["text"].strip():
-            raise CloudPolicyError("cloud_checkpoint_invalid")
+        record = value.get("result")
+        if not isinstance(record, dict) or _json_hash(record) != value.get("result_sha256"):
+            raise WorkerPolicyError("cloud_checkpoint_invalid")
         return record
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-        raise CloudPolicyError("cloud_checkpoint_invalid") from error
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError) as exc:
+        raise WorkerPolicyError("cloud_checkpoint_invalid") from exc
 
 
-def _base_result(
-    job_id: str = "",
-    *,
-    result_schema: str = IMPORTANT_RESULT_SCHEMA,
-    purpose: str = IMPORTANT_PURPOSE,
-    important_only: bool = True,
-) -> dict[str, Any]:
-    return {
-        "schema": result_schema,
-        "job_id": job_id,
-        "model": MODEL,
-        "provider": "aliyun-bailian",
-        "provider_endpoint": DEFAULT_ENDPOINT,
-        "purpose": purpose,
-        "important_only": important_only,
-        "status": "failed",
-        "error_code": "",
-        "error_message": "",
-        "credential_result": "Provider-Unavailable",
-        "cloud_upload_performed": False,
-        "text": "",
-        "chunks": [],
-        "started_utc": _utc_now(),
-        "completed_utc": "",
-    }
-
-
-def process_request_file(
-    request_path: Path,
-    *,
-    api_key: str,
-    transport: Transport = _post_json,
-) -> dict[str, Any]:
-    result = _base_result()
+def process_request_file(request_path: Path, *, api_key: str, request_root: Path | None = None,
+                         http_transport: Callable[..., dict[str, Any]] = _post_http,
+                         websocket_transport: Callable[..., dict[str, Any]] = _post_websocket) -> dict[str, Any]:
+    root = (request_root or request_path.parent).resolve()
+    result: dict[str, Any] = {"schema": RESULT_SCHEMA, "job_id": "", "status": "failed",
+        "error_code": "", "provider_error_code": "", "provider_error_message": "",
+        "http_status": None, "credential_result": "Provider-Unavailable",
+        "cloud_upload_performed": False, "chunks": [], "started_utc": _utc_now(),
+        "completed_utc": "", "plaintext_returned": False, "secret_returned": False}
     try:
-        request = _load_json_object(request_path)
-        if request.get("schema") == QUALITY_REVIEW_REQUEST_SCHEMA:
-            result = _base_result(
-                result_schema=QUALITY_REVIEW_RESULT_SCHEMA,
-                purpose=QUALITY_REVIEW_PURPOSE,
-                important_only=False,
-            )
-        validated = _validate_request(request)
-        result["job_id"] = validated["job_id"]
-        result["schema"] = validated["result_schema"]
-        result["purpose"] = validated["purpose"]
-        result["important_only"] = validated["important_only"]
+        request = _load_request(request_path, root)
+        result.update(job_id=request["job_id"], model=request["model"],
+            protocol=request["protocol"], provider="aliyun-bailian",
+            provider_endpoint=HTTP_ENDPOINT if request["protocol"] == "http" else WEBSOCKET_ENDPOINT,
+            source_audio_path=str(request.get("source_audio_path") or ""),
+            source_audio_sha256=request["source_audio_sha256"],
+            source_audio_bytes=request["source_audio_bytes"],
+            selected_channel=request.get("selected_channel"),
+            billing_warning=str(request.get("billing_warning") or ""),
+            automatic_review=request.get("automatic_review") is True,
+            completion="partial", reused_chunks=0, new_requests=0)
         if not api_key or "\x00" in api_key:
-            raise CloudApiError(
-                "api_key_missing",
-                credential_result="Permission-Denied",
-                upload_performed=False,
-            )
-        source: Path = validated["audio_path"]
-        result["source_audio_sha256"] = _sha256_file(source)
-        result["source_audio_bytes"] = source.stat().st_size
-        work_dir = request_path.parent / f"{validated['job_id']}.work"
-        prepared = _prepare_pcm16_mono(source, work_dir)
-        chunks = _split_wav(
-            prepared,
-            work_dir / "chunks",
-            chunk_sec=validated["chunk_sec"],
-            overlap_sec=validated["overlap_sec"],
-        )
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "X-DashScope-SSE": "disable",
-        }
-        texts: list[str] = []
-        chunk_results: list[dict[str, Any]] = []
-        result.update(chunks=chunk_results, reused_chunks=0, new_requests=0,
-            uploaded_audio_seconds=0.0, completion="partial",
-            boundary_policy="preserve_text_without_word_timestamps")
-        prepared_hash = _sha256_file(prepared)
-        for chunk in chunks:
-            identity = {"source_audio_sha256": result["source_audio_sha256"],
-                "prepared_audio_sha256": prepared_hash, "audio_sha256": _sha256_file(chunk["path"]),
-                "model": MODEL, "endpoint": DEFAULT_ENDPOINT,
-                "parameters": {"format": "wav", "sample_rate": "16000"},
-                "chunk_sec": validated["chunk_sec"], "overlap_sec": validated["overlap_sec"],
-                "index": chunk["index"], "start_ms": chunk["start_ms"], "end_ms": chunk["end_ms"]}
-            checkpoint = work_dir / f"chunk-{chunk['index']:06d}.result.json"
-            record = _cached_chunk(checkpoint, identity, request.get("retry_uncertain_chunks") is True)
-            if record is not None:
-                result["reused_chunks"] += 1
-            else:
-                payload = _payload(chunk["path"])
-                pending = {"schema": "chineseasr.cloud-chunk.v1", "identity": identity,
-                    "status": "in_flight", "started_utc": _utc_now()}
-                _write_json_atomic(checkpoint, pending)
+            raise WorkerPolicyError("api_key_missing")
+        work = _inside(root / (request["job_id"] + ".work"), root)
+        work.mkdir(parents=True, exist_ok=True)
+        for chunk in request["chunks"]:
+            identity = {"model": request["model"], "protocol": request["protocol"],
+                "audio_sha256": chunk["audio_sha256"], "index": chunk["index"],
+                "start_ms": chunk["start_ms"], "end_ms": chunk["end_ms"],
+                "parameters_sha256": _json_hash(request["parameters"]),
+                "input_sha256": _json_hash({"input": request.get("input", {}),
+                    "messages_prefix": request.get("messages_prefix", []),
+                    "ws_task": request.get("ws_task", {})})}
+            checkpoint = work / f"provider-chunk-{chunk['index']:06d}.json"
+            record = _cached(checkpoint, identity, request.get("retry_uncertain_chunks") is True)
+            if record is None:
+                _check_deadline(request["send_before_utc"])
+                marker = {"schema": "zh_asr.dashscope_chunk_checkpoint.v1",
+                          "identity": identity, "status": "in_flight", "started_utc": _utc_now()}
+                _write_json_atomic(checkpoint, marker)
                 result["cloud_upload_performed"] = True
                 result["new_requests"] += 1
-                result["uploaded_audio_seconds"] += (chunk["end_ms"]-chunk["start_ms"])/1000
                 try:
-                    response = transport(DEFAULT_ENDPOINT, headers, payload, DEFAULT_TIMEOUT_SEC)
-                    text, request_id = _response_text(response)
+                    if request["protocol"] == "http":
+                        audio = "data:audio/wav;base64," + base64.b64encode(
+                            chunk["path"].read_bytes()).decode("ascii")
+                        messages = list(request.get("messages_prefix", [])) + [{"role": "user",
+                            "content": [{"type": "input_audio", "input_audio": {"data": audio}}]}]
+                        payload = {"model": request["model"], "input": {"messages": messages},
+                                   "parameters": request["parameters"]}
+                        response = http_transport(payload, api_key)
+                    else:
+                        response = websocket_transport(request["model"], chunk["path"],
+                            request, api_key, request["send_before_utc"])
                     record = {"index": chunk["index"], "start_ms": chunk["start_ms"],
-                        "end_ms": chunk["end_ms"], "audio_sha256": identity["audio_sha256"],
-                        "provider_request_id": request_id, "text": text,
-                        "usage": response.get("usage") if isinstance(response.get("usage"), dict) else None}
-                except Exception as error:
-                    ambiguous = not isinstance(error, CloudApiError) or error.code in {
-                        "network_failure", "provider_response_invalid", "provider_transcript_missing"}
-                    pending.update(status="outcome_unknown" if ambiguous else "failed",
-                        error_code=error.code if isinstance(error, CloudApiError) else type(error).__name__,
-                        completed_utc=_utc_now())
-                    _write_json_atomic(checkpoint, pending)
+                        "end_ms": chunk["end_ms"], "audio_sha256": chunk["audio_sha256"],
+                        **_scrub(response, api_key)}
+                except Exception as exc:
+                    ambiguous = not isinstance(exc, (ProviderError, WorkerPolicyError)) or (
+                        isinstance(exc, ProviderError) and exc.code in {
+                            "network_failure", "provider_response_invalid", "provider_task_timeout"})
+                    marker.update(status="outcome_unknown" if ambiguous else "failed",
+                                  error_code=_scrub(exc.code, api_key) if isinstance(exc, (ProviderError, WorkerPolicyError))
+                                  else type(exc).__name__, completed_utc=_utc_now())
+                    _write_json_atomic(checkpoint, marker)
                     raise
-                pending.update(status="succeeded", result=record,
-                    result_sha256=_json_digest(record), completed_utc=_utc_now())
-                _write_json_atomic(checkpoint, pending)
-            texts.append(record["text"])
-            chunk_results.append(record)
-            result["text"] = _merge_texts(texts)
-            _write_json_atomic(work_dir / "partial-result.json", result)
-        result.update(
-            {
-                "status": "succeeded",
-                "credential_result": "Success",
-                "text": _merge_texts(texts),
-                "chunks": chunk_results,
-                "completion": "complete",
-            }
-        )
-    except CloudPolicyError as exc:
-        result.update(
-            {
-                "status": "blocked",
-                "error_code": exc.code,
-                "error_message": _bounded_provider_error(exc),
-                "credential_result": "Scope-Error",
-            }
-        )
-    except CloudApiError as exc:
-        result.update(
-            {
-                "status": "failed",
-                "error_code": exc.code,
-                "error_message": _bounded_provider_error(exc),
-                "credential_result": exc.credential_result,
-                "provider_request_id": exc.request_id,
-                "cloud_upload_performed": bool(
-                    result["cloud_upload_performed"] or exc.upload_performed
-                ),
-            }
-        )
+                marker.update(status="succeeded", result=record,
+                              result_sha256=_json_hash(record), completed_utc=_utc_now())
+                _write_json_atomic(checkpoint, marker)
+            else:
+                result["reused_chunks"] += 1
+            result["chunks"].append(record)
+            _write_json_atomic(work / "partial-provider-result.json", result)
+        result.update(status="succeeded", credential_result="Success", completion="complete")
+    except WorkerPolicyError as exc:
+        result.update(status="blocked", error_code=exc.code, credential_result="Scope-Error")
+    except ProviderError as exc:
+        result.update(status="failed", error_code=_scrub(exc.code, api_key),
+            provider_error_code=_scrub(exc.code, api_key),
+            provider_error_message=_scrub(exc.message[:500], api_key),
+            provider_request_id=_scrub(exc.request_id, api_key),
+            http_status=exc.http_status, credential_result=exc.credential_result)
     except Exception as exc:
-        result.update(
-            {
-                "status": "failed",
-                "error_code": "worker_internal_error",
-                "error_message": type(exc).__name__,
-                "credential_result": "Provider-Unavailable",
-            }
-        )
+        result.update(status="failed", error_code="worker_internal_error",
+                      error_type=type(exc).__name__)
     finally:
         result["completed_utc"] = _utc_now()
     return result
 
 
 def claim_single_pending_request(request_root: Path) -> Path:
-    request_root.mkdir(parents=True, exist_ok=True)
     pending = sorted(request_root.glob("*.pending.json"))
-    if not pending:
-        raise CloudPolicyError("pending_request_missing")
     if len(pending) != 1:
-        raise CloudPolicyError("pending_request_ambiguous")
+        raise WorkerPolicyError("pending_request_ambiguous")
     source = pending[0]
-    target = source.with_name(source.name.removesuffix(".pending.json") + ".running.json")
+    target = source.with_name(source.name.replace(".pending.json", ".running.json"))
     if target.exists():
-        raise CloudPolicyError("running_request_already_exists")
+        raise WorkerPolicyError("running_request_exists")
     source.replace(target)
     return target
-
-
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request-root", required=True)
     args = parser.parse_args(argv)
-    request_root = Path(args.request_root).resolve()
+    root = Path(args.request_root).resolve()
+    canonical = (Path(__file__).resolve().parents[1] / "outputs" / "cloud-jobs").resolve()
+    if root != canonical:
+        return 20
     try:
-        request_path = claim_single_pending_request(request_root)
-    except CloudPolicyError:
+        request_path = claim_single_pending_request(root)
+    except WorkerPolicyError:
         return 20
     api_key = os.environ.pop("DASHSCOPE_API_KEY", "")
     try:
-        result = process_request_file(request_path, api_key=api_key)
+        result = process_request_file(request_path, api_key=api_key, request_root=root)
     finally:
         api_key = ""
-    job_id = result.get("job_id") or request_path.name.removesuffix(".running.json")
-    result_path = request_root / f"{job_id}.result.json"
-    _write_json_atomic(result_path, result)
-    if result.get("status") == "succeeded":
-        transcript_path = request_root / f"{job_id}.transcript.txt"
-        transcript_path.write_text(str(result.get("text", "")) + "\n", encoding="utf-8")
-    done_path = request_path.with_name(
-        request_path.name.removesuffix(".running.json") + ".done.json"
-    )
-    request_path.replace(done_path)
-    if result.get("status") == "succeeded":
-        return 0
-    if result.get("status") == "blocked":
-        return 3
-    return 4
+    job_id = result.get("job_id") or request_path.name.replace(".running.json", "")
+    _write_json_atomic(root / (job_id + ".provider.json"), result)
+    request_path.replace(request_path.with_name(request_path.name.replace(".running.json", ".done.json")))
+    return 0 if result["status"] == "succeeded" else 3
 
 
 if __name__ == "__main__":

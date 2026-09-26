@@ -48,10 +48,9 @@ $utf8NoBom = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = $utf8NoBom
 
 $brokerPath = 'C:\ProgramData\PCConfig\AuthorityHost\tools\Invoke-SecretBroker.ps1'
-# One registered, hash-pinned worker owns both explicitly labelled request purposes.
-$brokerTarget = 'qwen-audio-asr-review-once'
-$importantRequestSchema = 'chineseasr.qwen-audio3-important-request.v1'
-$qualityReviewRequestSchema = 'chineseasr.qwen-audio3-quality-review-request.v1'
+$pipelineScript = Join-Path $PSScriptRoot 'cloud-review-pipeline.py'
+$python = Join-Path $PSScriptRoot '..\.venv\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { $python = 'python' }
 $importantResultSchema = 'chineseasr.qwen-audio3-important-result.v1'
 $qualityReviewResultSchema = 'chineseasr.qwen-audio3-quality-review-result.v1'
 $canonicalRequestRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\outputs\cloud-jobs'))
@@ -61,7 +60,9 @@ function Write-BoundedReceipt {
     param(
         [Parameter(Mandatory)][string] $Status,
         [Parameter(Mandatory)][string] $ErrorCode,
-        [Parameter(Mandatory)][int] $ExitCode
+        [Parameter(Mandatory)][int] $ExitCode,
+        [string] $Message = '',
+        [string] $BillingWarning = ''
     )
 
     $receipt = [ordered]@{
@@ -76,6 +77,8 @@ function Write-BoundedReceipt {
         cloud_retry_policy = 'do_not_retry'
         local_fallback_recommendation = 'none'
     }
+    if ($Message) { $receipt['message'] = $Message }
+    if ($BillingWarning) { $receipt['billing_warning'] = $BillingWarning }
     if ($Json) {
         $receipt | ConvertTo-Json -Depth 8 -Compress | Write-Output
     }
@@ -127,18 +130,15 @@ function Get-CloudFailureAdvice {
 }
 
 $selectedPurpose = 'unspecified'
-$selectedRequestSchema = $importantRequestSchema
 $selectedResultSchema = $importantResultSchema
 $selectedImportantOnly = $false
 if ($Important -and -not $QualityReview) {
     $selectedPurpose = 'important_evidence'
-    $selectedRequestSchema = $importantRequestSchema
     $selectedResultSchema = $importantResultSchema
     $selectedImportantOnly = $true
 }
 elseif ($QualityReview -and -not $Important) {
     $selectedPurpose = 'quality_review'
-    $selectedRequestSchema = $qualityReviewRequestSchema
     $selectedResultSchema = $qualityReviewResultSchema
 }
 
@@ -157,17 +157,8 @@ if (-not $CloudUploadAuthorized -and -not $AutomaticReview) {
 if ($AutomaticReview -and -not $LocalOutDir) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'local_review_required' -ExitCode 2
 }
-if ($Legacy -and ($AutomaticReview -or $ModelProfile -or $SpeakerDiarization -or $KeepDialect)) {
+if ($Legacy -and ($AutomaticReview -or $ModelProfile)) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'legacy_options_unsupported' -ExitCode 2
-}
-if ($SpeakerDiarization -and $KeepDialect) {
-    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'speaker_and_dialect_conflict' -ExitCode 2
-}
-if ($ModelProfile -and $ModelProfile -notin @('short', 'message')) {
-    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'model_profile_invalid' -ExitCode 2
-}
-if ($ModelProfile -eq 'message' -and $SpeakerDiarization) {
-    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'speaker_model_required' -ExitCode 2
 }
 if ($OverlapSec -ge $ChunkSec) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'chunk_policy_invalid' -ExitCode 2
@@ -181,10 +172,6 @@ $audioPath = [IO.Path]::GetFullPath($Audio)
 if (-not (Test-Path -LiteralPath $audioPath -PathType Leaf)) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'audio_file_missing' -ExitCode 2
 }
-if (-not (Test-Path -LiteralPath $brokerPath -PathType Leaf)) {
-    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'secret_broker_unavailable' -ExitCode 2
-}
-
 $cloudMutex = [Threading.Mutex]::new($false, 'Global\ChineseASRCloudUploadOnce')
 $mutexHeld = $false
 try {
@@ -207,10 +194,12 @@ if ($pending.Count -ne 0) {
 }
 
 $jobId = [Guid]::NewGuid().ToString()
-$requestPath = Join-Path $resolvedRequestRoot ($jobId + '.pending31.json')
+$intentPath = Join-Path $resolvedRequestRoot ($jobId + '.intent.json')
+$requestPath = Join-Path $resolvedRequestRoot ($jobId + '.pending.json')
+$providerPath = Join-Path $resolvedRequestRoot ($jobId + '.provider.json')
 $resultPath = Join-Path $resolvedRequestRoot ($jobId + '.result.json')
-$request = [ordered]@{
-    schema = 'chineseasr.qwen-audio31-request.v1'
+$intent = [ordered]@{
+    schema = 'zh_asr.cloud_review_intent.v1'
     job_id = $jobId
     purpose = $selectedPurpose
     cloud_upload_authorized = $true
@@ -220,49 +209,73 @@ $request = [ordered]@{
     overlap_sec = $OverlapSec
 }
 if ($Important) {
-    $request['importance'] = 'important'
+    $intent['importance'] = 'important'
 }
-$request['automatic_review'] = [bool]$AutomaticReview
-$request['speaker_diarization'] = [bool]$SpeakerDiarization
-$request['keep_dialect'] = [bool]$KeepDialect
-$request['hotwords'] = $Hotwords
-if ($null -ne $ChannelIndex) { $request['channel_index'] = [int]$ChannelIndex }
-if ($EvidenceStatus) { $request['evidence_status'] = $EvidenceStatus }
-if ($ModelProfile) { $request['model_profile'] = $ModelProfile }
-if ($Legacy) { $request['model_profile'] = 'legacy' }
+$intent['automatic_review'] = [bool]$AutomaticReview
+$intent['speaker_diarization'] = [bool]$SpeakerDiarization
+$intent['keep_dialect'] = [bool]$KeepDialect
+$intent['hotwords'] = $Hotwords
+if ($null -ne $ChannelIndex) { $intent['channel_index'] = [int]$ChannelIndex }
+if ($EvidenceStatus) { $intent['evidence_status'] = $EvidenceStatus }
+if ($ModelProfile) { $intent['model_profile'] = $ModelProfile }
+if ($Legacy) { $intent['model_profile'] = 'legacy' }
 if ($LocalOutDir) {
     $localPath = [IO.Path]::GetFullPath($LocalOutDir)
     if (-not (Test-Path -LiteralPath $localPath -PathType Container)) {
         Write-BoundedReceipt -Status 'blocked' -ErrorCode 'local_result_missing' -ExitCode 2
     }
-    $request['local_out_dir'] = $localPath
+    $intent['local_out_dir'] = $localPath
 }
 [IO.File]::WriteAllText(
-    $requestPath,
-    ($request | ConvertTo-Json -Depth 8),
+    $intentPath,
+    ($intent | ConvertTo-Json -Depth 8),
     $utf8NoBom
 )
+$prepareRaw = & $python $pipelineScript prepare `
+    --root $resolvedRequestRoot --intent $intentPath 2>&1 | Out-String
+$prepareExit = $LASTEXITCODE
+try { $prepared = $prepareRaw | ConvertFrom-Json -Depth 30 }
+catch { Write-BoundedReceipt -Status 'failed' -ErrorCode 'cloud_prepare_receipt_invalid' -ExitCode 3 }
+if ($prepareExit -ne 0 -or [string]$prepared.status -cne 'ready') {
+    $errorCode = if ($prepared.error_code) { [string]$prepared.error_code } else { 'cloud_prepare_failed' }
+    $status = if ($prepared.status) { [string]$prepared.status } else { 'failed' }
+    $prepareMessage = if ($prepared.PSObject.Properties.Name -contains 'message') { [string]$prepared.message } else { '' }
+    $prepareWarning = if ($prepared.PSObject.Properties.Name -contains 'billing_warning') { [string]$prepared.billing_warning } else { '' }
+    Write-BoundedReceipt -Status $status -ErrorCode $errorCode -ExitCode 2 `
+        -Message $prepareMessage -BillingWarning $prepareWarning
+}
+$brokerTarget = [string]$prepared.secret_ref_target
+$credentialRef = [string]$prepared.credential_ref
+if (-not $brokerTarget -or -not $credentialRef) {
+    Write-BoundedReceipt -Status 'failed' -ErrorCode 'cloud_credential_route_missing' -ExitCode 3
+}
 
 $brokerOutput = ''
 $brokerExitCode = 1
 try {
-    $brokerOutput = & $brokerPath `
-        -Action AgentSecretRef `
-        -Query $brokerTarget `
-        -RuntimePrincipal Codex `
-        -Json 2>&1 | Out-String
-    $brokerExitCode = $LASTEXITCODE
+    if (Test-Path -LiteralPath $brokerPath -PathType Leaf) {
+        $brokerOutput = & $brokerPath `
+            -Action AgentSecretRef `
+            -Query $brokerTarget `
+            -RuntimePrincipal Codex `
+            -Json 2>&1 | Out-String
+        $brokerExitCode = $LASTEXITCODE
+    }
 }
 finally {
     if (Test-Path -LiteralPath $requestPath -PathType Leaf) {
-        $unclaimedPath = Join-Path $resolvedRequestRoot ($jobId + '.unclaimed31.json')
+        $unclaimedPath = Join-Path $resolvedRequestRoot ($jobId + '.unclaimed.json')
         Move-Item -LiteralPath $requestPath -Destination $unclaimedPath -Force
     }
 }
 
-if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+$brokerError = ''
+if (-not (Test-Path -LiteralPath $providerPath -PathType Leaf)) {
     $brokerErrorCode = Get-SafeBrokerErrorCode -Raw $brokerOutput
-    $errorCode = if ($brokerErrorCode) {
+    $brokerError = if (-not (Test-Path -LiteralPath $brokerPath -PathType Leaf)) {
+        'secret_broker_unavailable'
+    }
+    elseif ($brokerErrorCode) {
         $brokerErrorCode
     }
     elseif ($brokerExitCode -eq 0) {
@@ -271,28 +284,14 @@ if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
     else {
         'secret_broker_target_failed'
     }
-    $advice = Get-CloudFailureAdvice -Status 'failed' -ErrorCode $errorCode -CredentialResult ''
-    $receipt = [ordered]@{
-        schema = $selectedResultSchema
-        job_id = $jobId
-        status = 'failed'
-        error_code = $errorCode
-        purpose = $selectedPurpose
-        important_only = $selectedImportantOnly
-        cloud_upload_performed = $false
-        broker_exit_code = $brokerExitCode
-        plaintext_returned = $false
-        secret_returned = $false
-        cloud_retry_policy = $advice.cloud_retry_policy
-        local_fallback_recommendation = $advice.local_fallback_recommendation
-    }
-    if ($Json) {
-        $receipt | ConvertTo-Json -Depth 8 -Compress | Write-Output
-    }
-    else {
-        $receipt
-    }
-    exit 3
+}
+$finalArguments = @($pipelineScript, 'finalize', '--root', $resolvedRequestRoot,
+                    '--intent', $intentPath)
+if ($brokerError) { $finalArguments += @('--broker-error', $brokerError) }
+else { $finalArguments += @('--provider', $providerPath) }
+$finalRaw = & $python @finalArguments 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+    Write-BoundedReceipt -Status 'failed' -ErrorCode 'cloud_finalize_failed' -ExitCode 3
 }
 
 $result = Get-Content -LiteralPath $resultPath -Raw -Encoding utf8 |
@@ -325,7 +324,7 @@ if ($credentialResult -cin $allowedCredentialResults) {
     try {
         $reportOutput = & $brokerPath `
             -Action ReportCredentialResult `
-            -Query 'qwen-default' `
+            -Query $credentialRef `
             -ResultCode $credentialResult `
             -OperationId $jobId `
             -RuntimePrincipal Codex `

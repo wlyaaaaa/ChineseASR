@@ -151,7 +151,10 @@ profiles:
 # provider-error pause without calculating local credit.
 cloud_review:
   region: cn-beijing
+  # Exclusive Beijing-time cutoff; a date with unknown clock time stops at 00:00.
   credit_cycle: '2026-09-26-initial'
+  secret_ref_target: qwen-audio3-asr-important-once
+  credential_ref: qwen-default
   routes:
     short: short
     long: message
@@ -161,16 +164,33 @@ cloud_review:
   models:
     short:
       id: qwen-audio-3.1-asr-flash
-      api: http_base64
-      endpoint: https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
+      free_until: '2026-12-21T00:00:00+08:00'
+      api: http
       max_chunk_sec: 120
+      supports_speaker_diarization: true
+      supports_keep_dialect: true
+      speaker_dialect_exclusive: true
+      supports_vocabulary: true
     message:
       id: qwen-audio-3.1-asr-flash-message
-      api: websocket_pcm
-      endpoint: wss://dashscope.aliyuncs.com/api-ws/v1/inference
+      free_until: '2026-12-21T00:00:00+08:00'
+      api: websocket
       max_chunk_sec: 30
+      supports_speaker_diarization: false
+      supports_keep_dialect: true
+      supports_vocabulary: true
+      parameters:
+        disfluency_removal_enabled: false
+        intermediate_result_enabled: false
+      ws_task:
+        task_group: audio
+        task: asr
+        function: recognition
     legacy:
       id: qwen-audio-3.0-asr-flash
-      api: legacy_http_base64
-      endpoint: https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
+      free_until: '2026-09-27T02:00:00+08:00'
+      api: http
       max_chunk_sec: 180
+      supports_speaker_diarization: false
+      supports_keep_dialect: false
+      supports_vocabulary: true

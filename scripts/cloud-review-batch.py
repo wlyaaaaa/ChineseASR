@@ -11,7 +11,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from zh_asr.cloud_review import (CloudReviewError, auto_cloud_status,
-    compare_text, load_cloud_config, local_review_signals)
+    compare_text, load_cloud_config, local_review_signals, pause_message)
 
 
 def _write_sidecar(out_dir: str, payload: dict) -> None:
@@ -27,6 +27,7 @@ def _skip_group(group: dict, reason: str) -> None:
     for run in group["local_runs"]:
         _write_sidecar(run["out_dir"], {"status": "skipped",
             "error_code": "auto_cloud_paused", "pause_reason": reason,
+            "message": pause_message(reason),
             "source_audio_sha256": group["audio_sha256"],
             "cloud_upload_performed": False})
 

@@ -40,7 +40,7 @@
 - **低幻觉和可复核**：双模型分歧、静音出字、模板废话、异常重复、繁体残留、超长无标点等都会进入 audit / metrics / review。
 - **适合 AI Agent 调用**：`scripts\asr-smart.ps1` 通过本地 API 提交任务，快速返回 job 状态，避免长时间卡住命令行或上层 Agent。
 
-它以本地转写为主。2026-09-26 本人授权疑难录音自动加跑阿里云百炼复核，无需逐次授权；本人决定阿里云账户没有余额，不开启「免费额度用完即停」，本地不计算额度。自动路径只判断录音是否疑难；云端若报额度、欠费、余额、权限或模型下线错误，就记录原因并停止后续自动上传。网络等临时错误只记本次失败。本地正文先保存，云结果另外保存并标出分歧；普通清楚录音和桌面听写不上传。
+它以本地转写为主。2026-09-26 本人授权疑难录音在配置的免费期内自动加跑阿里云百炼复核，无需逐次授权；本人已了解余额为零仍可能产生后付费欠费，决定不开「免费额度用完即停」、本地不计算用量。自动路径只看疑难信号、模型免费期日期及已有的云端停用状态；过期写明「免费期已到期，云端未跑」。云端若报额度、欠费、余额、权限或模型下线错误，记录原因并停止后续自动上传；临时网络等错误只记本次。显式授权的单次上传过期仍可执行，结果注明可能计费。本地正文先保存，云结果另外保存并标出分歧；普通清楚录音和桌面听写不上传。
 
 ## 文件转写质量与模型维护
 
@@ -184,13 +184,17 @@ cd <repo-root>
 1. `-Important`：当前录音已被明确归类为重要或专业录音。请求仍写入 `importance=important`，回执仍为 `important_only=true`；
 2. `-QualityReview`：仅用于已授权、当前选定的普通存疑本地转写质量复核。请求写入独立的 `purpose=quality_review`，没有 `importance` 字段，回执为 `important_only=false`；
 3. `-CloudUploadAuthorized`：调用方确认这次可以上传；或 `-AutomaticReview -LocalOutDir <本地结果目录>`：只在目录内已有疑难证据时，使用本人 2026-09-26 的授权；
-4. Password Center 对新受管目标 `qwen-audio-asr-review-once` 及 worker 哈希的完整性验证通过。3.0 显式后备也走同一受管 worker；目标缺失不绕过。
+4. Password Center 对配置的受管目标及 worker 哈希的完整性验证通过。当前配置仍指向已有 `qwen-audio3-asr-important-once`；厂商一把 Key 的最终登记形式由 PCConfig 相关调查确定，本项目不绕过既有固定哈希。3.0 显式后备与 3.1 共用同一 DashScope worker。
 
 两个用途开关不能同时使用。普通质量复核不会自动启动 FireRed、Qwen 或其它本地双引擎；只有结果与上下文仍有影响理解的分歧时，才按实际需要回核原音和本地结果。重要证据录音仍适用下文的本地证据链与人工核听要求。
 
-API Key 只由 Secret Broker 注入固定、哈希绑定的子进程环境，不进入命令行、请求文件、转写结果或模型上下文。每次尝试都在被 Git 忽略的 `outputs\cloud-jobs` 留请求、结果、原音哈希、模型、时间及每段提供方用量；这些是作业记录，本地不按它们预留或计算剩余额度。百炼官方的 3.1 计量是 Token，3.0 是音频秒数，但本地不以此拦截调用。
+流水线先按 `configs/models.yaml` 选模型、接口类型和免费期，抽取指定声道、重采样并在本机切段；请求只引用 `outputs\cloud-jobs` 内的音频段。受管 `scripts\qwen_audio3_broker_worker.py` 是自成一体的单文件，仅从 Password Center 的 SecretRef 接收 Key，校验请求根与音频段，按请求明写的 `http` 或 `websocket` 类型送往写死的北京 DashScope 地址，并留原始响应、HTTP 状态与 usage。worker 不导入本项目其它源码，也不读模型配置；模型名只检查基本字符格式，不设模型族白名单。模型或流水线配置更新无需因此重新固定 worker 哈希；worker 本身修改仍须由受管目标核对其新哈希。Key 不进入命令行、请求文件、结果或日志。WebSocket 使用现有 venv 的 websockets 客户端完成标准库缺少的握手和二进制帧。
 
-百炼返回免费额度用尽、欠费、余额不足、无权限或模型下线类错误时，`outputs\cloud-jobs\auto-cloud-state.json` 记录停用原因，后续疑难作业保留本地转写并在 `cloud.review.json` 写明云端未跑及原因。`python scripts/cloud-review-state.py status` 查看状态。本人说恢复时运行 `python scripts/cloud-review-state.py resume`；配置新增或替换模型 ID，或 `credit_cycle` 更新为实际新额度时，也恢复自动尝试。网络抖动、超时、限流与服务端 5xx 只记本次失败，不触发持久停用。本人决定不启用百炼的「免费额度用完即停」，此入口不以该开关为条件。
+每次尝试都在被 Git 忽略的 `outputs\cloud-jobs` 留请求、供应商原始结果、投影结果、原音哈希、模型、时间及每段 usage；这些是作业记录，本地不预留或计算剩余额度。百炼官方的 3.1 计量是 Token，3.0 是音频秒数，但本地不以此拦截调用。
+
+免费期截止日写在 `configs/models.yaml` 的每个云模型 `free_until` 中，按北京时间的带时区时刻作不含截止点的比较。3.1 两款按本人转述的 2026-12-21 暂取当日 00:00 早停；3.0 暂取 2026-09-27 02:00，均不是控制台实时核验的到期时刻。自动模式过期不上传并写 `cloud.review.json`；换成新模型或更新确有新免费期的日期后恢复。显式 `-CloudUploadAuthorized` 不受日期阻断，但过期结果标「可能计费」。这只比日期，不算用量。
+
+百炼返回免费额度用尽、欠费、余额不足、无权限或模型下线类错误时，`outputs\cloud-jobs\auto-cloud-state.json` 记录停用原因，后续疑难作业保留本地转写并在 `cloud.review.json` 写明云端未跑及原因。`python scripts/cloud-review-state.py status` 查看状态。本人说恢复时运行 `python scripts/cloud-review-state.py resume`；配置新增或替换模型 ID、更新免费期日期，或 `credit_cycle` 更新为实际新额度时，也解除旧供应商停用。网络抖动、超时、限流与服务端 5xx 只记本次失败，不触发持久停用。本人决定不启用百炼的「免费额度用完即停」，此入口不以该开关为条件。
 
 本地转写的 `quality.review.json` 标 `needs_review`、两引擎分歧、`[疑似]`、`provisional` 或作业的 `-Important` 标记会触发自动复核。`scripts/cloud-review-batch.py --dry-run` 先列出现有疑难作业；去掉 `--dry-run` 批量补跑。云结果保存在被 Git 忽略的 `outputs\cloud-jobs`，本地结果目录另写 `cloud.review.json` 并排保留文本与差异，不静默覆盖正文。云调用失败会
 明确返回失败原因，不会静默冒充本地结果。运行时重绑缺失时不上传，重绑后可按原用途重试；网络、
