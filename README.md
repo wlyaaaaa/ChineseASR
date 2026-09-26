@@ -206,6 +206,8 @@ cd <repo-root>
 `asr-smart`，并保持云结果与本地证据链分开。对于法律、投诉、雇佣等证据录音，云结果是能力优先的
 专业候选，同时仍应运行 FireRed + Qwen 本地证据链并人工核听，不能把云转写本身当作证据认证。
 
+`asr-professional-cloud.ps1 -Json` 的标准输出只给最终转写回执，密钥代理的两份原始回执保存在回执所列 `outputs\cloud-jobs\<job>.broker.json`；批量补跑会先按原音哈希、用途和声道复用已成功的云结果，修正误记的失败侧车，再决定是否上传。
+
 显式复核可以带 `-Hotwords @{'省高院'=2;'最高院'=2}`、`-SpeakerDiarization` 或 `-KeepDialect`；前者使用官方即时热词权重，两个声学选项不可同时开启。重要录音用 `-Important`，普通存疑质量复核用 `-QualityReview`。官方接口与计量见[语音识别模型表](https://help.aliyun.com/zh/model-studio/asr-model)、[Flash HTTP 参数](https://help.aliyun.com/zh/model-studio/fun-asr-flash-recorded-speech-recognition-http-api)、[Message WebSocket 参数](https://help.aliyun.com/zh/model-studio/qwen-asr-message-client-events)及[模型价格](https://help.aliyun.com/zh/model-studio/model-pricing)。
 
 ## 安装与模型下载

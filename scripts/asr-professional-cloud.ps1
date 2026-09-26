@@ -107,6 +107,29 @@ function Get-SafeBrokerErrorCode {
     return $null
 }
 
+function Convert-BrokerReceiptForLog {
+    param([AllowEmptyString()][string] $Raw)
+    if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
+    try { return ($Raw | ConvertFrom-Json -AsHashtable -Depth 30) }
+    catch { return $Raw.Trim() }
+}
+
+function Write-BrokerReceiptLog {
+    param(
+        [string] $Path,
+        [string] $JobId,
+        [AllowEmptyString()][string] $AgentSecretRefRaw,
+        [AllowEmptyString()][string] $CredentialReportRaw
+    )
+    $log = [ordered]@{
+        schema = 'zh_asr.broker_receipts.v1'
+        job_id = $JobId
+        agent_secret_ref_receipt = Convert-BrokerReceiptForLog -Raw $AgentSecretRefRaw
+        credential_result_report_receipt = Convert-BrokerReceiptForLog -Raw $CredentialReportRaw
+    }
+    [IO.File]::WriteAllText($Path, ($log | ConvertTo-Json -Depth 30), $utf8NoBom)
+}
+
 function Get-CloudFailureAdvice {
     param(
         [AllowEmptyString()][string] $Status,
@@ -203,6 +226,7 @@ $intentPath = Join-Path $resolvedRequestRoot ($jobId + '.intent.json')
 $requestPath = Join-Path $resolvedRequestRoot ($jobId + '.pending.json')
 $providerPath = Join-Path $resolvedRequestRoot ($jobId + '.provider.json')
 $resultPath = Join-Path $resolvedRequestRoot ($jobId + '.result.json')
+$brokerLogPath = Join-Path $resolvedRequestRoot ($jobId + '.broker.json')
 $intent = [ordered]@{
     schema = 'zh_asr.cloud_review_intent.v1'
     job_id = $jobId
@@ -259,7 +283,9 @@ $brokerOutput = ''
 $brokerExitCode = 1
 try {
     if (Test-Path -LiteralPath $brokerPath -PathType Leaf) {
-        $brokerOutput = & $brokerPath `
+        # The broker writes directly to Console.Out; a child process makes that
+        # output capturable instead of leaking it into this entry's JSON stdout.
+        $brokerOutput = & pwsh -NoProfile -NonInteractive -File $brokerPath `
             -Action AgentSecretRef `
             -Query $brokerTarget `
             -RuntimePrincipal $RuntimePrincipal `
@@ -273,6 +299,8 @@ finally {
         Move-Item -LiteralPath $requestPath -Destination $unclaimedPath -Force
     }
 }
+Write-BrokerReceiptLog -Path $brokerLogPath -JobId $jobId `
+    -AgentSecretRefRaw $brokerOutput -CredentialReportRaw ''
 
 $brokerError = ''
 if (-not (Test-Path -LiteralPath $providerPath -PathType Leaf)) {
@@ -325,9 +353,10 @@ $allowedCredentialResults = @(
 )
 $credentialResult = [string]$result.credential_result
 $credentialReportStatus = 'not-reported'
+$reportOutput = ''
 if ($credentialResult -cin $allowedCredentialResults) {
     try {
-        $reportOutput = & $brokerPath `
+        $reportOutput = & pwsh -NoProfile -NonInteractive -File $brokerPath `
             -Action ReportCredentialResult `
             -Query $credentialRef `
             -ResultCode $credentialResult `
@@ -345,8 +374,11 @@ if ($credentialResult -cin $allowedCredentialResults) {
         $credentialReportStatus = 'report-failed'
     }
 }
+Write-BrokerReceiptLog -Path $brokerLogPath -JobId $jobId `
+    -AgentSecretRefRaw $brokerOutput -CredentialReportRaw $reportOutput
 
 $result | Add-Member -NotePropertyName result_path -NotePropertyValue $resultPath -Force
+$result | Add-Member -NotePropertyName broker_log_path -NotePropertyValue $brokerLogPath -Force
 $result | Add-Member `
     -NotePropertyName credential_report_status `
     -NotePropertyValue $credentialReportStatus `

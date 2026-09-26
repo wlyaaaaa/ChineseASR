@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import uuid
 import wave
 
 
@@ -21,6 +22,73 @@ def _write_wav(path: Path) -> None:
 
 
 class ProfessionalCloudScriptTests(unittest.TestCase):
+    def test_json_stdout_contains_only_final_receipt_and_broker_receipts_are_logged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            audio = root / "recording.wav"
+            _write_wav(audio)
+            broker = scripts / "fake-broker.ps1"
+            request_root = root / "outputs" / "cloud-jobs"
+            broker.write_text("""param([string]$Action, [string]$Query, [string]$RuntimePrincipal,
+    [string]$ResultCode, [string]$OperationId, [switch]$Json)
+$root = '%s'
+if ($Action -eq 'AgentSecretRef') {
+    [IO.File]::WriteAllText((Join-Path $root ($Query + '.provider.json')), '{}')
+    [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"ok","action":"AgentSecretRef"}')
+    exit 0
+}
+[Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"ok","action":"ReportCredentialResult"}')
+exit 0
+""" % str(request_root).replace("'", "''"), encoding="utf-8")
+            pipeline = scripts / "cloud-review-pipeline.py"
+            pipeline.write_text("""import json
+from pathlib import Path
+import sys
+
+action = sys.argv[1]
+root = Path(sys.argv[sys.argv.index('--root') + 1])
+intent = json.loads(Path(sys.argv[sys.argv.index('--intent') + 1]).read_text(encoding='utf-8'))
+job_id = intent['job_id']
+if action == 'prepare':
+    (root / (job_id + '.pending.json')).write_text('{}', encoding='utf-8')
+    print(json.dumps({'status': 'ready', 'secret_ref_target': job_id,
+                      'credential_ref': 'fixture'}))
+else:
+    result = {'schema': 'chineseasr.qwen-audio3-quality-review-result.v1',
+              'job_id': job_id, 'purpose': 'quality_review',
+              'important_only': False, 'status': 'succeeded', 'error_code': '',
+              'credential_result': 'Success', 'cloud_upload_performed': True,
+              'text': 'fixture transcript'}
+    (root / (job_id + '.result.json')).write_text(json.dumps(result), encoding='utf-8')
+    print(json.dumps({'status': 'succeeded'}))
+""", encoding="utf-8")
+            source = SCRIPT.read_text(encoding="utf-8")
+            original = "$brokerPath = 'C:\\ProgramData\\PCConfig\\AuthorityHost\\tools\\Invoke-SecretBroker.ps1'"
+            self.assertIn(original, source)
+            relocated = scripts / SCRIPT.name
+            relocated.write_text(source.replace(original,
+                "$brokerPath = '" + str(broker).replace("'", "''") + "'").replace(
+                "Global\\ChineseASRCloudUploadOnce",
+                "Global\\ChineseASRCloudUploadTest" + uuid.uuid4().hex), encoding="utf-8")
+            result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File",
+                str(relocated), "-Audio", str(audio), "-QualityReview",
+                "-CloudUploadAuthorized", "-Json"], cwd=root, capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=60,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.assertEqual(0, result.returncode, result.stderr)
+            decoder = json.JSONDecoder()
+            receipt, end = decoder.raw_decode(result.stdout.strip())
+            self.assertEqual(len(result.stdout.strip()), end)
+            self.assertEqual("succeeded", receipt["status"])
+            log_path = Path(receipt["broker_log_path"])
+            self.assertTrue(log_path.is_file())
+            log = json.loads(log_path.read_text(encoding="utf-8"))
+            self.assertEqual("AgentSecretRef", log["agent_secret_ref_receipt"]["action"])
+            self.assertEqual("ReportCredentialResult",
+                log["credential_result_report_receipt"]["action"])
+
     def test_relocated_script_uses_its_own_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -11,7 +11,10 @@ import sys
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+CLOUD_RESULTS_ROOT = ROOT / "outputs" / "cloud-jobs"
 SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+RESULT_SCHEMAS = {"important_evidence": "chineseasr.qwen-audio3-important-result.v1",
+                  "quality_review": "chineseasr.qwen-audio3-quality-review-result.v1"}
 sys.path.insert(0, str(ROOT / "src"))
 from zh_asr.cloud_review import (CloudReviewError, auto_cloud_status,
     compare_text, load_cloud_config, local_review_signals, pause_message)
@@ -35,16 +38,54 @@ def _skip_group(group: dict, reason: str) -> None:
             "cloud_upload_performed": False})
 
 
-def _link_result(group: dict, result_path: Path) -> bool:
+def _successful_result(result_path: Path) -> dict | None:
     try:
         retained = json.loads(result_path.read_text(encoding="utf-8"))
-        if (retained.get("status") != "succeeded" or
-            retained.get("source_audio_sha256") != group["audio_sha256"] or
-            retained.get("selected_channel") != group["channel_index"] or
-            (group["important"] and retained.get("purpose") != "important_evidence") or
-            not isinstance(retained.get("text"), str)):
-            return False
-    except (OSError, ValueError, AttributeError):
+        purpose = retained.get("purpose")
+        if (not isinstance(retained, dict) or
+            retained.get("schema") != RESULT_SCHEMAS.get(purpose) or
+            retained.get("status") != "succeeded" or
+            retained.get("credential_result") != "Success" or
+            retained.get("cloud_upload_performed") is not True or
+            not isinstance(retained.get("text"), str) or not retained["text"].strip() or
+            result_path.name != str(retained.get("job_id")) + ".result.json"):
+            return None
+        return retained
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def _result_key(audio_hash: str, channel: int | None, purpose: str) -> tuple[str, int | None, str]:
+    return audio_hash.casefold(), channel, purpose
+
+
+def _retained_result_index() -> dict[tuple[str, int | None, str], Path]:
+    matches: dict[tuple[str, int | None, str], Path] = {}
+    try:
+        paths = list(CLOUD_RESULTS_ROOT.glob("*.result.json"))
+    except OSError:
+        return matches
+    dated_paths = []
+    for path in paths:
+        try:
+            dated_paths.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue
+    for _, path in sorted(dated_paths):
+        retained = _successful_result(path)
+        if retained:
+            matches[_result_key(str(retained.get("source_audio_sha256") or ""),
+                retained.get("selected_channel"), retained["purpose"])] = path
+    return matches
+
+
+def _link_result(group: dict, result_path: Path, *, reused: bool = False) -> bool:
+    retained = _successful_result(result_path)
+    if (retained is None or
+        _result_key(str(retained.get("source_audio_sha256") or ""),
+                    retained.get("selected_channel"), retained["purpose"]) !=
+        _result_key(group["audio_sha256"], group["channel_index"],
+                    "important_evidence" if group["important"] else "quality_review")):
         return False
     for run in group["local_runs"]:
         reasons, local_text = local_review_signals(Path(run["out_dir"]),
@@ -59,8 +100,27 @@ def _link_result(group: dict, result_path: Path) -> bool:
             "local_text": local_text, "cloud_text": retained["text"],
             "disagreement": compare_text(local_text, retained["text"]) if local_text else [],
             "cloud_upload_performed": True,
-            "reused_cloud_result": run["job_id"] != group["job_id"]})
+            "reused_cloud_result": reused or run["job_id"] != group["job_id"]})
     return True
+
+
+def _last_json_object(stdout: str) -> dict:
+    """Read the last complete object from concatenated process receipts."""
+    decoder = json.JSONDecoder()
+    position = 0
+    last: dict | None = None
+    while (start := stdout.find("{", position)) >= 0:
+        try:
+            value, end = decoder.raw_decode(stdout, start)
+        except json.JSONDecodeError:
+            position = start + 1
+            continue
+        if isinstance(value, dict):
+            last = value
+        position = end
+    if last is None:
+        raise ValueError("cloud_receipt_invalid")
+    return last
 
 
 def _matching_source(path: Path, expected_hash: str, hashes: dict[Path, str]) -> bool:
@@ -102,8 +162,8 @@ def candidates(jobs_file: Path, *, recovery_roots: list[Path] | None = None,
     data = json.loads(jobs_file.read_text(encoding="utf-8"))
     if data.get("schema") != "zh_asr.jobs.v1" or not isinstance(data.get("jobs"), list):
         raise ValueError("jobs_schema_invalid")
-    groups: dict[tuple[str, int | None], dict] = {}
-    retained: dict[tuple[str, int | None], tuple[str, str]] = {}
+    groups: dict[tuple[str, int | None, str], dict] = {}
+    retained = _retained_result_index()
     hashes: dict[Path, str] = {}
     roots = recovery_roots or []
     ordered = sorted(data["jobs"], key=lambda item: (
@@ -119,20 +179,18 @@ def candidates(jobs_file: Path, *, recovery_roots: list[Path] | None = None,
         if not out_dir.is_dir():
             continue
         audio_hash = str(request.get("audio_sha256") or "")
-        key = ((audio_hash or str(audio)).casefold(), request.get("channel_index"))
+        purpose = "important_evidence" if important else "quality_review"
+        key = _result_key(audio_hash or str(audio), request.get("channel_index"), purpose)
         sidecar = out_dir / "cloud.review.json"
         if sidecar.is_file():
             try:
                 current = json.loads(sidecar.read_text(encoding="utf-8"))
                 result_path = Path(str(current.get("cloud_result_path") or ""))
-                if current.get("status") == "succeeded" and result_path.is_file():
-                    cloud = json.loads(result_path.read_text(encoding="utf-8"))
-                    if (cloud.get("status") == "succeeded" and
-                        cloud.get("source_audio_sha256") == audio_hash and
-                        cloud.get("selected_channel") == request.get("channel_index") and
-                        (not important or cloud.get("purpose") == "important_evidence")):
-                        retained[key] = (str(result_path), str(cloud.get("purpose") or ""))
-                        continue
+                cloud = _successful_result(result_path) if result_path.is_file() else None
+                if (current.get("status") == "succeeded" and cloud and
+                    _result_key(str(cloud.get("source_audio_sha256") or ""),
+                        cloud.get("selected_channel"), cloud["purpose"]) == key):
+                    continue
             except (OSError, ValueError, AttributeError):
                 pass
         reasons, _ = local_review_signals(out_dir,
@@ -141,7 +199,8 @@ def candidates(jobs_file: Path, *, recovery_roots: list[Path] | None = None,
             continue
         recovered = False
         original_audio = str(audio)
-        if not _matching_source(audio, audio_hash, hashes):
+        existing = retained.get(key)
+        if not existing and not _matching_source(audio, audio_hash, hashes):
             replacement = _recover_source(audio, audio_hash, roots, hashes)
             if replacement is None:
                 if missing_sources is not None:
@@ -163,11 +222,7 @@ def candidates(jobs_file: Path, *, recovery_roots: list[Path] | None = None,
                 "out_dir": str(out_dir), "evidence_status": run["evidence_status"],
                 "important": important, "audio_sha256": audio_hash,
                 "channel_index": request.get("channel_index"), "reasons": reasons,
-                "local_runs": [run], "existing_result_path": ""}
-    for key, group in groups.items():
-        existing = retained.get(key)
-        if existing and (not group["important"] or existing[1] == "important_evidence"):
-            group["existing_result_path"] = existing[0]
+                "local_runs": [run], "existing_result_path": str(existing or "")}
     return list(groups.values())
 
 
@@ -208,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
     if state["status"] == "paused":
         reused = 0
         for group in selected:
-            if group["existing_result_path"] and _link_result(group, Path(group["existing_result_path"])):
+            if group["existing_result_path"] and _link_result(group, Path(group["existing_result_path"]), reused=True):
                 reused += 1
             else:
                 _skip_group(group, state["reason"])
@@ -223,10 +278,11 @@ def main(argv: list[str] | None = None) -> int:
     for position, group in enumerate(selected):
         existing = group["existing_result_path"]
         if existing:
-            linked = _link_result(group, Path(existing))
-            results.append({"job_id": group["job_id"], "status": "reused" if linked else "failed",
-                "error_code": "" if linked else "cloud_result_invalid", "cloud_result_path": existing})
-            continue
+            linked = _link_result(group, Path(existing), reused=True)
+            if linked:
+                results.append({"job_id": group["job_id"], "status": "reused",
+                    "error_code": "", "cloud_result_path": existing})
+                continue
         command = ["pwsh", "-NoProfile", "-NonInteractive", "-File",
             str(ROOT / "scripts" / "asr-professional-cloud.ps1"),
             "-Audio", group["audio"], "-Important" if group["important"] else "-QualityReview",
@@ -239,15 +295,20 @@ def main(argv: list[str] | None = None) -> int:
             done = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=86500,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            receipt = json.loads(done.stdout)
-            if not isinstance(receipt, dict):
-                raise ValueError("cloud_receipt_invalid")
+            receipt = _last_json_object(done.stdout)
         except (OSError, ValueError, subprocess.TimeoutExpired):
             receipt = {"status": "failed", "error_code": "cloud_receipt_invalid"}
         result_path = str(receipt.get("result_path") or "")
         success = receipt.get("status") == "succeeded" and bool(result_path)
         if success:
             success = _link_result(group, Path(result_path))
+        recovered_result = False
+        if not success:
+            key = _result_key(group["audio_sha256"], group["channel_index"],
+                "important_evidence" if group["important"] else "quality_review")
+            retained_path = _retained_result_index().get(key)
+            if retained_path and _link_result(group, retained_path, reused=True):
+                success, recovered_result, result_path = True, True, str(retained_path)
         if not success:
             for run in group["local_runs"]:
                 existing_sidecar = Path(run["out_dir"]) / "cloud.review.json"
@@ -267,14 +328,14 @@ def main(argv: list[str] | None = None) -> int:
                     "cloud_upload_performed": bool(receipt.get("cloud_upload_performed"))})
         results.append({"job_id": group["job_id"],
             "local_runs": len(group["local_runs"]),
-            "status": "succeeded" if success else "failed",
+            "status": "reused" if recovered_result else "succeeded" if success else "failed",
             "error_code": "" if success else str(receipt.get("error_code") or "cloud_result_invalid"),
             "model": receipt.get("model"), "cloud_result_path": result_path})
         state = auto_cloud_status(state_path, config)
         if state["status"] == "paused":
             for pending in selected[position + 1:]:
                 if not (pending["existing_result_path"] and _link_result(
-                        pending, Path(pending["existing_result_path"]))):
+                        pending, Path(pending["existing_result_path"]), reused=True)):
                     _skip_group(pending, state["reason"])
             stopped = True
             break
