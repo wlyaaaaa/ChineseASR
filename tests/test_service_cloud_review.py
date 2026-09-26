@@ -48,8 +48,9 @@ class ServiceCloudReviewTests(unittest.TestCase):
             self.assertIn("quality_needs_review", sidecar["review_reasons"])
             self.assertIn("-AutomaticReview", sidecar["next_command"])
             self.assertIn("-LocalOutDir", sidecar["next_command"])
-            self.assertIn("-RuntimePrincipal Codex", sidecar["next_command"])
-            self.assertIn("Claude", sidecar["runtime_principal_note"])
+            # The Secret Broker recognises the real caller itself.
+            self.assertNotIn("-RuntimePrincipal", sidecar["next_command"])
+            self.assertNotIn("runtime_principal_note", sidecar)
             self.assertFalse(sidecar["cloud_upload_performed"])
             snapshot = json.loads((root / "outputs" / "api" / "jobs.json").read_text(
                 encoding="utf-8"))

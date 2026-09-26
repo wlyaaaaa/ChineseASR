@@ -233,8 +233,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--recover-root", type=Path, action="append",
                         help="search matching filenames here; accept only an exact SHA-256 match")
-    parser.add_argument("--runtime-principal", choices=("Codex", "Claude"), default="Codex",
-                        help="real caller checked by the Secret Broker; Claude sessions pass Claude")
     args = parser.parse_args(argv)
     try:
         missing_sources: list[dict] = []
@@ -287,8 +285,7 @@ def main(argv: list[str] | None = None) -> int:
             str(ROOT / "scripts" / "asr-professional-cloud.ps1"),
             "-Audio", group["audio"], "-Important" if group["important"] else "-QualityReview",
             "-AutomaticReview", "-LocalOutDir", group["out_dir"],
-            "-EvidenceStatus", group["evidence_status"],
-            "-RuntimePrincipal", args.runtime_principal, "-Json"]
+            "-EvidenceStatus", group["evidence_status"], "-Json"]
         if group["channel_index"] is not None:
             command.extend(["-ChannelIndex", str(group["channel_index"])])
         try:

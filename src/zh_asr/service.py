@@ -359,7 +359,7 @@ def _cloud_review_projection(outputs: Mapping[str, str]) -> dict:
             return {"status": "unreadable"}
         return {key: value[key] for key in (
             "status", "message", "review_reasons", "pause_reason", "error_code",
-            "next_command", "runtime_principal_note") if key in value}
+            "next_command") if key in value}
     except (OSError, ValueError, TypeError):
         return {"status": "unreadable"}
 
@@ -919,17 +919,13 @@ class TranscriptionService:
                     quote = lambda value: "'" + str(value).replace("'", "''") + "'"
                     command = (f"& {quote(script)} -Audio {quote(audio)} "
                         f"-{'Important' if important else 'QualityReview'} -AutomaticReview "
-                        f"-LocalOutDir {quote(out_dir)} -EvidenceStatus {quote(evidence)} "
-                        "-RuntimePrincipal Codex")
+                        f"-LocalOutDir {quote(out_dir)} -EvidenceStatus {quote(evidence)}")
                     if job.request.channel_index is not None:
                         command += f" -ChannelIndex {job.request.channel_index}"
                     command += " -Json"
                     payload.update({"status": "pending_ai_session", "model": model["id"],
                         "message": "疑难录音，等 AI 会话补跑云端复核",
-                        "next_command": command,
-                        "runtime_principal_note": (
-                            "-RuntimePrincipal 须与实际调用方一致：Codex 桌面版用 Codex（默认），"
-                            "Claude 会话及其子代理用 Claude。")})
+                        "next_command": command})
             sidecar = out_dir / "cloud.review.json"
             write_json_atomic(sidecar, payload)
             job.outputs["cloud_review"] = str(sidecar)

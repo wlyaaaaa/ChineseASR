@@ -188,7 +188,6 @@ if ($Json) {
   if ($Result.cloud_review.status -eq 'pending_ai_session') {
     Write-Host "Cloud review: $($Result.cloud_review.message)"
     Write-Host "Cloud command: $($Result.cloud_review.next_command)"
-    Write-Host $Result.cloud_review.runtime_principal_note
   }
   if ($Result.outputs) {
     $Result.outputs.PSObject.Properties | ForEach-Object {

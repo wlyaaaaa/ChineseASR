@@ -38,11 +38,6 @@ param(
 
     [string] $RequestRoot = '',
 
-    # The Secret Broker checks the real caller: Codex desktop, or a Claude session
-    # (claude-root) and the subagents in its process tree.
-    [ValidateSet('Codex', 'Claude')]
-    [string] $RuntimePrincipal = 'Codex',
-
     [switch] $Json
 )
 
@@ -288,7 +283,6 @@ try {
         $brokerOutput = & pwsh -NoProfile -NonInteractive -File $brokerPath `
             -Action AgentSecretRef `
             -Query $brokerTarget `
-            -RuntimePrincipal $RuntimePrincipal `
             -Json 2>&1 | Out-String
         $brokerExitCode = $LASTEXITCODE
     }
@@ -361,7 +355,6 @@ if ($credentialResult -cin $allowedCredentialResults) {
             -Query $credentialRef `
             -ResultCode $credentialResult `
             -OperationId $jobId `
-            -RuntimePrincipal $RuntimePrincipal `
             -Json 2>&1 | Out-String
         if ($LASTEXITCODE -eq 0) {
             $credentialReportStatus = 'reported'

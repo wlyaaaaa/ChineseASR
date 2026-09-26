@@ -37,8 +37,7 @@ class _Api(BaseHTTPRequestHandler):
             "job_id": "job-1", "out_dir": "E:/example/job-1", "outputs": {},
             "message": "Completed.", "cloud_review": {
                 "status": "pending_ai_session", "message": "疑难录音，等 AI 会话补跑云端复核",
-                "next_command": "& 'asr-professional-cloud.ps1' -AutomaticReview",
-                "runtime_principal_note": "-RuntimePrincipal Claude for Claude sessions"}}})
+                "next_command": "& 'asr-professional-cloud.ps1' -AutomaticReview"}}})
 
 
 class AsrSmartCloudStatusTests(unittest.TestCase):
