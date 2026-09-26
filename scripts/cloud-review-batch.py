@@ -122,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--jobs", type=Path, default=ROOT / "outputs" / "api" / "jobs.json")
     parser.add_argument("--max-files", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--runtime-principal", choices=("Codex", "Claude"), default="Codex",
+                        help="real caller checked by the Secret Broker; Claude sessions pass Claude")
     args = parser.parse_args(argv)
     try:
         selected = candidates(args.jobs)
@@ -165,7 +167,8 @@ def main(argv: list[str] | None = None) -> int:
             str(ROOT / "scripts" / "asr-professional-cloud.ps1"),
             "-Audio", group["audio"], "-Important" if group["important"] else "-QualityReview",
             "-AutomaticReview", "-LocalOutDir", group["out_dir"],
-            "-EvidenceStatus", group["evidence_status"], "-Json"]
+            "-EvidenceStatus", group["evidence_status"],
+            "-RuntimePrincipal", args.runtime_principal, "-Json"]
         if group["channel_index"] is not None:
             command.extend(["-ChannelIndex", str(group["channel_index"])])
         try:
