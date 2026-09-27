@@ -12,8 +12,9 @@
 2. `strict.primary_engine` / `strict.secondary_engine` 决定严格模式双模型组合。
 3. `aliases` 记录 VAD、标点、说话人等可复用模型别名；`speaker_verification` 只配置按需的本地 `person:self` CAM++ 锚，不进入默认转写。
 4. `engines.*.adapter` 决定运行时适配器；当前已实现 `funasr`、`qwen-asr` 和 `firered-worker`。
+5. `llm_arbitration` 配置本地 Ollama 仲裁，默认关闭。
 
-当前默认策略仍然是。命名配置 `baseline` 对应 Qwen + SenseVoice，`high_quality` 对应 FireRed + Qwen；显式配置不会自动提升为全局默认：
+当前默认策略如下。命名配置 `baseline` 对应 Qwen + SenseVoice，`high_quality` 对应 FireRed + Qwen；显式配置不会自动提升为全局默认：
 
 1. `qwen3-asr-1.7b`：strict 准确率优先主线。基于 Qwen3-ASR 官方开源权重和 `qwen-asr` runtime。
 2. `sensevoice`：quick 默认和 strict 低幻觉锚点。组合 `iic/SenseVoiceSmall`、`fsmn-vad`、`ct-punc`；默认明确**不**加载 `cam++`。
@@ -32,7 +33,7 @@ FireRed 通过 Windows adapter 调用隔离的 WSL worker。默认 WSL Python �
 
 Qwen runtime 固定为 `qwen-asr==0.0.6`，模型固定为 revision
 `a04930dbe5419bfee073f7cade734f572689a3a8`。Qwen 的规范
-`MODEL_RECEIPT.json` 绑定 13 个必要模型文件；runtime 版本、revision、收据、大小或
+`MODEL_RECEIPT.json` 逐项绑定 13 个必要模型文件的规范路径、大小和 SHA-256；runtime 版本、revision、收据、大小或
 SHA-256 任一漂移都会在 `Qwen3ASRModel.from_pretrained` 前 fail-closed。重要录音使用
 `FireRedASR2-LLM + Qwen3-ASR-1.7B`，默认日常 strict 仍保持
 `Qwen3-ASR-1.7B + SenseVoiceSmall`。
@@ -160,12 +161,7 @@ LLM 仲裁刻意默认关闭。这是资源和可信度边界：默认转写链�
 
 长音频 planner 已按引擎能力限制实际切片，并以 schema 2 manifest 支持内容寻址的断点续跑。当前 `cut_strategy=vad` 时，CPU FSMN-VAD 只用于在目标长度附近寻找更自然的停顿切口，仍覆盖整条原始时间线；VAD 不可用或失败时显式回退固定切分。manifest 继续保留请求值、有效值、VAD 状态、provenance、内容 hash 和 resume 判定，不得退回无来源的固定 300 秒描述。
 
-个人使用版关闭标准：
-
-1. `doctor.ps1` 能确认无代理、CUDA、模型配置和依赖状态。
-2. 单元测试全通过。
-3. `smoke-asr-smart.ps1 -Json` 能完成默认 strict smart job；`smoke-evidence-asr.ps1 -Audio <path> -Json` 能对重要录音完成 FireRed + Qwen 证据验收。
-4. 公开仓库只包含源码、脚本、配置、测试和文档，不包含模型权重、用户音频、输出转写或 wheelhouse 大文件。
+维护验收以 [README 的当前状态](../README.md#当前状态) 中的关闭标准为准，涵盖环境体检、测试、真实作业及公开源码边界。
 
 2026-09-17 收尾验收使用公开音频完成桌面听写、高质量短音频、42 秒两切片长音频、FireRed + Qwen 和实际 Qwen3-ForcedAligner 推理；正常 smart/API 作业也返回 `succeeded`。该批验收只证明当前集成、切片、对齐和恢复链路在这些公开样例上可运行，不代表通用准确率或个人麦克风表现。私人音频、转写正文和收据不作为公开仓库验收材料。
 

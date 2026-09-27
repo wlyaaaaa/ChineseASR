@@ -251,11 +251,7 @@ strict 主线需要 Qwen ASR runtime 和权重：
 .\scripts\download-models.ps1 -Engine qwen3-asr-1.7b
 ```
 
-Qwen runtime 固定为 `qwen-asr==0.0.6`，模型固定为 revision
-`a04930dbe5419bfee073f7cade734f572689a3a8`。下载脚本会生成并验证
-`MODEL_RECEIPT.json`，逐项绑定 13 个必要文件的规范路径、大小和 SHA-256；已有固定
-缓存可用 `-ReceiptOnly` 只生成/核验收据，不下载也不加载模型。runtime 版本、revision、
-收据或任一权重文件漂移时，adapter 会在模型 loader 运行前 fail-closed。
+Qwen 的固定运行时、模型 revision 及加载前校验约束统一见 [架构说明“引擎策略”](docs/architecture.md#引擎策略)。下载脚本会生成并核验 `MODEL_RECEIPT.json`；已有固定缓存可用 `-ReceiptOnly` 只核验或生成收据，不下载也不加载模型。
 
 可选的 FireRedASR2-LLM 使用独立 WSL runtime，安装顺序如下：
 
@@ -550,13 +546,7 @@ benchmark 按文件 stem 匹配音频和 truth，写 `_manifest\manifest.json`�
 
 ## 模型替换
 
-同一 adapter 内换模型，优先只改 `configs\models.yaml`：
-
-- `defaults.engine`：quick 默认引擎。
-- `strict.primary_engine`：strict 主引擎。
-- `strict.secondary_engine`：strict 对照引擎。
-- `engines.*.adapter`：运行时适配器，目前有 `funasr`、`qwen-asr` 和 `firered-worker`。
-- `llm_arbitration`：本地 Ollama 仲裁配置，默认关闭。
+同一 adapter 内换模型，优先修改 `configs/models.yaml`；字段含义和已实现的适配器统一见 [架构说明“引擎策略”](docs/architecture.md#引擎策略)。
 
 临时使用其他配置：
 
