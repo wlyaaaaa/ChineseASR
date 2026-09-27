@@ -32,7 +32,7 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
             broker = scripts / "fake-broker.ps1"
             request_root = root / "outputs" / "cloud-jobs"
             broker.write_text("""param([string]$Action, [string]$Query,
-    [string]$ResultCode, [string]$OperationId, [switch]$Json)
+    [string]$ResultCode, [string]$OperationId, [string]$SecretRefRequestPath, [switch]$Json)
 $root = '%s'
 if ($Action -eq 'AgentSecretRef') {
     [IO.File]::WriteAllText((Join-Path $root ($Query + '.provider.json')), '{}')

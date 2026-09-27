@@ -211,10 +211,6 @@ if (-not $mutexHeld) {
 }
 try {
 $null = New-Item -ItemType Directory -Path $resolvedRequestRoot -Force
-$pending = @(Get-ChildItem -LiteralPath $resolvedRequestRoot -File | Where-Object { $_.Name -like '*.pending.json' -or $_.Name -like '*.pending31.json' })
-if ($pending.Count -ne 0) {
-    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'pending_request_ambiguous' -ExitCode 2
-}
 
 $jobId = [Guid]::NewGuid().ToString()
 $intentPath = Join-Path $resolvedRequestRoot ($jobId + '.intent.json')
@@ -283,6 +279,7 @@ try {
         $brokerOutput = & pwsh -NoProfile -NonInteractive -File $brokerPath `
             -Action AgentSecretRef `
             -Query $brokerTarget `
+            -SecretRefRequestPath $requestPath `
             -Json 2>&1 | Out-String
         $brokerExitCode = $LASTEXITCODE
     }

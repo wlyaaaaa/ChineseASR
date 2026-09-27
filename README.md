@@ -641,3 +641,17 @@ LocalGpuBroker 不可用、同族 ChineseASR 已在运行、Ollama 重型请求/
 
 - [架构说明](docs/architecture.md)
 - [公开发布边界](docs/public-release.md)
+
+### 厂商 Key 与云请求续作
+
+云端 Key 的产品登记属于密码中心，机器路径/哈希由 PCConfig 安装合成。ASR 沿用
+`qwen-default` 和 `qwen-audio3-asr-important-once`；`cloud_review.py` 先准备 HTTP body
+或 WebSocket 帧，再通过 `-SecretRefRequestPath` 提交精确请求。换模型、切段、声道和
+用途判断都不进入持钥程序，也不产生新凭据登记。
+
+一次调用保留 `<job_id>.intent.json`、`<job_id>.unclaimed.json`、`.provider.json` 和检查点。
+恢复同一次作业时，用已安装的 `Invoke-PasswordCenterVendor.ps1 -Vendor qwen -RequestPath
+<原 unclaimed.json> -Json`，随后用 `scripts/cloud-review-pipeline.py finalize --root <原请求根>
+--intent <原 intent.json> --provider <原 provider.json>`。已经成功的 operation 不重发；
+`previous_outcome_unknown` 表示服务端是否完成尚不清楚，不自动新建作业。明确允许重试该
+不确定项后，才在原请求添加 `retry_uncertain: true`；请求体、模型及音频摘要仍必须相同。

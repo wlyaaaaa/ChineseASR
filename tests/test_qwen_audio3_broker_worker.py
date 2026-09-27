@@ -61,225 +61,54 @@ def _write_request(root: Path, *, model: str = "qwen-audio-3.1-asr-flash",
     return path
 
 
-class DashScopeWorkerTests(unittest.TestCase):
-    def setUp(self) -> None:
+class PreparedVendorRequestTests(unittest.TestCase):
+    def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name) / "cloud-jobs"
-        self.root.mkdir()
-        self.worker = _load_worker()
+        self.root = Path(self.tmp.name)
 
-    def test_pinned_worker_has_no_mutable_project_imports_or_model_config(self) -> None:
+    def test_compatibility_launcher_has_no_key_or_business_import(self):
         source = WORKER_PATH.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        imported = [node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
-        imported += [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
-                     for alias in node.names]
-        self.assertFalse(any(name and (name.startswith("zh_asr") or
-                         name.startswith("qwen_audio")) for name in imported))
-        self.assertNotIn("models.yaml", source)
+        imported = [node.module for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ImportFrom)]
+        self.assertFalse(any(name and name.startswith("zh_asr") for name in imported))
+        self.assertNotIn("DASHSCOPE_API_KEY", source)
+        self.assertNotIn("glob(", source)
+        worker = _load_worker()
+        with patch.object(worker.Path, "is_file", return_value=True), patch.object(worker.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            self.assertEqual(0, worker.main(["--request-path", str(self.root / "selected.json")]))
+        self.assertIn(str(self.root / "selected.json"), run.call_args.args[0])
+        self.assertIn("qwen", run.call_args.args[0])
 
-    def test_model_name_has_format_only_no_family_whitelist(self) -> None:
-        for model in ("qwen-audio-3.1-asr-flash", "qwen3-omni", "glm_5.3", "deepseek-v3.1"):
-            with self.subTest(model=model):
-                path = _write_request(self.root, model=model)
-                result = self.worker.process_request_file(path, api_key="fixture",
-                    request_root=self.root, http_transport=lambda payload, key: {
-                        "http_status": 200, "raw_response": {"output": {"text": "测试"}},
-                        "usage": {}, "provider_request_id": "fixture"})
-                self.assertEqual("succeeded", result["status"], result)
-        for model in ("", "bad/model", "https://example.com", "x" * 129, "中文模型"):
-            with self.subTest(model=model):
-                path = _write_request(self.root, model=model)
-                result = self.worker.process_request_file(path, api_key="fixture",
-                    request_root=self.root, http_transport=lambda *_: self.fail("invalid model uploaded"))
-                self.assertEqual("model_name_invalid", result["error_code"])
+    def test_http_body_is_prepared_before_broker_and_model_not_whitelisted(self):
+        from zh_asr.cloud_review import prepare_vendor_operations
+        for model in ("new/model:中文", "future+name"):
+            request = json.loads(_write_request(self.root, model=model).read_text("utf-8"))
+            operation = prepare_vendor_operations(request, self.root)[0]
+            self.assertEqual("http", operation["protocol"])
+            body = json.loads(Path(operation["body_file"]["path"]).read_text("utf-8"))
+            self.assertEqual(model, body["model"])
+            self.assertTrue(body["input"]["messages"][-1]["content"][0]["input_audio"]["data"].startswith("data:audio/wav;base64,"))
+            self.assertNotIn("api_key", json.dumps(body))
 
-    def test_transport_does_not_interpret_asr_business_purpose(self) -> None:
-        path = _write_request(self.root)
-        request = json.loads(path.read_text(encoding="utf-8"))
-        request.pop("purpose")
-        request.pop("important_only")
-        path.write_text(json.dumps(request), encoding="utf-8")
-        result = self.worker.process_request_file(path, api_key="fixture",
-            request_root=self.root, http_transport=lambda *_: {
-                "http_status": 200, "raw_response": {"output": {"text": "测试"}},
-                "usage": {}, "provider_request_id": "fixture"})
-        self.assertEqual("succeeded", result["status"])
-        self.assertNotIn("purpose", result)
+    def test_websocket_frames_are_business_prepared_and_repeatable(self):
+        from zh_asr.cloud_review import prepare_vendor_operations
+        request = json.loads(_write_request(self.root, protocol="websocket").read_text("utf-8"))
+        first = prepare_vendor_operations(request, self.root)
+        second = prepare_vendor_operations(request, self.root)
+        self.assertEqual(first, second)
+        frames = first[0]["frames"]
+        self.assertEqual("asr", frames[0]["json"]["payload"]["task"])
+        self.assertEqual("task-started", frames[1]["receive_until"]["equals"])
+        self.assertEqual("task-finished", frames[-1]["receive_until"]["equals"])
+        self.assertFalse(Path(frames[2]["binary_file"]["path"]).read_bytes().startswith(b"RIFF"))
 
-    def test_request_and_audio_must_stay_inside_request_root(self) -> None:
-        outside = Path(self.tmp.name) / "outside.wav"
-        _write_wav(outside)
-        path = _write_request(self.root, audio=outside)
-        result = self.worker.process_request_file(path, api_key="fixture",
-            request_root=self.root, http_transport=lambda *_: self.fail("outside audio uploaded"))
-        self.assertEqual("request_root_escape", result["error_code"])
-        self.assertFalse(result["cloud_upload_performed"])
-        outside_request = Path(self.tmp.name) / "outside.running.json"
-        outside_request.write_bytes(path.read_bytes())
-        blocked = self.worker.process_request_file(outside_request, api_key="fixture",
-            request_root=self.root, http_transport=lambda *_: self.fail("outside request uploaded"))
-        self.assertEqual("request_root_escape", blocked["error_code"])
-
-    def test_text_context_cannot_sneak_unbound_audio_or_url_into_request(self) -> None:
-        http = _write_request(self.root)
-        payload = json.loads(http.read_text(encoding="utf-8"))
-        payload["messages_prefix"] = [{"role": "user", "content": [{
-            "type": "input_audio", "input_audio": {"data": "https://example.com/outside.wav"}}]}]
-        http.write_text(json.dumps(payload), encoding="utf-8")
-        result = self.worker.process_request_file(http, api_key="fixture",
-            request_root=self.root, http_transport=lambda *_: self.fail("unbound audio sent"))
-        self.assertEqual("input_invalid", result["error_code"])
-        websocket = _write_request(self.root, protocol="websocket")
-        payload = json.loads(websocket.read_text(encoding="utf-8"))
-        payload["input"] = {"file_urls": ["https://example.com/outside.wav"]}
-        websocket.write_text(json.dumps(payload), encoding="utf-8")
-        blocked = self.worker.process_request_file(websocket, api_key="fixture",
-            request_root=self.root,
-            websocket_transport=lambda *_: self.fail("unbound audio sent"))
-        self.assertEqual("external_audio_input_forbidden", blocked["error_code"])
-
-    def test_http_uses_fixed_provider_address_and_no_redirect_handler(self) -> None:
-        worker = self.worker
-        opened = []
-        class Response:
-            status = 200
-            def __enter__(self): return self
-            def __exit__(self, *_): return False
-            def read(self, _limit): return b'{"output":{"text":"ok"},"request_id":"r"}'
-        class Opener:
-            def open(self, request, timeout):
-                opened.append((request.full_url, request.get_header("Authorization")))
-                return Response()
-        handlers = []
-        def factory(*items):
-            handlers.extend(items)
-            return Opener()
-        with patch.object(worker, "build_opener", side_effect=factory):
-            worker._post_http({"model": "model", "input": {}}, "fixture-secret")
-        self.assertEqual([(worker.HTTP_ENDPOINT, "Bearer fixture-secret")], opened)
-        self.assertTrue(any(isinstance(item, worker._NoRedirect) for item in handlers))
-
-    def test_arbitrary_json_parameters_and_secret_never_persist(self) -> None:
-        path = _write_request(self.root)
-        payloads = []
-        def fake(payload, key):
-            payloads.append(payload)
-            return {"http_status": 200,
-                "raw_response": {"output": {"text": "测试"}, "echo": "fixture-secret-never-disk",
-                                 "fixture-secret-never-disk": "provider-key"},
-                "usage": {"total_tokens": 10}, "provider_request_id": "r1"}
-        result = self.worker.process_request_file(path, api_key="fixture-secret-never-disk",
-            request_root=self.root, http_transport=fake)
-        self.assertEqual("succeeded", result["status"])
-        self.assertEqual({"term": "技术词"}, payloads[0]["parameters"]["arbitrary_json"])
-        self.assertTrue(payloads[0]["input"]["messages"][-1]["content"][0]["input_audio"]["data"].startswith("data:audio/wav;base64,"))
-        self.assertEqual("[secret-removed]", result["chunks"][0]["raw_response"]["echo"])
-        self.assertEqual("provider-key", result["chunks"][0]["raw_response"]["[secret-removed]"])
-        self.assertNotIn("fixture-secret-never-disk", json.dumps(result, ensure_ascii=False))
-        self.assertNotIn("fixture-secret-never-disk", "".join(
-            file.read_text(encoding="utf-8", errors="ignore")
-            for file in self.root.rglob("*.json")))
-
-    def test_provider_error_cannot_echo_key_into_receipts_or_checkpoints(self) -> None:
-        path = _write_request(self.root)
-        key = "fixture-secret-never-disk"
-        def rejected(_payload, _key):
-            raise self.worker.ProviderError("error-" + key, http_status=400,
-                message="provider echoed " + key, credential_result="Scope-Error")
-        result = self.worker.process_request_file(path, api_key=key,
-            request_root=self.root, http_transport=rejected)
-        self.assertEqual("failed", result["status"])
-        self.assertNotIn(key, json.dumps(result, ensure_ascii=False))
-        for file in self.root.rglob("*.json"):
-            self.assertNotIn(key, file.read_text(encoding="utf-8", errors="ignore"))
-
-    def test_protocol_is_explicit_not_guessed_from_model_name(self) -> None:
-        path = _write_request(self.root, model="qwen-audio-3.1-asr-flash", protocol="websocket")
-        calls = []
-        result = self.worker.process_request_file(path, api_key="fixture",
-            request_root=self.root,
-            http_transport=lambda *_: self.fail("http not selected"),
-            websocket_transport=lambda model, chunk, request, key, deadline: (
-                calls.append((model, request["parameters"]["arbitrary_json"])) or
-                {"http_status": 101, "raw_events": [], "usage": {}, "provider_request_id": "task"}))
-        self.assertEqual("succeeded", result["status"])
-        self.assertEqual(1, len(calls))
-        bad = _write_request(self.root, protocol="filetrans")
-        blocked = self.worker.process_request_file(bad, api_key="fixture",
-            request_root=self.root, http_transport=lambda *_: self.fail("unsupported uploaded"))
-        self.assertEqual("protocol_unsupported", blocked["error_code"])
-
-    def test_websocket_uses_fixed_address_and_official_event_shape(self) -> None:
-        worker = self.worker
-        chunk = self.root / "ws.wav"
-        _write_wav(chunk)
-        class Socket:
-            def __init__(self):
-                self.sent = []
-                self.started = False
-                self.finished = False
-                self.generated = False
-                self.task_id = ""
-            def __enter__(self): return self
-            def __exit__(self, *_): return False
-            def send(self, value):
-                if isinstance(value, str):
-                    item = json.loads(value)
-                    self.sent.append(item)
-                    self.task_id = item["header"]["task_id"]
-                    if item["header"]["action"] == "finish-task":
-                        self.finished = True
-            def recv(self, timeout):
-                if not self.started:
-                    self.started = True
-                    return json.dumps({"header": {"event": "task-started",
-                        "task_id": self.task_id}, "payload": {}})
-                if not self.finished:
-                    raise TimeoutError()
-                if not self.generated:
-                    self.generated = True
-                    return json.dumps({"header": {"event": "result-generated",
-                        "task_id": self.task_id}, "payload": {"output": {"sentence": {
-                        "sentence_id": 1, "sentence_end": True, "text": "测试"}}}})
-                return json.dumps({"header": {"event": "task-finished",
-                    "task_id": self.task_id}, "payload": {"usage": {"total_tokens": 2}}})
-        socket = Socket()
-        addresses = []
-        def fake_connect(uri, **kwargs):
-            addresses.append((uri, kwargs["proxy"], kwargs["additional_headers"]["Authorization"]))
-            return socket
-        request = {"ws_task": {"task_group": "audio", "task": "asr", "function": "recognition"},
-            "parameters": {"format": "pcm", "sample_rate": 16000, "arbitrary": {"x": 1}},
-            "input": {}}
-        with (patch("websockets.sync.client.connect", side_effect=fake_connect),
-              patch.object(worker.time, "sleep", return_value=None)):
-            response = worker._post_websocket("model_without_message_suffix", chunk,
-                request, "fixture-key", None)
-        self.assertEqual([(worker.WEBSOCKET_ENDPOINT, None, "Bearer fixture-key")], addresses)
-        self.assertEqual("asr", socket.sent[0]["payload"]["task"])
-        self.assertEqual({"x": 1}, socket.sent[0]["payload"]["parameters"]["arbitrary"])
-        self.assertEqual({"input": {}}, socket.sent[-1]["payload"])
-        self.assertEqual(2, response["usage"]["total_tokens"])
-
-    def test_send_deadline_blocks_before_transport(self) -> None:
-        path = _write_request(self.root, deadline="2020-01-01T00:00:00+08:00")
-        result = self.worker.process_request_file(path, api_key="fixture",
-            request_root=self.root, http_transport=lambda *_: self.fail("expired uploaded"))
-        self.assertEqual("request_send_deadline_passed", result["error_code"])
-        self.assertFalse(result["cloud_upload_performed"])
-
-    def test_claim_requires_one_pending(self) -> None:
-        first = self.root / "first.pending.json"
-        second = self.root / "second.pending.json"
-        first.write_text("{}", encoding="utf-8")
-        second.write_text("{}", encoding="utf-8")
-        with self.assertRaises(self.worker.WorkerPolicyError):
-            self.worker.claim_single_pending_request(self.root)
-        second.unlink()
-        self.assertEqual("first.running.json",
-            self.worker.claim_single_pending_request(self.root).name)
+    def test_changed_audio_is_rejected_before_building_request(self):
+        from zh_asr.cloud_review import prepare_vendor_operations, CloudReviewError
+        request = json.loads(_write_request(self.root).read_text("utf-8"))
+        Path(request["chunks"][0]["path"]).write_bytes(b"changed")
+        with self.assertRaisesRegex(CloudReviewError, "chunk_hash_mismatch"):
+            prepare_vendor_operations(request, self.root)
 
 
 if __name__ == "__main__":

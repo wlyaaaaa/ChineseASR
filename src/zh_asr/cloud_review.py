@@ -267,7 +267,7 @@ def compare_text(local: str, cloud: str, *, limit: int = 120) -> list[dict[str, 
 
 
 INTENT_SCHEMA = "zh_asr.cloud_review_intent.v1"
-TRANSPORT_SCHEMA = "zh_asr.dashscope_transport_request.v1"
+TRANSPORT_SCHEMA = "passwordcenter.vendor-request.v1"
 PROVIDER_SCHEMA = "zh_asr.dashscope_transport_result.v1"
 IMPORTANT_RESULT_SCHEMA = "chineseasr.qwen-audio3-important-result.v1"
 QUALITY_RESULT_SCHEMA = "chineseasr.qwen-audio3-quality-review-result.v1"
@@ -476,6 +476,11 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
         "billing_warning": billing_warning,
         "send_before_utc": model["free_until"] if automatic else None,
         "created_utc": datetime.now(timezone.utc).isoformat()}
+    # Audio preparation and DashScope request construction belong here. The
+    # Password Center worker receives generic HTTP bodies / WebSocket frames.
+    request.update(vendor="qwen", mode="invoke",
+                   result_path=str(root / (intent["job_id"] + ".provider.json")),
+                   operations=prepare_vendor_operations(request, work))
     pending = root / (intent["job_id"] + ".pending.json")
     if pending.exists():
         raise CloudReviewError("pending_request_exists")
@@ -485,6 +490,8 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
         review_reasons=reasons, prepared_audio_sha256=_file_hash(prepared.path),
         chunk_bindings=[{key: chunk[key] for key in ("index", "start_ms", "end_ms", "audio_sha256")}
                         for chunk in chunks])
+    intent["vendor_request_sha256"] = hashlib.sha256(json.dumps(request, ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
     _write_state(intent_path, intent)
     _write_state(pending, request)
     return {"status": "ready", "job_id": intent["job_id"],
@@ -493,6 +500,67 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
             "credential_ref": config["credential_ref"],
             "request_path": str(pending), "billing_warning": billing_warning,
             "source_audio_seconds": duration_sec, "chunk_count": len(chunks)}
+
+
+def prepare_vendor_operations(request: dict[str, Any], work: Path) -> list[dict[str, Any]]:
+    import base64
+    operations = []
+    for chunk in request["chunks"]:
+        audio = Path(chunk["path"])
+        if _file_hash(audio) != chunk["audio_sha256"]:
+            raise CloudReviewError("chunk_hash_mismatch")
+        operation = {"id": str(chunk["index"]), "protocol": request["protocol"], "timeout_seconds": 180}
+        if request["protocol"] == "http":
+            data = "data:audio/wav;base64," + base64.b64encode(audio.read_bytes()).decode("ascii")
+            messages = list(request.get("messages_prefix", [])) + [{"role": "user",
+                "content": [{"type": "input_audio", "input_audio": {"data": data}}]}]
+            body = {"model": request["model"], "input": {"messages": messages},
+                    "parameters": request["parameters"]}
+            body_path = work / f"body-{chunk['index']:06d}.json"
+            _write_state(body_path, body)
+            operation.update(path="/api/v1/services/aigc/multimodal-generation/generation",
+                             body_file={"path": str(body_path), "sha256": _file_hash(body_path)})
+        else:
+            with wave.open(str(audio), "rb") as reader:
+                pcm = reader.readframes(reader.getnframes())
+            pcm_path = work / f"frames-{chunk['index']:06d}.pcm"
+            pcm_path.write_bytes(pcm)
+            task_id = str(uuid.uuid5(uuid.UUID(request["job_id"]), str(chunk["index"])))
+            run = {"header": {"action": "run-task", "task_id": task_id, "streaming": "duplex"},
+                   "payload": {**request["ws_task"], "model": request["model"],
+                               "parameters": request["parameters"], "input": request.get("input", {})}}
+            finish = {"header": {"action": "finish-task", "task_id": task_id, "streaming": "duplex"},
+                      "payload": {"input": {}}}
+            operation.update(path="/api-ws/v1/inference", frames=[{"json": run},
+                {"receive_until": {"field": ["header", "event"], "equals": "task-started", "errors": ["task-failed"], "error_code_field": ["header", "error_code"], "error_message_field": ["header", "error_message"]}},
+                {"binary_file": {"path": str(pcm_path), "sha256": _file_hash(pcm_path)}, "chunk_bytes": 3200, "interval_ms": 100, "drain_available": True},
+                {"json": finish},
+                {"receive_until": {"field": ["header", "event"], "equals": "task-finished", "errors": ["task-failed"], "error_code_field": ["header", "error_code"], "error_message_field": ["header", "error_message"]}}])
+            operation["event_bindings"] = [{"field": ["header", "task_id"], "value": task_id}]
+            operation["event_error"] = {"field": ["header", "event"], "values": ["task-failed"],
+                "code_field": ["header", "error_code"], "message_field": ["header", "error_message"]}
+        operations.append(operation)
+    return operations
+
+
+def project_vendor_result(provider: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
+    if (provider.get("vendor") != "qwen" or
+            provider.get("request_sha256") != intent.get("vendor_request_sha256")):
+        raise CloudReviewError("provider_result_invalid")
+    expected = intent.get("chunk_bindings") or []
+    results = provider.get("results")
+    if not isinstance(results, list) or len(results) > len(expected):
+        raise CloudReviewError("provider_result_binding_invalid")
+    chunks = []
+    for raw, binding in zip(results, expected):
+        if raw.get("id") != str(binding["index"]):
+            raise CloudReviewError("provider_result_binding_invalid")
+        chunks.append({**raw, **binding})
+    return {**provider, "schema": PROVIDER_SCHEMA, "job_id": intent["job_id"],
+            "source_audio_sha256": intent.get("source_audio_sha256"), "model": intent.get("model"),
+            "protocol": intent.get("protocol"), "chunks": chunks,
+            "cloud_upload_performed": provider.get("new_requests", 0) > 0 or bool(chunks),
+            "reused_chunks": provider.get("reused_requests", 0)}
 
 
 def _provider_chunk_text(chunk: dict[str, Any], protocol: str) -> str:
@@ -571,6 +639,8 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
             provider = json.loads(provider_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise CloudReviewError("provider_result_invalid") from exc
+        if provider.get("schema") == "passwordcenter.vendor-result.v1":
+            provider = project_vendor_result(provider, intent)
         if (provider.get("schema") != PROVIDER_SCHEMA or
                 provider.get("job_id") != job_id or
                 provider.get("source_audio_sha256") != intent.get("source_audio_sha256") or
