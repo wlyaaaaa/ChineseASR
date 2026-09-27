@@ -1,5 +1,9 @@
 # ChineseASR
 
+本地中文录音转写与桌面听写工具。普通转写常会漏字、在静音处凭空出字，却不标出哪里可能错；这里用两路模型转写录音文件并保留两路的分歧，输出正文和疑点清单，争议片段可在本地回听页面复核，需要时还能输出逐句时间和匿名说话人。桌面听写用单模型，把识别结果直接输入当前文本框。
+
+一次文件转写：录音 → `Qwen3-ASR-1.7B` 主转写、`SenseVoiceSmall` 对照 → 标出两路不一致、静音出字、异常重复等疑点 → 回听复核。最短入口见下文「一分钟使用」：通过本地接口提交任务、先返回任务状态，调用方不会被长时间卡住。
+
 `ChineseASR` 是一个本地优先的中文语音转文字项目，目标是把中文录音转成可审计、低幻觉、可复现的文本。它面向 Windows + CUDA 工作站，默认 quick 使用 `SenseVoiceSmall`，strict 使用 `Qwen3-ASR-1.7B + SenseVoiceSmall`。FunASR 官方 GPU flagship `Fun-ASR-Nano-2512` 已作为显式 `fun-asr-nano` 引擎提供，但不会因为安装完成而改变 quick 默认；可选的 `FireRedASR2-LLM` 是 `high_quality` 路线的词汇主引擎，也不会自动取代默认 strict 组合。
 
 项目同时提供录音转写和 Windows 桌面语音输入。本文是使用入口；项目执行规则见 `AGENTS.md`，机器状态以 PCConfig 和 Windows 现场为准。
