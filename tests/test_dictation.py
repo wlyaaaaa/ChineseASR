@@ -15,6 +15,7 @@ from zh_asr.dictation import (
     DictationController, DictationSettings, PauseSegmenter, QwenDictationEngine, Recording, main,
     resample_audio,
 )
+from zh_asr.gpu_broker import GpuBrokerConflict, GpuBrokerLease
 
 
 class FakeHost:
@@ -337,6 +338,49 @@ class DictationTests(unittest.TestCase):
         controller._recognize(recording_with_chunks())
         self.assertEqual(host.insertions, [])
         self.assertEqual(host.last_text, "")
+
+    def test_ollama_conflicts_without_owner_show_model_wait_and_resume(self):
+        for reason in ("ollama_session_active", "ollama_request_active"):
+            with self.subTest(reason=reason):
+                host = FakeHost()
+                engine = FakeEngine(["继续听写。"])
+                recording = recording_with_chunks(1)
+                lease = GpuBrokerLease(
+                    "chineseasr", renew_interval_seconds=0,
+                    transport=lambda action, payload: {"ok": False, "reason": reason},
+                )
+                with self.assertRaises(GpuBrokerConflict) as rejected:
+                    lease.__enter__()
+                controller = DictationController(host, DictationSettings(), engine)
+                with patch.object(engine, "activate", side_effect=[rejected.exception, None]) as activate, \
+                        patch.object(recording.cancelled, "wait"):
+                    controller._recognize(recording)
+                waits = [detail for status, detail in host.messages if status == "等待 GPU"]
+                self.assertEqual(len(waits), 1)
+                self.assertIn("本地大语言模型", waits[0])
+                self.assertNotIn("unknown", waits[0])
+                self.assertEqual(activate.call_count, 2)
+                self.assertEqual(host.insertions, [("继续听写。", "original-focus")])
+
+    def test_gpu_wait_keeps_other_owners_distinct_and_can_be_cancelled(self):
+        for owner, label in (("chineseasr-cli", "文件转写任务"),
+                             ("chineseasr", "另一段听写"),
+                             ("unknown", "其他 GPU 任务")):
+            with self.subTest(owner=owner):
+                host = FakeHost()
+                engine = FakeEngine(["不应输入。"])
+                recording = recording_with_chunks(1)
+                controller = DictationController(host, DictationSettings(), engine)
+                conflict = GpuBrokerConflict("busy", owner=owner, reason="gpu_lease_active")
+                with patch.object(engine, "activate", side_effect=conflict) as activate, \
+                        patch.object(recording.cancelled, "wait", side_effect=lambda _: recording.cancelled.set()):
+                    controller._recognize(recording)
+                waits = [detail for status, detail in host.messages if status == "等待 GPU"]
+                self.assertEqual(len(waits), 1)
+                self.assertIn(label, waits[0])
+                self.assertNotIn("本地大语言模型", waits[0])
+                activate.assert_called_once()
+                self.assertEqual(host.insertions, [])
 
     def test_focus_change_stops_all_later_insertion_but_keeps_complete_text(self):
         host = FakeHost(allow=False)

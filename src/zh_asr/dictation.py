@@ -727,8 +727,12 @@ class DictationController:
                     self.host.show("正在聆听", "点击麦克风或快捷键暂停", recording=True)
                 break
             except GpuBrokerConflict as error:
-                owner = {"chineseasr-cli": "文件转写任务", "chineseasr": "另一段听写",
-                         "ollama": "本地大语言模型"}.get(error.owner, error.owner)
+                if error.reason in {"ollama_session_active", "ollama_request_active"}:
+                    owner = "本地大语言模型"
+                else:
+                    owner = {"chineseasr-cli": "文件转写任务", "chineseasr": "另一段听写",
+                             "ollama": "本地大语言模型", "unknown": "其他 GPU 任务"}.get(
+                                 error.owner, error.owner or "其他 GPU 任务")
                 self.host.show("等待 GPU", f"正在等待{owner}释放资源；录音保留在内存，Esc 可取消",
                                recording=not recording.stopped.is_set())
                 recording.cancelled.wait(0.3)
