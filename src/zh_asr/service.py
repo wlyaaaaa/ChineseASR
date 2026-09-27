@@ -6,6 +6,7 @@ import math
 import os
 import queue
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -355,8 +356,17 @@ def _cloud_review_projection(outputs: Mapping[str, str], fallback: dict | None =
     if not path:
         return fallback or {"status": "not_required"}
     try:
-        if fallback and Path(path).stat().st_mtime <= fallback.get("failed_at", 0):
-            return fallback
+        if fallback:
+            current = Path(path).stat()
+            stale = fallback.get("stale_sidecar")
+            if isinstance(stale, dict):
+                # The sidecar that already existed when the handoff failed is
+                # stale; only a different file written afterwards may win.
+                if (current.st_mtime_ns, current.st_size) == (stale.get("mtime_ns"), stale.get("size")):
+                    return fallback
+            elif "stale_sidecar" not in fallback and current.st_mtime <= fallback.get("failed_at", 0):
+                # Failures recorded before stale_sidecar existed keep the old rule.
+                return fallback
         value = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(value, dict) or value.get("schema") != "zh_asr.cloud_review.v1":
             return fallback or {"status": "unreadable"}
@@ -946,10 +956,17 @@ class TranscriptionService:
             # The optional handoff must not erase a successful local transcript.
             # Persist the failure in jobs.json even when the sidecar cannot be
             # written; a later sidecar from the existing recovery entry wins.
+            stale_sidecar = None
+            try:
+                previous = (out_dir / "cloud.review.json").stat()
+                if stat.S_ISREG(previous.st_mode):
+                    stale_sidecar = {"mtime_ns": previous.st_mtime_ns, "size": previous.st_size}
+            except OSError:
+                pass
             job.cloud_review_fallback = {
                 "status": "failed", "error_code": "cloud_review_not_scheduled",
                 "message": f"云复核未安排成功：{type(exc).__name__}: {exc}",
-                "failed_at": time.time(),
+                "failed_at": time.time(), "stale_sidecar": stale_sidecar,
                 "review_reasons": reasons, "cloud_upload_performed": False,
                 "local_text_rewritten": False,
             }

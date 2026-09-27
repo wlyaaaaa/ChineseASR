@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -82,7 +83,8 @@ class ServiceCloudReviewTests(unittest.TestCase):
                 self.assertEqual(reason, sidecar["error_code"])
                 self.assertFalse(sidecar["cloud_upload_performed"])
 
-    def _run_real_failure(self, root: Path, fault: str, *, prior_status: str | None = None):
+    def _run_real_failure(self, root: Path, fault: str, *, prior_status: str | None = None,
+            prior_mtime_offset: float = 0):
         audio = root / "call.wav"
         with wave.open(str(audio), "wb") as stream:
             stream.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
@@ -126,6 +128,10 @@ class ServiceCloudReviewTests(unittest.TestCase):
                 "schema": "zh_asr.cloud_review.v1", "status": prior_status,
                 "message": "上一次的云复核提示",
             }), encoding="utf-8")
+            if prior_mtime_offset:
+                # Simulates a runner clock that stamps files ahead of time.time().
+                stamp = (job.out_dir / "cloud.review.json").stat().st_mtime + prior_mtime_offset
+                os.utime(job.out_dir / "cloud.review.json", (stamp, stamp))
         self.assertTrue(service.run_next_job())
         return job
 
@@ -171,6 +177,17 @@ class ServiceCloudReviewTests(unittest.TestCase):
                 restored = TranscriptionService(root=root, process_runner=lambda _: None,
                     gpu_process_detector=lambda: [], autostart=False)
                 self.assertEqual(result["cloud_review"], restored.get_job(job.job_id).to_dict()["cloud_review"])
+
+    def test_old_sidecar_stamped_after_the_failure_still_cannot_hide_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job = self._run_real_failure(root, "config", prior_status="pending_ai_session",
+                prior_mtime_offset=120)
+            result = job.to_dict()
+            self.assertEqual("cloud_review_not_scheduled", result["cloud_review"]["error_code"])
+            restored = TranscriptionService(root=root, process_runner=lambda _: None,
+                gpu_process_detector=lambda: [], autostart=False)
+            self.assertEqual(result["cloud_review"], restored.get_job(job.job_id).to_dict()["cloud_review"])
 
     def test_existing_batch_recovery_can_replace_a_failed_handoff_without_upload(self):
         with tempfile.TemporaryDirectory() as tmp:
