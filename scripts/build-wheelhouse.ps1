@@ -1,104 +1,63 @@
 param(
-  [string]$Wheelhouse = '',
-  [string]$ManifestDir = '',
-  [string]$TorchIndexUrl = 'https://download.pytorch.org/whl/cu128',
-  [string]$PypiIndexUrl = 'https://pypi.tuna.tsinghua.edu.cn/simple',
-  [string]$PypiTrustedHost = 'pypi.tuna.tsinghua.edu.cn'
+  [string]$RuntimeRoot = 'E:\Projects\Tools\ChineseASR',
+  [Parameter(Mandatory = $true)][string]$Bundle,
+  [string]$Distro = 'Ubuntu'
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1')
-Clear-ProxyEnv
-
-$Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-if (-not $Wheelhouse) {
-  $Wheelhouse = Join-Path $Root 'offline\wheelhouse'
+$Python = Join-Path $RuntimeRoot '.venv\Scripts\python.exe'
+$WindowsLock = Join-Path $Bundle 'manifests\windows-requirements.txt'
+$LinuxLock = Join-Path $Bundle 'manifests\linux-requirements.txt'
+$VersionsPath = Join-Path $Bundle 'manifests\versions.json'
+foreach ($item in @($Python, $WindowsLock, $LinuxLock, $VersionsPath)) {
+  if (-not (Test-Path -LiteralPath $item -PathType Leaf)) { throw "Missing installed runtime or lock: $item" }
 }
-if (-not $ManifestDir) {
-  $ManifestDir = Join-Path $Root 'offline\manifests'
+if ([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Bundle)) -notmatch '^[Ee]:\\$') {
+  throw 'Offline bundle must be staged on E:.'
 }
+$WindowsWheelhouse = Join-Path $Bundle 'wheelhouse\windows'
+$LinuxWheelhouse = Join-Path $Bundle 'wheelhouse\linux'
+New-Item -ItemType Directory -Force -Path $WindowsWheelhouse, $LinuxWheelhouse | Out-Null
 
-$Python = Join-Path $Root '.venv\Scripts\python.exe'
-if (-not (Test-Path $Python)) {
-  throw 'Virtual environment not found. Run scripts\install-torch-cu128-direct.ps1 and scripts\setup-core.ps1 first.'
+# Every installed dependency is pinned in the lock.  No-deps avoids fetching
+# newer transitive packages; the disconnected install and pip check prove the
+# wheel set is actually sufficient.
+& $Python -m pip download --no-deps -r $WindowsLock -d $WindowsWheelhouse `
+  --index-url https://download.pytorch.org/whl/cu128 `
+  --extra-index-url https://pypi.org/simple
+if ($LASTEXITCODE -ne 0) { throw 'Windows wheel download failed.' }
+& $Python -m pip wheel --no-deps --no-index --find-links $WindowsWheelhouse `
+  -r $WindowsLock -w $WindowsWheelhouse
+if ($LASTEXITCODE -ne 0) { throw 'Windows source distributions could not be built into wheels.' }
+
+$Versions = Get-Content -LiteralPath $VersionsPath -Raw | ConvertFrom-Json
+$WslPython = [string]$Versions.wsl_python
+function Quote-Bash([string]$Value) { return "'" + $Value.Replace("'", "'`"`'`"`'") + "'" }
+function Convert-ToWslPath([string]$Path) {
+  $Full = [IO.Path]::GetFullPath($Path)
+  if ($Full -notmatch '^([A-Za-z]):\\(.*)$') { throw "Expected local drive path: $Full" }
+  return '/mnt/' + $Matches[1].ToLowerInvariant() + '/' + $Matches[2].Replace('\', '/')
 }
+$LockWsl = Quote-Bash (Convert-ToWslPath $LinuxLock)
+$WheelsWsl = Quote-Bash (Convert-ToWslPath $LinuxWheelhouse)
+$PythonWsl = Quote-Bash $WslPython
+$Command = "$PythonWsl -m pip download --no-deps -r $LockWsl -d $WheelsWsl --index-url https://download.pytorch.org/whl/cu128 --extra-index-url https://pypi.org/simple"
+& wsl.exe -d $Distro -- bash -lc $Command
+if ($LASTEXITCODE -ne 0) { throw 'FireRed WSL wheel download failed.' }
+$BuildCommand = "$PythonWsl -m pip wheel --no-deps --no-index --find-links $WheelsWsl -r $LockWsl -w $WheelsWsl"
+& wsl.exe -d $Distro -- bash -lc $BuildCommand
+if ($LASTEXITCODE -ne 0) { throw 'FireRed WSL source distributions could not be built into wheels.' }
 
-$LockFile = Join-Path $ManifestDir 'requirements-lock.txt'
-if (-not (Test-Path $LockFile)) {
-  throw "Lock file not found: $LockFile. Run scripts\export-lock.ps1 first."
-}
-
-New-Item -ItemType Directory -Force -Path $Wheelhouse | Out-Null
-New-Item -ItemType Directory -Force -Path $ManifestDir | Out-Null
-
-$TempDir = Join-Path $ManifestDir '_tmp'
-New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
-$TorchRequirements = Join-Path $TempDir 'requirements-torch.txt'
-$OtherRequirements = Join-Path $TempDir 'requirements-other.txt'
-
-$TorchLines = New-Object System.Collections.Generic.List[string]
-$OtherLines = New-Object System.Collections.Generic.List[string]
-foreach ($Line in Get-Content $LockFile) {
-  $Clean = $Line.Trim()
-  if (-not $Clean -or $Clean.StartsWith('#')) {
-    continue
-  }
-  if ($Clean -match '^(torch|torchaudio|torchvision)(==|~=|>=|<=|>|<|$)') {
-    $TorchLines.Add($Clean)
-  } else {
-    $OtherLines.Add($Clean)
-  }
-}
-
-if ($TorchLines.Count -gt 0) {
-  $TorchLines | Set-Content -Encoding UTF8 $TorchRequirements
-  & $Python -m pip download -r $TorchRequirements -d $Wheelhouse --index-url $TorchIndexUrl --extra-index-url $PypiIndexUrl --trusted-host download.pytorch.org --trusted-host $PypiTrustedHost
-  if ($LASTEXITCODE -ne 0) {
-    throw 'pip download failed for torch requirements.'
-  }
-}
-
-if ($OtherLines.Count -gt 0) {
-  $OtherLines | Set-Content -Encoding UTF8 $OtherRequirements
-  & $Python -m pip download -r $OtherRequirements -d $Wheelhouse -i $PypiIndexUrl --trusted-host $PypiTrustedHost
-  if ($LASTEXITCODE -ne 0) {
-    throw 'pip download failed for non-torch requirements.'
+# The built wheels are the recovery material; source archives are redundant.
+Add-Type -AssemblyName Microsoft.VisualBasic
+foreach ($Wheelhouse in @($WindowsWheelhouse, $LinuxWheelhouse)) {
+  $ResolvedWheelhouse = [IO.Path]::GetFullPath($Wheelhouse)
+  if (-not $ResolvedWheelhouse.StartsWith([IO.Path]::GetFullPath($Bundle) + [IO.Path]::DirectorySeparatorChar,
+      [StringComparison]::OrdinalIgnoreCase)) { throw 'Wheelhouse path escaped staging bundle.' }
+  foreach ($Archive in @(Get-ChildItem -LiteralPath $Wheelhouse -File | Where-Object Extension -ne '.whl')) {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+      $Archive.FullName, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+      [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
   }
 }
-
-$ChecksumFile = Join-Path $ManifestDir 'wheelhouse.sha256'
-$JsonFile = Join-Path $ManifestDir 'wheelhouse.json'
-$Files = Get-ChildItem -LiteralPath $Wheelhouse -File | Sort-Object Name
-if (-not $Files) {
-  throw "Wheelhouse is empty: $Wheelhouse"
-}
-
-$ChecksumLines = foreach ($File in $Files) {
-  $Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $File.FullName).Hash.ToLowerInvariant()
-  "$Hash  $($File.Name)"
-}
-$ChecksumLines | Set-Content -Encoding ASCII $ChecksumFile
-
-$LockHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $LockFile).Hash.ToLowerInvariant()
-$Manifest = [ordered]@{
-  schema_version = 1
-  generated_at = (Get-Date).ToString('s')
-  wheelhouse = $Wheelhouse
-  requirements_lock = $LockFile
-  requirements_lock_sha256 = $LockHash
-  files = @(
-    foreach ($File in $Files) {
-      [ordered]@{
-        name = $File.Name
-        size_bytes = $File.Length
-        sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $File.FullName).Hash.ToLowerInvariant()
-      }
-    }
-  )
-}
-$Manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 $JsonFile
-
-Remove-Item -LiteralPath $TempDir -Recurse -Force
-Write-Host "Wheelhouse: $Wheelhouse"
-Write-Host "Checksum file: $ChecksumFile"
-Write-Host "Manifest: $JsonFile"
+Write-Host "Windows wheels: $(@(Get-ChildItem -LiteralPath $WindowsWheelhouse -File).Count); Linux wheels: $(@(Get-ChildItem -LiteralPath $LinuxWheelhouse -File).Count)."

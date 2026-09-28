@@ -1,46 +1,51 @@
 param(
-  [string]$Venv = '',
-  [string]$OutDir = ''
+  [string]$RuntimeRoot = 'E:\Projects\Tools\ChineseASR',
+  [Parameter(Mandatory = $true)][string]$Bundle,
+  [string]$Distro = 'Ubuntu'
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1')
-Clear-ProxyEnv
-
-$Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-if (-not $Venv) {
-  $Venv = Join-Path $Root '.venv'
+$Python = Join-Path $RuntimeRoot '.venv\Scripts\python.exe'
+$Config = Join-Path $RuntimeRoot 'configs\models.yaml'
+if (-not (Test-Path -LiteralPath $Python -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $Config -PathType Leaf)) {
+  throw 'Installed ChineseASR Python or model config is missing.'
 }
-if (-not $OutDir) {
-  $OutDir = Join-Path $Root 'offline\manifests'
+$ManifestDir = Join-Path $Bundle 'manifests'
+New-Item -ItemType Directory -Force -Path $ManifestDir | Out-Null
+$WindowsLock = Join-Path $ManifestDir 'windows-requirements.txt'
+$LinuxLock = Join-Path $ManifestDir 'linux-requirements.txt'
+
+# pip list expresses local/direct installs as their installed pinned versions.
+# The project source is restored from Git, not as a third-party wheel.
+$WindowsPackages = @(& $Python -m pip list --format=freeze | Where-Object {
+  $_ -match '^[A-Za-z0-9_.-]+==[^\s]+$' -and $_ -notmatch '^local-chinese-asr=='
+} | Sort-Object)
+if ($LASTEXITCODE -ne 0 -or $WindowsPackages.Count -lt 20) {
+  throw 'Cannot export installed Windows dependency lock.'
 }
+$WindowsPackages = @($WindowsPackages + 'wheel==0.47.0' | Sort-Object -Unique)
+$WindowsPackages | Set-Content -LiteralPath $WindowsLock -Encoding utf8NoBOM
 
-$Python = Join-Path $Venv 'Scripts\python.exe'
-if (-not (Test-Path $Python)) {
-  throw "Virtual environment not found: $Venv"
+$WslPython = (& $Python -c "import sys,yaml; print(yaml.safe_load(open(sys.argv[1],encoding='utf-8'))['engines']['fireredasr2-llm']['options']['python_path'])" $Config | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $WslPython.StartsWith('/')) {
+  throw 'Invalid configured FireRed WSL Python path.'
 }
-
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$LockFile = Join-Path $OutDir 'requirements-lock.txt'
-$PythonVersionFile = Join-Path $OutDir 'python-version.txt'
-
-$Freeze = & $Python -m pip freeze --exclude-editable
-if ($LASTEXITCODE -ne 0) {
-  throw 'pip freeze failed.'
+$LinuxPackages = @(& wsl.exe -d $Distro -- $WslPython -m pip list --format=freeze | Where-Object {
+  $_ -match '^[A-Za-z0-9_.-]+==[^\s]+$'
+} | Sort-Object)
+if ($LASTEXITCODE -ne 0 -or $LinuxPackages.Count -lt 20) {
+  throw 'Cannot export installed FireRed WSL dependency lock.'
 }
-$Freeze |
-  Where-Object { $_ -and ($_ -notmatch '^-e\s+') } |
-  Set-Content -Encoding UTF8 $LockFile
+$LinuxPackages | Set-Content -LiteralPath $LinuxLock -Encoding utf8NoBOM
 
-& $Python --version | Set-Content -Encoding UTF8 $PythonVersionFile
-if ($LASTEXITCODE -ne 0) {
-  throw 'python --version failed.'
+$Versions = [ordered]@{
+  schema = 'zh_asr.offline_runtime_versions.v1'
+  windows_python = ((& $Python --version | Out-String).Trim())
+  linux_python = ((& wsl.exe -d $Distro -- $WslPython --version | Out-String).Trim())
+  wsl_distribution = $Distro
+  wsl_python = $WslPython
+  model_config_sha256 = (Get-FileHash -LiteralPath $Config -Algorithm SHA256).Hash.ToLowerInvariant()
 }
-
-& $Python -m pip check
-if ($LASTEXITCODE -ne 0) {
-  throw 'pip check failed.'
-}
-
-Write-Host "Lock file: $LockFile"
-Write-Host "Python version: $PythonVersionFile"
+$Versions | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $ManifestDir 'versions.json') -Encoding utf8NoBOM
+Write-Host "Windows lock: $($WindowsPackages.Count) packages; FireRed WSL lock: $($LinuxPackages.Count) packages."

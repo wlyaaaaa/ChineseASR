@@ -2,6 +2,9 @@
 models/
 outputs/
 offline/wheelhouse/
+offline/current/
+offline/staging-*/
+offline/previous-*/
 eval/corpus/
 eval/runs/
 __pycache__/

@@ -521,32 +521,21 @@ LLM 仲裁配置在 `configs\models.yaml` 的 `llm_arbitration`，默认关闭�
 
 benchmark 按文件 stem 匹配音频和 truth，写 `_manifest\manifest.json`，不会复制你的源音频或 truth 文件。真实私人录音 benchmark 是校准手段，不需要提交到公开仓库。
 
-## 离线备用（尚未建成）
+## 离线备用
 
-当前仓库的 `offline\wheelhouse\` 为空，不能把下列脚本视作已经验收的断网恢复路线。当前使用的模型权重、锁定依赖安装包应作为同一版备用；模型或依赖升级后重新生成并验证，再替换旧版。仅 Qwen3-ASR-1.7B、SenseVoiceSmall 和 FireRedASR2-LLM 三个已安装模型目录就约 22.8 GiB，超过本轮 5 GB 存放前裁定界限，因此本轮没有制作副本，也没有做断网安装验收。正式恢复仍须依赖现有运行文件或联网获取；不要把这些脚本当成已可用的离线备份。
+当前唯一的离线备用在 `E:\Projects\Tools\ChineseASR\offline\current\`，属于 PCConfig 已登记的 ChineseASR 项目运行数据，不进 Git，也不由现有每日备份再复制到 G/H。它是防模型或依赖包上游撤包的本机备用；E 盘本身损坏时，这份备用也不可用。
 
-以下是现有依赖包脚本入口，待决定存放边界后与模型文件一起验收；FireRed 的 WSL 依赖是独立环境，不能用 Windows wheelhouse 安装：
+备份从 `configs/models.yaml` 选择已安装、已接入适配器的引擎和支持模型：日常 quick/strict、`high_quality` 的 FireRed、显式 Paraformer/Fun-ASR、说话人模型和强制对齐器。另存 Windows 已安装环境及 FireRed WSL 隔离环境各自固定版本的 wheel、FireRed 固定提交的源码归档，以及源/副本 SHA-256 清单；不收下载缓存、示例、录音、转写正文或虚拟环境。Whisper 没有可运行适配器，不进入备份。两套 wheelhouse 的 Python/平台不同，不能混装。
 
-冻结当前依赖：
-
-```powershell
-.\scripts\export-lock.ps1
-```
-
-下载 wheelhouse：
+模型或依赖升级并完成运行时验证后，在**同一次升级流程**里刷新备用：
 
 ```powershell
-.\scripts\build-wheelhouse.ps1
-.\scripts\verify-wheelhouse.ps1
+.\scripts\refresh-offline.ps1
 ```
 
-离线安装 smoke：
+该入口串起 `export-lock.ps1`（导出两套锁）、`build-wheelhouse.ps1`（下载并构轮）、模型源/副本 SHA-256 比对、`verify-wheelhouse.ps1`（整包封存与回读）和 `install-offline.ps1`（新建 E 盘 Windows 虚拟环境与 E 盘 Ubuntu 虚拟磁盘内的 WSL 环境，`--no-index --find-links` 安装、`pip check`、项目 `doctor`、FireRed WSL 导入检查）。全部通过后才把候选目录切为 `offline\current`，旧版放回收站；失败保留旧版。没有定时刷新或后台服务。只改默认路线而未升级权重时也刷新清单，使模型集合与配置一致。临时目录若因回收站容量无法回收，入口会保留并报告路径。
 
-```powershell
-.\scripts\install-offline.ps1 -Venv .venv-offline-smoke
-```
-
-`offline\wheelhouse\` 被 Git 忽略。小型 lock/checksum manifest 可以放在 `offline\manifests\` 下追踪。
+恢复时先运行 `verify-wheelhouse.ps1` 核对清单，再用 `install-offline.ps1 -Venv <E盘新Windows虚拟环境> -RestoreModels -VerifyLinux -LinuxVenv /tmp/chineseasr-offline-<随机十六进制号>` 安装依赖并补回缺失模型/FireRed 源码；WSL `/tmp` 位于本机 E 盘的 Ubuntu 虚拟磁盘内。已有但哈希不同的模型不会被覆盖。项目源码须先从可信 Git 副本恢复。若原 `.venv` 已不存在，给两个入口传 `-HostPython <已恢复的同版本 Python 3.11 路径>`；Ubuntu/WSL 的 Python 3.12 也须先可用。此验收检查依赖、配置和源码导入，不替代真实 GPU 推理、个人录音准确率或更换电脑后的完整恢复验收。
 
 ## 模型替换
 
@@ -614,7 +603,8 @@ git status --ignored=matching --short
 - `models\`
 - `outputs\`
 - `eval\corpus\`
-- `offline\wheelhouse\`
+- `offline\current\`、`offline\staging-*\`、`offline\previous-*\`（含各自模型与 wheelhouse）
+- `offline\wheelhouse\`（旧入口遗留路径）
 - Python cache 和 build artifacts
 
 这些目录可能包含模型权重、生成转写、私人音频路径、评测材料或大型 wheel 文件。

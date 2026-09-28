@@ -93,40 +93,39 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("$env:ZH_ASR_WRAPPER = 'scripts\\benchmark.ps1'", script)
         self.assertIn("$LASTEXITCODE", script)
 
-    def test_offline_wheelhouse_directory_is_ignored_but_manifests_are_trackable(self):
+    def test_offline_runtime_bundle_is_ignored_but_source_files_are_trackable(self):
         gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
 
         self.assertIn("offline/wheelhouse/", gitignore)
+        self.assertIn("offline/current/", gitignore)
+        self.assertIn("offline/staging-*/", gitignore)
         self.assertNotIn("offline/manifests/", gitignore)
 
-    def test_export_lock_script_freezes_current_venv_without_editable_project(self):
+    def test_export_lock_script_pins_both_installed_runtimes(self):
         script = (PROJECT_ROOT / "scripts" / "export-lock.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("Clear-ProxyEnv", script)
-        self.assertIn("requirements-lock.txt", script)
-        self.assertIn("pip freeze", script)
-        self.assertIn("--exclude-editable", script)
-        self.assertIn("pip check", script)
+        self.assertIn("pip list --format=freeze", script)
+        self.assertIn("local-chinese-asr", script)
+        self.assertIn("windows-requirements.txt", script)
+        self.assertIn("linux-requirements.txt", script)
+        self.assertIn("versions.json", script)
 
-    def test_build_wheelhouse_script_downloads_pinned_wheels_and_writes_checksums(self):
+    def test_build_wheelhouse_script_prepares_both_platforms_as_wheels(self):
         script = (PROJECT_ROOT / "scripts" / "build-wheelhouse.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("Clear-ProxyEnv", script)
         self.assertIn("download.pytorch.org/whl/cu128", script)
-        self.assertIn("pypi.tuna.tsinghua.edu.cn", script)
         self.assertIn("pip download", script)
-        self.assertIn("requirements-lock.txt", script)
-        self.assertIn("wheelhouse.sha256", script)
-        self.assertIn("wheelhouse.json", script)
-        self.assertIn("Get-FileHash", script)
+        self.assertIn("pip wheel", script)
+        self.assertIn("windows-requirements.txt", script)
+        self.assertIn("linux-requirements.txt", script)
+        self.assertIn("SendToRecycleBin", script)
 
-    def test_verify_wheelhouse_script_fails_on_missing_or_mismatched_hashes(self):
+    def test_verify_wheelhouse_script_uses_bundle_hash_verifier(self):
         script = (PROJECT_ROOT / "scripts" / "verify-wheelhouse.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("wheelhouse.sha256", script)
-        self.assertIn("Get-FileHash", script)
-        self.assertIn("Missing wheelhouse file", script)
-        self.assertIn("Checksum mismatch", script)
+        self.assertIn("offline_bundle.py", script)
+        self.assertIn("'verify'", script)
+        self.assertIn("'seal'", script)
         self.assertIn("throw", script)
 
     def test_install_offline_script_verifies_then_installs_without_index(self):
@@ -134,10 +133,12 @@ class ScriptTests(unittest.TestCase):
 
         self.assertIn("verify-wheelhouse.ps1", script)
         self.assertIn("--no-index", script)
+        self.assertIn("--only-binary=:all:", script)
         self.assertIn("--find-links", script)
-        self.assertIn("requirements-lock.txt", script)
+        self.assertIn("windows-requirements.txt", script)
+        self.assertIn("linux-requirements.txt", script)
         self.assertIn("pip check", script)
-        self.assertIn("pip install -e", script)
+        self.assertIn("$env:PYTHONPATH", script)
         self.assertIn("zh_asr doctor", script)
 
     def test_asr_smart_script_starts_local_api_submits_jobs_and_returns_status(self):
