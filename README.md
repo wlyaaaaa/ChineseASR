@@ -200,7 +200,7 @@ cd <repo-root>
 
 免费期截止日写在 `configs/models.yaml` 的每个云模型 `free_until` 中，按北京时间的带时区时刻作不含截止点的比较。3.1 两款按本人转述的 2026-12-21 暂取当日 00:00 早停；3.0 暂取 2026-09-27 02:00，均不是控制台实时核验的到期时刻。自动模式过期不上传并写 `cloud.review.json`；换成新模型或更新确有新免费期的日期后恢复。显式 `-CloudUploadAuthorized` 不受日期阻断，但过期结果标「可能计费」。这只比日期，不算用量。
 
-百炼返回免费额度用尽、欠费、余额不足、无权限或模型下线类错误时，`outputs\cloud-jobs\auto-cloud-state.json` 记录停用原因，后续疑难作业保留本地转写并在 `cloud.review.json` 写明云端未跑及原因。`python scripts/cloud-review-state.py status` 查看状态。本人说恢复时运行 `python scripts/cloud-review-state.py resume`；配置新增或替换模型 ID、更新免费期日期，或 `credit_cycle` 更新为实际新额度时，也解除旧供应商停用。网络抖动、超时、限流与服务端 5xx 只记本次失败，不触发持久停用。百炼的「免费额度用完即停」保持不启用，此入口不以该开关为条件（决定：9/26 疑难录音自动云复核的费用边界）。
+百炼返回免费额度用尽、欠费、余额不足、无权限或模型下线类错误时，`outputs\cloud-jobs\auto-cloud-state.json` 记录停用原因，后续疑难作业保留本地转写并在 `cloud.review.json` 写明云端未跑及原因。`python scripts/cloud-review-state.py status` 回执含 `enabled`、`free_until`、各自动路由模型的 `model_free_until`、`reason` 和 `failure_reason`，供驾驶舱读取。要主动停用时运行 `python scripts/cloud-review-state.py pause --reason "暂停原因"`；手动暂停不会因模型或免费期配置变化自动解除。本人说恢复时运行 `python scripts/cloud-review-state.py resume`；配置新增或替换模型 ID、更新免费期日期，或 `credit_cycle` 更新为实际新额度时，只解除旧供应商停用。恢复操作仍受免费期限制。网络抖动、超时、限流与服务端 5xx 只记本次失败，不触发持久停用。百炼的「免费额度用完即停」保持不启用，此入口不以该开关为条件（决定：9/26 疑难录音自动云复核的费用边界）。
 
 本地转写的 `quality.review.json` 标 `needs_review`、两引擎分歧、`[疑似]`、`provisional` 或作业的 `-Important` 标记会触发自动复核。本地 API 服务只在 `cloud.review.json` 标记 `pending_ai_session`，并把状态放入 `asr-smart.ps1 -Json` 的 `cloud_review` 字段；服务自身不上传。`asr-smart` 若先返回运行中，AI 应按 `next_status_command` 查询终态，再读取 `cloud_review`。处理该录音的 AI 会话读到待补跑状态后，在自己的进程链中执行侧车给出的 `asr-professional-cloud.ps1 -Audio <原音> -QualityReview`（重要录音改用 `-Important`）`-AutomaticReview -LocalOutDir <结果目录> -EvidenceStatus <本地状态> -Json`。密码中心自己认出实际调用方（Codex 桌面版、Claude 会话及它们派出的子代理），不用传调用方参数。停用或所选模型免费期到期时，本地只记录原因，不安排上传。
 
@@ -521,7 +521,11 @@ LLM 仲裁配置在 `configs\models.yaml` 的 `llm_arbitration`，默认关闭�
 
 benchmark 按文件 stem 匹配音频和 truth，写 `_manifest\manifest.json`，不会复制你的源音频或 truth 文件。真实私人录音 benchmark 是校准手段，不需要提交到公开仓库。
 
-## 离线 Wheelhouse
+## 离线备用（尚未建成）
+
+当前仓库的 `offline\wheelhouse\` 为空，不能把下列脚本视作已经验收的断网恢复路线。当前使用的模型权重、锁定依赖安装包应作为同一版备用；模型或依赖升级后重新生成并验证，再替换旧版。仅 Qwen3-ASR-1.7B、SenseVoiceSmall 和 FireRedASR2-LLM 三个已安装模型目录就约 22.8 GiB，超过本轮 5 GB 存放前裁定界限，因此本轮没有制作副本，也没有做断网安装验收。正式恢复仍须依赖现有运行文件或联网获取；不要把这些脚本当成已可用的离线备份。
+
+以下是现有依赖包脚本入口，待决定存放边界后与模型文件一起验收；FireRed 的 WSL 依赖是独立环境，不能用 Windows wheelhouse 安装：
 
 冻结当前依赖：
 

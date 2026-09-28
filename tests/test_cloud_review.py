@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -84,6 +86,40 @@ class CloudReviewTests(unittest.TestCase):
         self.assertEqual("running", auto_cloud_status(path, self.config)["status"])
         path.write_text("{broken", encoding="utf-8")
         self.assertEqual("cloud_state_unreadable", auto_cloud_status(path, self.config)["reason"])
+
+    def test_manual_pause_cli_survives_config_change_until_resume(self) -> None:
+        state = self.root / "auto-cloud-state.json"
+        command = [sys.executable, str(ROOT / "scripts" / "cloud-review-state.py")]
+
+        def run(action: str, *extra: str) -> dict:
+            result = subprocess.run(command + [action, "--state", str(state), *extra],
+                                    capture_output=True, text=True, check=True)
+            return json.loads(result.stdout)
+
+        paused = run("pause", "--reason", "本次暂缓")
+        self.assertFalse(paused["enabled"])
+        self.assertEqual("manual_pause", paused["reason"])
+        self.assertEqual("本次暂缓", paused["manual_reason"])
+        self.assertEqual("", paused["failure_reason"])
+        self.assertEqual("2026-12-21T00:00:00+08:00", paused["free_until"])
+        self.assertEqual(2, len(paused["model_free_until"]))
+        changed = dict(self.config, credit_cycle="new-grant")
+        self.assertEqual("manual_pause", auto_cloud_status(state, changed)["reason"])
+        pause_cloud(state, self.config, reason="account_arrears",
+                    provider_error="Arrearage", model="cloud-short")
+        self.assertEqual("manual_pause", auto_cloud_status(state, self.config)["reason"])
+        resumed = run("resume")
+        self.assertTrue(resumed["enabled"])
+        self.assertEqual("", resumed["reason"])
+
+    def test_provider_failure_is_visible_in_status_receipt(self) -> None:
+        state = self.root / "auto-cloud-state.json"
+        pause_cloud(state, self.config, reason="account_arrears",
+                    provider_error="Arrearage", model="cloud-short")
+        receipt = auto_cloud_status(state, self.config)
+        self.assertFalse(receipt["enabled"])
+        self.assertEqual("Arrearage", receipt["failure_reason"])
+        self.assertEqual("cloud-short", receipt["model"])
 
     def test_free_period_cutoffs_are_timezone_aware_and_exclusive(self) -> None:
         short = self.config["models"]["short"]

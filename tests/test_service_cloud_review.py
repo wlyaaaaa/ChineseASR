@@ -17,21 +17,22 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ServiceCloudReviewTests(unittest.TestCase):
-    def _run_job(self, root: Path, *, cloud_state: dict, free_until: str) -> tuple[dict, dict]:
+    def _run_job(self, root: Path, *, cloud_state: dict, free_until: str,
+                 important: bool = False, needs_review: bool = True) -> tuple[dict, dict]:
         audio = root / "call.wav"
         audio.write_bytes(b"RIFF fixture")
 
         def local_runner(job):
             job.out_dir.mkdir(parents=True, exist_ok=True)
             (job.out_dir / "quality.review.json").write_text(
-                '{"needs_review":true}', encoding="utf-8")
+                json.dumps({"needs_review": needs_review}), encoding="utf-8")
             return ProcessResult(returncode=0)
 
         service = TranscriptionService(root=root, process_runner=local_runner,
             gpu_process_detector=lambda: [], autostart=False)
         service._cloud_review_marker_enabled = True
         request = JobRequest.from_payload({"audio": str(audio), "mode": "strict",
-            "device": "cpu"}, root=root)
+            "device": "cpu", "important": important}, root=root)
         config = {"routes": {"short": "short", "long": "short"},
             "models": {"short": {"id": "cloud-short", "free_until": free_until}}}
         with (patch("zh_asr.audio_quality.probe_duration_ms", return_value=1000),
@@ -67,6 +68,16 @@ class ServiceCloudReviewTests(unittest.TestCase):
             restored = TranscriptionService(root=root, process_runner=lambda _: None,
                 gpu_process_detector=lambda: [], autostart=False)
             self.assertEqual("unreadable", restored.get_job(job["job_id"]).to_dict()["cloud_review"]["status"])
+
+    def test_important_flag_alone_selects_important_cloud_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job, sidecar = self._run_job(Path(tmp), cloud_state={"status": "running"},
+                free_until="2099-01-01T00:00:00+08:00", important=True,
+                needs_review=False)
+            self.assertTrue(job["request"]["important"])
+            self.assertIn("important_recording", sidecar["review_reasons"])
+            self.assertIn("-Important -AutomaticReview", sidecar["next_command"])
+            self.assertNotIn("-QualityReview", sidecar["next_command"])
 
     def test_paused_and_expired_jobs_keep_reason_and_do_not_queue_cloud(self):
         cases = (

@@ -53,6 +53,8 @@ def all_automatic_models_expired(config: dict[str, Any], *,
 
 
 def pause_message(reason: str) -> str:
+    if reason == "manual_pause":
+        return "自动云复核已手动暂停，云端未跑"
     if reason == "free_period_expired":
         return "免费期已到期，云端未跑"
     if reason == "free_quota_exhausted":
@@ -134,26 +136,44 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 def auto_cloud_status(path: Path, config: dict[str, Any], *,
                       now: datetime | None = None) -> dict[str, Any]:
-    if all_automatic_models_expired(config, now=now):
-        return {"status": "paused", "reason": "free_period_expired",
-                "message": pause_message("free_period_expired")}
+    routed = {config["models"][profile]["id"]: config["models"][profile]["free_until"]
+              for profile in set(config["routes"].values())}
+    earliest = min(routed.values(), key=lambda value: datetime.fromisoformat(value))
+    deadlines = {"free_until": earliest, "model_free_until": routed}
+
+    def receipt(status: str, reason: str = "", **details: Any) -> dict[str, Any]:
+        return {"status": status, "enabled": status == "running", "reason": reason,
+                "failure_reason": details.pop("failure_reason", ""), **deadlines, **details}
+
     if not path.exists():
-        return {"status": "running", "reason": ""}
-    state = _read_json(path)
-    if state is None or state.get("schema") != STATE_SCHEMA:
-        return {"status": "paused", "reason": "cloud_state_unreadable",
-                "message": pause_message("cloud_state_unreadable")}
+        state = None
+    else:
+        state = _read_json(path)
+        if state is None or state.get("schema") != STATE_SCHEMA:
+            return receipt("paused", "cloud_state_unreadable",
+                           message=pause_message("cloud_state_unreadable"),
+                           failure_reason="cloud_state_unreadable")
+        if state.get("status") == "paused" and state.get("reason") == "manual_pause":
+            return receipt("paused", "manual_pause", message=pause_message("manual_pause"),
+                           manual_reason=str(state.get("manual_reason") or ""))
+    if all_automatic_models_expired(config, now=now):
+        return receipt("paused", "free_period_expired",
+                       message=pause_message("free_period_expired"))
+    if state is None:
+        return receipt("running")
     if state.get("status") == "running":
-        return {"status": "running", "reason": ""}
+        return receipt("running")
     if state.get("status") != "paused" or not state.get("reason"):
-        return {"status": "paused", "reason": "cloud_state_unreadable",
-                "message": pause_message("cloud_state_unreadable")}
+        return receipt("paused", "cloud_state_unreadable",
+                       message=pause_message("cloud_state_unreadable"),
+                       failure_reason="cloud_state_unreadable")
     if state.get("config_signature") != config_resume_signature(config):
-        return {"status": "running", "reason": "resumed_by_new_model_or_free_until"}
-    return {"status": "paused", "reason": str(state["reason"]),
-            "message": pause_message(str(state["reason"])),
-            "provider_error": str(state.get("provider_error") or ""),
-            "model": str(state.get("model") or "")}
+        return receipt("running", "resumed_by_new_model_or_free_until")
+    provider_error = str(state.get("provider_error") or "")
+    return receipt("paused", str(state["reason"]),
+                   message=pause_message(str(state["reason"])),
+                   failure_reason=provider_error or str(state["reason"]),
+                   provider_error=provider_error, model=str(state.get("model") or ""))
 
 
 def _write_state(path: Path, state: dict[str, Any]) -> None:
@@ -165,8 +185,18 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
 
 def pause_cloud(path: Path, config: dict[str, Any], *, reason: str,
                 provider_error: str, model: str) -> None:
+    current = _read_json(path)
+    if current and current.get("schema") == STATE_SCHEMA and current.get("reason") == "manual_pause":
+        return
     _write_state(path, {"schema": STATE_SCHEMA, "status": "paused", "reason": reason,
         "provider_error": provider_error, "model": model,
+        "config_signature": config_resume_signature(config),
+        "updated_utc": datetime.now(timezone.utc).isoformat()})
+
+
+def pause_cloud_manually(path: Path, config: dict[str, Any], *, reason: str = "本人手动暂停") -> None:
+    _write_state(path, {"schema": STATE_SCHEMA, "status": "paused",
+        "reason": "manual_pause", "manual_reason": reason,
         "config_signature": config_resume_signature(config),
         "updated_utc": datetime.now(timezone.utc).isoformat()})
 
