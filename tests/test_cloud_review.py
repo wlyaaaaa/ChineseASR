@@ -10,7 +10,8 @@ import unittest
 
 from zh_asr.cloud_review import (
     auto_cloud_status, compare_text, load_cloud_config, local_review_signals,
-    free_period_expired, pause_cloud, resume_cloud, select_model, stopping_error,
+    free_period_expired, pause_cloud, pause_cloud_manually, public_cloud_status,
+    resume_cloud, select_model, stopping_error,
 )
 
 
@@ -23,6 +24,39 @@ class CloudReviewTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = load_cloud_config(ROOT / "configs" / "models.yaml")
+
+    def test_public_cloud_status_states_and_latest_automatic_result(self) -> None:
+        state = self.root / "auto-cloud-state.json"
+        now = datetime.fromisoformat("2026-09-28T12:00:00+08:00")
+        job = "first"
+        (self.root / (job + ".intent.json")).write_text(
+            json.dumps({"automatic_review": True, "audio_path": "DO_NOT_EMIT"}), encoding="utf-8")
+        (self.root / (job + ".result.json")).write_text(json.dumps({
+            "status": "failed", "completed_utc": "2026-09-27T03:00:00Z",
+            "text": "DO_NOT_EMIT", "error_code": "DO_NOT_EMIT"}), encoding="utf-8")
+        (self.root / "explicit.intent.json").write_text('{"automatic_review":false}', encoding="utf-8")
+        (self.root / "explicit.result.json").write_text(json.dumps({
+            "status": "succeeded", "completed_utc": "2026-09-28T03:00:00Z"}), encoding="utf-8")
+        expected = {"last_run_at": "2026-09-27T11:00:00+08:00", "last_result": "failed"}
+        automatic = public_cloud_status(state, self.config, now=now)
+        self.assertEqual(automatic["state"], "auto")
+        self.assertEqual({key: automatic[key] for key in expected}, expected)
+        self.assertEqual(automatic["free_until"], "2026-12-21T00:00:00+08:00")
+        self.assertNotIn("DO_NOT_EMIT", json.dumps(automatic))
+
+        pause_cloud_manually(state, self.config, reason="DO_NOT_EMIT")
+        self.assertEqual(public_cloud_status(state, self.config, now=now)["state"], "paused")
+        resume_cloud(state, self.config)
+        self.assertEqual(public_cloud_status(state, self.config,
+            now=datetime.fromisoformat("2026-12-21T00:00:00+08:00"))["state"], "expired")
+        pause_cloud(state, self.config, reason="free_quota_exhausted",
+                    provider_error="DO_NOT_EMIT", model="DO_NOT_EMIT")
+        stopped = public_cloud_status(state, self.config, now=now)
+        self.assertEqual((stopped["state"], stopped["failure_reason"]),
+                         ("error", "free_quota_exhausted"))
+        self.assertNotIn("DO_NOT_EMIT", json.dumps(stopped))
+        state.write_text("broken", encoding="utf-8")
+        self.assertEqual(public_cloud_status(state, self.config, now=now)["state"], "unknown")
 
     def test_config_routes_without_local_credit_gate(self) -> None:
         self.assertEqual("short", select_model(self.config, duration_sec=12))

@@ -5,7 +5,7 @@ keeps a visible job record for every attempted upload.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 import hashlib
 import json
@@ -25,6 +25,10 @@ class CloudReviewError(RuntimeError):
 
 _APIS = {"http", "websocket"}
 STATE_SCHEMA = "zh_asr.auto_cloud_state.v1"
+PUBLIC_STATUS_SCHEMA = "zh_asr.public_cloud_status.v1"
+BEIJING = timezone(timedelta(hours=8))
+PUBLIC_STOP_REASONS = {"free_quota_exhausted", "account_arrears", "balance_insufficient",
+                       "model_unavailable", "access_denied"}
 
 
 def _free_until(model: dict[str, Any]) -> datetime:
@@ -174,6 +178,49 @@ def auto_cloud_status(path: Path, config: dict[str, Any], *,
                    message=pause_message(str(state["reason"])),
                    failure_reason=provider_error or str(state["reason"]),
                    provider_error=provider_error, model=str(state.get("model") or ""))
+
+
+def public_cloud_status(state_path: Path, config: dict[str, Any], *,
+                        now: datetime | None = None) -> dict[str, Any]:
+    """Project-owned, content-free status for the public dashboard."""
+    status = auto_cloud_status(state_path, config, now=now)
+    reason = status["reason"]
+    if reason == "cloud_state_unreadable":
+        state = "unknown"
+    elif reason == "manual_pause":
+        state = "paused"
+    elif reason == "free_period_expired":
+        state = "expired"
+    elif status["enabled"] is True:
+        state = "auto"
+    elif reason in PUBLIC_STOP_REASONS:
+        state = "error"
+    else:
+        state = "unknown"
+
+    latest: tuple[datetime, str] | None = None
+    for result_path in state_path.parent.glob("*.result.json"):
+        result = _read_json(result_path)
+        if not result or result.get("status") not in {"succeeded", "failed"}:
+            continue
+        intent = _read_json(result_path.with_name(result_path.name.removesuffix(".result.json") + ".intent.json"))
+        if not intent or intent.get("automatic_review") is not True:
+            continue
+        try:
+            completed = datetime.fromisoformat(str(result["completed_utc"]).replace("Z", "+00:00"))
+            if completed.tzinfo is None:
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        if latest is None or completed > latest[0]:
+            latest = (completed, "success" if result["status"] == "succeeded" else "failed")
+
+    cutoff = datetime.fromisoformat(status["free_until"]).astimezone(BEIJING).isoformat()
+    return {"schema": PUBLIC_STATUS_SCHEMA, "state": state,
+            "free_until": cutoff,
+            "last_run_at": latest[0].astimezone(BEIJING).isoformat() if latest else None,
+            "last_result": latest[1] if latest else "none",
+            "failure_reason": reason if state == "error" else None}
 
 
 def _write_state(path: Path, state: dict[str, Any]) -> None:
