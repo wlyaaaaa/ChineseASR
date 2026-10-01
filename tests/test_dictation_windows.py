@@ -3,10 +3,11 @@ from __future__ import annotations
 import time
 import threading
 import unittest
+from unittest.mock import patch
 
 from zh_asr.dictation_windows import (
     KeyboardEvent,
-    TargetWindow,
+    InsertionResult,
     WindowsHost,
     _DisplayMonitor,
     _HOST_INPUT_EXTRA_INFO,
@@ -36,6 +37,8 @@ class FakeWindowsApi:
         self.modifiers_released = True
         self.wait_calls = 0
         self.sent_text: list[str] = []
+        self.sent_targets: list[tuple[int, int]] = []
+        self.send_succeeds = True
         self.mutex_held = False
         self.mutex_handle = 0
         self.next_handle = 10
@@ -143,7 +146,8 @@ class FakeWindowsApi:
 
     def send_unicode_text(self, text: str) -> bool:
         self.sent_text.append(text)
-        return True
+        self.sent_targets.append((self.root, self.focus))
+        return self.send_succeeds
 
     def send_menu_mask(self) -> bool:
         self.menu_masks += 1
@@ -380,23 +384,67 @@ class WindowsHostTests(unittest.TestCase):
         self.assertEqual(["cancel"], self.calls)
         self.assertFalse(host._handle_keyboard_event(KeyboardEvent(_VK_ESCAPE, _WM_KEYDOWN)))
 
-    def test_target_guard_rejects_changed_focus_and_waits_for_shortcut_modifiers(self):
+    def test_insertion_follows_same_window_focus_and_cross_application_changes(self):
         host = self.make_host()
-        target = host.capture_target()
 
-        self.assertTrue(host.insert_text("中文😀", target))
+        self.assertEqual(InsertionResult.INSERTED, host.insert_text("中文😀"))
         self.assertEqual(["中文😀"], self.api.sent_text)
         self.assertEqual([0x4E2D, 0x6587, 0xD83D, 0xDE00], _utf16_units("中文😀"))
         self.assertEqual(1, self.api.wait_calls)
 
         self.api.focus = 202
-        self.assertFalse(host.insert_text("不应输入", target))
-        self.assertEqual(["中文😀"], self.api.sent_text)
+        self.assertEqual(InsertionResult.INSERTED, host.insert_text("新输入框"))
+        self.api.foreground, self.api.root, self.api.focus = 102, 1002, 203
+        self.assertEqual(InsertionResult.INSERTED, host.insert_text("新应用"))
+        self.assertEqual(["中文😀", "新输入框", "新应用"], self.api.sent_text)
+        self.assertEqual([(1001, 201), (1001, 202), (1002, 203)], self.api.sent_targets)
 
-        self.api.focus = 201
+    def test_modifier_timeout_is_temporary_and_input_recovers_without_replay(self):
+        host = self.make_host()
         self.api.modifiers_released = False
-        self.assertFalse(host.insert_text("仍不应输入", target))
-        self.assertEqual(["中文😀"], self.api.sent_text)
+        self.assertEqual(InsertionResult.TEMPORARILY_UNAVAILABLE, host.insert_text("留待复制"))
+        self.assertEqual([], self.api.sent_text)
+        self.api.modifiers_released = True
+        self.assertEqual(InsertionResult.INSERTED, host.insert_text("继续输入"))
+        self.assertEqual(["继续输入"], self.api.sent_text)
+
+    def test_target_is_read_after_modifiers_are_released(self):
+        host = self.make_host()
+        def release_and_switch(timeout):
+            self.assertEqual(0.5, timeout)
+            self.api.foreground, self.api.root, self.api.focus = 102, 1002, 203
+            return True
+        with patch.object(self.api, "wait_for_modifiers_released", side_effect=release_and_switch):
+            self.assertEqual(InsertionResult.INSERTED, host.insert_text("跟随当前位置"))
+        self.assertEqual([(1002, 203)], self.api.sent_targets)
+
+    def test_no_foreground_or_window_root_is_temporary_and_recoverable(self):
+        host = self.make_host()
+        self.api.foreground = 0
+        self.assertEqual(InsertionResult.TEMPORARILY_UNAVAILABLE, host.insert_text("没有窗口"))
+        self.api.foreground, self.api.root = 101, 0
+        self.assertEqual(InsertionResult.TEMPORARILY_UNAVAILABLE, host.insert_text("没有根窗口"))
+        self.assertEqual([], self.api.sent_text)
+        self.api.root = 1001
+        self.assertEqual(InsertionResult.INSERTED, host.insert_text("窗口已恢复"))
+
+    def test_send_input_failure_is_distinct_and_does_not_latch(self):
+        host = self.make_host()
+        self.api.send_succeeds = False
+        self.assertEqual(InsertionResult.FAILED, host.insert_text("发送失败"))
+        self.api.send_succeeds = True
+        self.assertEqual(InsertionResult.INSERTED, host.insert_text("发送恢复"))
+
+    def test_cancel_before_or_during_modifier_wait_never_sends_late_text(self):
+        host = self.make_host()
+        cancelled = threading.Event()
+        cancelled.set()
+        self.assertEqual(InsertionResult.TEMPORARILY_UNAVAILABLE, host.insert_text("已取消", cancelled=cancelled))
+        self.assertEqual(0, self.api.wait_calls)
+        cancelled.clear()
+        with patch.object(self.api, "wait_for_modifiers_released", side_effect=lambda _: (cancelled.set() or True)):
+            self.assertEqual(InsertionResult.TEMPORARILY_UNAVAILABLE, host.insert_text("等待中取消", cancelled=cancelled))
+        self.assertEqual([], self.api.sent_text)
 
     def test_single_instance_quit_event_and_memory_text_are_independent_of_clipboard(self):
         host = self.make_host()
@@ -410,7 +458,7 @@ class WindowsHostTests(unittest.TestCase):
         self.assertEqual(["quit"], self.calls)
 
         host.set_last_text("累计识别全文")
-        host.show("输入位置已改变", "错误说明", error=True)
+        host.show("文字输入失败", "错误说明", error=True)
         self.assertEqual("累计识别全文", host.latest_text)
         self.assertFalse(host.copy_text())  # no UI means no implicit clipboard mutation
 
@@ -472,6 +520,8 @@ class WindowsHostTests(unittest.TestCase):
         host._status = "正在准备模型"
         self.assertEqual("#e3a008", host._status_indicator_color())
         host._status = "等待 GPU"
+        self.assertEqual("#e3a008", host._status_indicator_color())
+        host._status = "等待输入位置"
         self.assertEqual("#e3a008", host._status_indicator_color())
         host._status = "正在聆听"
         self.assertEqual("#16a765", host._status_indicator_color())
@@ -604,7 +654,7 @@ class WindowsHostTests(unittest.TestCase):
 
         self.assertEqual(["toggle"], self.calls)
 
-    def test_panel_callbacks_devices_and_external_target_fallback(self):
+    def test_panel_callbacks_devices_and_own_window_input_is_temporarily_unavailable(self):
         calls: list[object] = []
         host = WindowsHost(
             on_toggle=lambda: calls.append("toggle"),
@@ -626,15 +676,17 @@ class WindowsHostTests(unittest.TestCase):
         self.assertEqual([("device", None), "refresh"], calls)
 
         host._own_window_roots = {1001}
-        host._last_external_target = TargetWindow(2001, 2002)
         host._api.foreground = 101
         host._api.root = 1001
-        self.assertEqual(TargetWindow(2001, 2002), host.capture_target())
-        self.assertFalse(host.insert_text("不应输入", TargetWindow(1001, 201)))
+        self.assertEqual(InsertionResult.TEMPORARILY_UNAVAILABLE, host.insert_text("不应输入"))
 
         host._own_window_roots.clear()
         host._api.own_process_windows.add(101)
-        self.assertEqual(TargetWindow(2001, 2002), host.capture_target())
+        self.assertEqual(InsertionResult.TEMPORARILY_UNAVAILABLE, host.insert_text("仍不应输入"))
+        self.assertEqual([], host._api.sent_text)
+        host._api.own_process_windows.clear()
+        self.assertEqual(InsertionResult.INSERTED, host.insert_text("继续输入"))
+        self.assertEqual(["继续输入"], host._api.sent_text)
 
     def test_post_to_ui_and_x_hide_before_notifying_controller(self):
         state: list[object] = []

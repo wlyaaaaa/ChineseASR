@@ -105,6 +105,8 @@ ASR 的 GPU 租约默认有效期两分钟，运行中每二十秒续期。继�
 
 Win+H uses a persistent supervised model subprocess, not the file-quality pipeline. UI and microphone work stay outside native model calls. Audio travels through an anonymous pipe and stays in memory. No new cloud call, transcript history or listening port is introduced. Idle weights remain in RAM; an active GPU lease belongs to the exact model-process creation identity.
 
+文字写入跟随当前光标：等待快捷键修饰键释放后，每段文字独立读取当前外部窗口和焦点。输入框或应用切换不暂停录音、不隐藏卡片、不触发红色故障；暂时无法输入显示「等待输入位置」，文字保留在内存供主动复制，恢复后只发送新结果。实际 SendInput 失败仍提示故障，但下一段重新尝试；取消也会阻止修饰键等待期间的延迟输入（决定：听写输入位置跟随 ASRF01～ASRF03）。
+
 Loading is bounded to 180 seconds per attempt, activation/inference to 60 seconds, warmup to 40 seconds, and parking to 20 seconds. Startup gets one recovery attempt; an unreturned phrase gets one retry after confirmed process exit. A warmup timeout reloads without repeating that warmup. Repeated failure becomes actionable instead of an infinite preparation state. Clicking the microphone retries failed initialization without rebooting Windows. An access-denied process query is not proof that another task died.
 
 File ASR and dictation renew short process-bound leases; the broker also caps legacy ASR lease requests to prevent old clients from retaining hours of orphan occupancy. A legitimate file job still has priority until it finishes: the dictation status names that blocker, preserves recorded audio in memory, and allows Esc cancellation. Do not bypass arbitration to hide contention.

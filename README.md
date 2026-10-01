@@ -32,7 +32,7 @@
 .\scripts\dictation.ps1 -Mode Uninstall  # 移除登录自启，保留项目和模型
 ```
 
-运行时接管这两组快捷键，支持本机键盘及远程控制发送的按键；退出或从托盘暂停快捷键后恢复系统行为。键盘监听与界面处理分开，麦克风初始化时仍能接收按键。麦克风和技术词拼写在 `configs/dictation.yaml` 设置；`input_device: null` 表示跟随 Windows 默认麦克风。指定设备未连接时会提示连接，不切换到其他麦克风。焦点改变时停止自动输入，托盘“复制最近文本”可手动取回完整识别结果。管理员窗口可能拒绝普通权限程序输入，需手动复制。
+运行时接管这两组快捷键，支持本机键盘及远程控制发送的按键；退出或从托盘暂停快捷键后恢复系统行为。键盘监听与界面处理分开，麦克风初始化时仍能接收按键。麦克风和技术词拼写在 `configs/dictation.yaml` 设置；`input_device: null` 表示跟随 Windows 默认麦克风。指定设备未连接时会提示连接，不切换到其他麦克风。输入位置跟随与临时无法输入的处理见 `docs/quality-and-model-maintenance.md` 的 Desktop dictation reliability 一节。管理员窗口可能拒绝普通权限程序输入，需手动复制。
 
 录音和识别结果不保存为历史文件；`outputs/dictation/runtime.log` 只记录运行错误、耗时和字数。麦克风选择保存在本机 `outputs/dictation/preferences.json`，不修改 Windows 默认设备。公开短音频只能检查软件集成及速度，个人口音、麦克风与实际体验仍以本人试用为准。
 

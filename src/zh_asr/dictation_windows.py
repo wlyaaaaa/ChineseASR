@@ -9,6 +9,7 @@ import ctypes
 import logging
 from ctypes import wintypes
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 import queue
 import sys
@@ -215,12 +216,10 @@ class _MSG(ctypes.Structure):
     ]
 
 
-@dataclass(frozen=True)
-class TargetWindow:
-    """The focused control which was active when one dictation session started."""
-
-    root: int
-    focus: int
+class InsertionResult(Enum):
+    INSERTED = "inserted"
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -797,7 +796,6 @@ class WindowsHost:
         self._last_topology_check = 0.0
         self._ui_thread_id: int | None = None
         self._own_window_roots: set[int] = set()
-        self._last_external_target: TargetWindow | None = None
         self._status_var = None
         self._detail_var = None
         self._device_var = None
@@ -1021,29 +1019,6 @@ class WindowsHost:
             "可从托盘随时切换",
         )
 
-    def capture_target(self) -> TargetWindow:
-        target = self._capture_external_target()
-        if target is not None:
-            return target
-        with self._lock:
-            return self._last_external_target or TargetWindow(0, 0)
-
-    def _capture_external_target(self) -> TargetWindow | None:
-        foreground = self._api.get_foreground_window()
-        if not foreground or self._is_own_window(foreground):
-            return None
-        root = self._api.get_root_window(foreground)
-        focus = self._api.get_focus_window(foreground) or foreground
-        if not root or not focus:
-            return None
-        target = TargetWindow(root, focus)
-        with self._lock:
-            self._last_external_target = target
-        return target
-
-    def _remember_external_target(self) -> None:
-        self._capture_external_target()
-
     def _is_own_window(self, hwnd: int) -> bool:
         if not hwnd:
             return False
@@ -1056,31 +1031,28 @@ class WindowsHost:
             return True
         return self._api.get_window_process_id(hwnd) == self._process_id
 
-    def insert_text(self, text: str, target: TargetWindow) -> bool:
-        """Insert Unicode text only while the original foreground/focus pair remains."""
+    def insert_text(
+        self, text: str, *, cancelled: threading.Event | None = None,
+    ) -> InsertionResult:
+        """Follow the current input position after shortcut modifiers are released."""
 
         if not text:
-            return True
-        if self._is_own_window(target.root):
-            return False
-        if not self._target_is_current(target):
-            return False
+            return InsertionResult.INSERTED
+        if cancelled is not None and cancelled.is_set():
+            return InsertionResult.TEMPORARILY_UNAVAILABLE
         if not self._api.wait_for_modifiers_released(0.5):
-            return False
-        # Recheck after the trigger modifiers are physically released and directly
-        # before SendInput.  The function never calls SetForegroundWindow.
-        if not self._target_is_current(target):
-            return False
-        return self._api.send_unicode_text(text)
-
-    def _target_is_current(self, target: TargetWindow) -> bool:
-        if not target.root or not target.focus:
-            return False
+            return InsertionResult.TEMPORARILY_UNAVAILABLE
+        # Focus may change during recognition or the modifier wait. Do not reuse
+        # a previous window or bring it forward; SendInput follows current focus.
         foreground = self._api.get_foreground_window()
-        if not foreground or self._api.get_root_window(foreground) != target.root:
-            return False
+        if not foreground or self._is_own_window(foreground):
+            return InsertionResult.TEMPORARILY_UNAVAILABLE
+        root = self._api.get_root_window(foreground)
         focus = self._api.get_focus_window(foreground) or foreground
-        return focus == target.focus
+        if not root or not focus or (cancelled is not None and cancelled.is_set()):
+            return InsertionResult.TEMPORARILY_UNAVAILABLE
+        return (InsertionResult.INSERTED if self._api.send_unicode_text(text)
+                else InsertionResult.FAILED)
 
     def run(self) -> bool:
         """Run the desktop event loop.  Returns ``False`` if no primary host exists."""
@@ -1312,7 +1284,7 @@ class WindowsHost:
         if error:
             return "#e5654f"
         if status in {
-            "中文听写正在启动", "正在准备模型", "正在打开麦克风", "准备继续录音", "等待 GPU",
+            "中文听写正在启动", "正在准备模型", "正在打开麦克风", "准备继续录音", "等待 GPU", "等待输入位置",
             "正在预热 GPU", "正在恢复模型", "模型正在清理",
         }:
             return "#e3a008"
@@ -1484,7 +1456,6 @@ class WindowsHost:
 
     def _open_device_menu(self, event, panel: _OverlayPanel | None = None) -> None:
         self._hide_tooltip()
-        self._remember_external_target()
         self._refresh_microphone_menu_ui()
         menu = self._device_menu if panel is None else panel.device_menu
         if menu is None:
@@ -1535,7 +1506,6 @@ class WindowsHost:
 
     def _toggle_from_panel(self) -> None:
         self._hide_tooltip()
-        self._remember_external_target()
         self._invoke_callback(self.on_toggle, "切换听写失败")
 
     def _hide_from_panel(self) -> None:
@@ -1840,7 +1810,6 @@ class WindowsHost:
                 self._refresh_microphone_menu_ui()
                 continue
             if action == "toggle":
-                self._remember_external_target()
                 self._invoke_callback(self.on_hotkey, "切换听写失败")
             elif action == "cancel":
                 self._invoke_callback(self.on_cancel, "取消听写失败")

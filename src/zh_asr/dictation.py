@@ -19,6 +19,7 @@ import numpy as np
 
 from .config import get_engine_spec, load_model_config, project_root
 from .dictation_vad import VoiceActivityDetector, contains_speech
+from .dictation_windows import InsertionResult
 from .gpu_broker import GpuBrokerConflict, GpuBrokerLease
 from .dictation_worker import ProcessDictationEngine, DictationWorkerFailure
 
@@ -290,12 +291,10 @@ class QwenDictationEngine:
 
 @dataclass
 class Recording:
-    target: object
     chunks: queue.Queue
     cancelled: threading.Event
     stopped: threading.Event
     text: str = ""
-    insertion_failed: bool = False
     error: str = ""
     settings: DictationSettings | None = None
     segmenter: PauseSegmenter | None = None
@@ -325,7 +324,6 @@ class DictationController:
         self.initialization_failed = False
         self.model_ready = False
         self.pending_start = False
-        self.pending_target = None
         self.worker = threading.Thread(target=self._worker, name="dictation-asr", daemon=True)
         self.audio_worker = threading.Thread(target=self._audio_worker, name="dictation-audio", daemon=True)
 
@@ -337,7 +335,6 @@ class DictationController:
 
     def toggle(self) -> None:
         LOG.info("dictation toggle received")
-        target = self.host.capture_target()  # Capture before any window can take focus.
         self.host.open_panel()
         if self.quit_event.is_set():
             return
@@ -353,7 +350,6 @@ class DictationController:
         if self.recording is not None:
             if self.recording.open_timed_out:
                 self.pending_start = False
-                self.pending_target = None
                 self.host.show(
                     "麦克风打开超时",
                     "驱动仍在处理中；请从托盘退出后重新启动听写",
@@ -365,10 +361,9 @@ class DictationController:
                 self.stop()
             else:
                 self.pending_start = not self.pending_start
-                self.pending_target = target if self.pending_start else None
                 self.host.show("准备继续录音" if self.pending_start else "已暂停", "正在完成上一段" if self.pending_start else "点击麦克风继续")
             return
-        self._begin_recording(target)
+        self._begin_recording()
 
     def toggle_visibility(self) -> None:
         """Hotkeys control visibility; the on-panel button controls recording."""
@@ -377,10 +372,10 @@ class DictationController:
         else:
             self.toggle()
 
-    def _begin_recording(self, target=None) -> None:
+    def _begin_recording(self) -> None:
         if self.quit_event.is_set():
             return
-        recording = Recording(target or self.host.capture_target(), queue.Queue(),
+        recording = Recording(queue.Queue(),
                               threading.Event(), threading.Event(), settings=self.settings,
                               segmenter=None)
         self.recording = recording
@@ -418,7 +413,6 @@ class DictationController:
             recording.stopped.set()
         recording.error = "麦克风打开超时；请从托盘退出后重新启动听写"
         self.pending_start = False
-        self.pending_target = None
         self.host.set_busy(False)
         self.host.show(
             "麦克风打开超时",
@@ -591,7 +585,6 @@ class DictationController:
     def hide(self) -> None:
         self.host.hide_panel()
         self.pending_start = False
-        self.pending_target = None
         self.stop()
 
     def select_microphone(self, value: str | None) -> None:
@@ -621,8 +614,7 @@ class DictationController:
             self.host.show("暂时无法听写", recording.error, error=True)
         if self.pending_start and not self.quit_event.is_set():
             self.pending_start = False
-            target, self.pending_target = self.pending_target, None
-            self._begin_recording(target)
+            self._begin_recording()
 
     def close(self) -> None:
         if self.quit_event.is_set():
@@ -720,6 +712,7 @@ class DictationController:
         self.host.show("语音模型加载失败", "自动恢复未成功；点击麦克风可重试，无需重启电脑", error=True)
 
     def _recognize(self, recording: Recording) -> None:
+        insertion_result = InsertionResult.INSERTED
         while not recording.cancelled.is_set() and not self.quit_event.is_set():
             try:
                 self.engine.activate()
@@ -755,10 +748,14 @@ class DictationController:
                 continue
             recording.text += text
             self.host.set_last_text(recording.text)
-            if not recording.insertion_failed:
-                recording.insertion_failed = not self.host.insert_text(text, recording.target)
-            if recording.insertion_failed:
-                self.host.show("输入位置已改变", "可从托盘复制最近文字", error=True,
+            insertion_result = self.host.insert_text(text, cancelled=recording.cancelled)
+            if recording.cancelled.is_set() or self.quit_event.is_set():
+                break
+            if insertion_result is InsertionResult.TEMPORARILY_UNAVAILABLE:
+                self.host.show("等待输入位置", "请点击输入框继续；可从菜单复制最近文字",
+                               recording=not recording.stopped.is_set())
+            elif insertion_result is InsertionResult.FAILED:
+                self.host.show("文字输入失败", "可从菜单复制最近文字；下一段将重新尝试", error=True,
                                recording=not recording.stopped.is_set())
             elif not recording.stopped.is_set():
                 self.host.show("正在聆听", "点击麦克风或快捷键暂停", recording=True)
@@ -766,8 +763,10 @@ class DictationController:
             self.host.show("录音未能完整采集", recording.error, error=True)
         elif recording.cancelled.is_set():
             self.host.show("已暂停", "已输入的文字保留")
-        elif recording.insertion_failed:
+        elif insertion_result is InsertionResult.FAILED:
             self.host.show("已暂停", "可从托盘复制最近文字", error=True)
+        elif insertion_result is InsertionResult.TEMPORARILY_UNAVAILABLE:
+            self.host.show("已暂停", "可从菜单复制最近文字")
         else:
             self.host.show("已暂停", "点击麦克风或快捷键继续")
 

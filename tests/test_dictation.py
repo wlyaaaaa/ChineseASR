@@ -16,30 +16,35 @@ from zh_asr.dictation import (
     resample_audio,
 )
 from zh_asr.gpu_broker import GpuBrokerConflict, GpuBrokerLease
+from zh_asr.dictation_windows import InsertionResult
 
 
 class FakeHost:
-    def __init__(self, allow=True):
-        self.allow = allow
+    def __init__(self, results=()):
+        self.results = iter(results)
+        self.current_target = "original-focus"
+        self.attempts = []
         self.insertions = []
         self.messages = []
+        self.states = []
         self.last_text = ""
         self.visible = False
         self.callbacks = queue.Queue()
         self.busy = False
 
-    def insert_text(self, text, target):
-        self.insertions.append((text, target))
-        return self.allow
+    def insert_text(self, text, *, cancelled=None):
+        self.attempts.append(text)
+        result = next(self.results, InsertionResult.INSERTED)
+        if result is InsertionResult.INSERTED:
+            self.insertions.append((text, self.current_target))
+        return result
 
     def show(self, status, detail="", **kwargs):
         self.messages.append((status, detail))
+        self.states.append((status, kwargs))
 
     def set_last_text(self, text):
         self.last_text = text
-
-    def capture_target(self):
-        return "original-focus"
 
     def open_panel(self):
         self.visible = True
@@ -76,7 +81,7 @@ class FakeEngine:
 
 
 def recording_with_chunks(count=2):
-    recording = Recording("original-focus", queue.Queue(), threading.Event(), threading.Event())
+    recording = Recording(queue.Queue(), threading.Event(), threading.Event())
     for _ in range(count):
         recording.chunks.put(np.ones(1600, dtype=np.float32))
     recording.chunks.put(None)
@@ -88,7 +93,7 @@ class DictationTests(unittest.TestCase):
     def test_capture_does_not_claim_ready_while_model_is_still_loading(self):
         host = FakeHost()
         controller = DictationController(host, DictationSettings(), FakeEngine([]))
-        recording = Recording("focus", queue.Queue(), threading.Event(), threading.Event())
+        recording = Recording(queue.Queue(), threading.Event(), threading.Event())
         controller.recording = recording
         controller._capture_started(recording)
         self.assertEqual(host.messages[-1][0], "正在准备模型")
@@ -225,9 +230,9 @@ class DictationTests(unittest.TestCase):
     def test_stale_callback_failure_never_stops_following_recording(self):
         host = FakeHost()
         controller = DictationController(host, DictationSettings(), FakeEngine([]))
-        first = Recording("first", queue.Queue(), threading.Event(), threading.Event())
+        first = Recording(queue.Queue(), threading.Event(), threading.Event())
         first.segmenter = SimpleNamespace(feed=lambda _samples: (_ for _ in ()).throw(ValueError("bad frame")))
-        following = Recording("following", queue.Queue(), threading.Event(), threading.Event())
+        following = Recording(queue.Queue(), threading.Event(), threading.Event())
         controller.recording = first
 
         controller._audio_callback(first, np.ones((320, 1), dtype=np.float32), None)
@@ -248,7 +253,7 @@ class DictationTests(unittest.TestCase):
 
         host = FakeHost()
         controller = DictationController(host, DictationSettings(), FakeEngine([]))
-        recording = Recording("current", queue.Queue(), threading.Event(), threading.Event())
+        recording = Recording(queue.Queue(), threading.Event(), threading.Event())
         recording.segmenter = BrokenSegmenter()
         controller.recording = recording
 
@@ -382,14 +387,59 @@ class DictationTests(unittest.TestCase):
                 activate.assert_called_once()
                 self.assertEqual(host.insertions, [])
 
-    def test_focus_change_stops_all_later_insertion_but_keeps_complete_text(self):
-        host = FakeHost(allow=False)
-        controller = DictationController(host, DictationSettings(), FakeEngine(["不要更新。", "保留 API。 "]))
+    def test_focus_change_during_recognition_follows_new_input_without_stopping(self):
+        host = FakeHost()
+        host.open_panel()
+        engine = FakeEngine(["原来这句。", "换到新框。"])
+        targets = iter(["original-focus", "new-focus"])
+        engine.before_return = lambda: setattr(host, "current_target", next(targets))
+        controller = DictationController(host, DictationSettings(), engine)
         recording = recording_with_chunks()
+        recording.stopped.clear()
+        controller.recording = recording
         controller._recognize(recording)
-        self.assertEqual(len(host.insertions), 1)
-        self.assertEqual(host.last_text, "不要更新。保留 API。 ")
-        self.assertTrue(recording.insertion_failed)
+        self.assertEqual(host.insertions, [("原来这句。", "original-focus"), ("换到新框。", "new-focus")])
+        self.assertTrue(host.visible)
+        self.assertFalse(recording.stopped.is_set())
+        self.assertIs(controller.recording, recording)
+        self.assertFalse(any(state.get("error") for _, state in host.states))
+
+    def test_temporary_unavailability_keeps_text_and_next_phrase_recovers_without_replay(self):
+        host = FakeHost([InsertionResult.TEMPORARILY_UNAVAILABLE, InsertionResult.INSERTED])
+        host.open_panel()
+        controller = DictationController(host, DictationSettings(), FakeEngine(["留待复制。", "继续输入。 "]))
+        recording = recording_with_chunks()
+        recording.stopped.clear()
+        controller._recognize(recording)
+        self.assertEqual(host.attempts, ["留待复制。", "继续输入。 "])
+        self.assertEqual(host.insertions, [("继续输入。 ", "original-focus")])
+        self.assertEqual(host.last_text, "留待复制。继续输入。 ")
+        self.assertIn(("等待输入位置", {"recording": True}), host.states)
+        self.assertFalse(any(state.get("error") for _, state in host.states))
+        self.assertTrue(host.visible)
+        self.assertFalse(recording.stopped.is_set())
+
+    def test_actual_insertion_failure_is_red_but_does_not_block_next_phrase(self):
+        host = FakeHost([InsertionResult.FAILED, InsertionResult.INSERTED])
+        controller = DictationController(host, DictationSettings(), FakeEngine(["保留文字。", "恢复输入。 "]))
+        recording = recording_with_chunks()
+        recording.stopped.clear()
+        controller._recognize(recording)
+        self.assertEqual(host.attempts, ["保留文字。", "恢复输入。 "])
+        self.assertEqual(host.insertions, [("恢复输入。 ", "original-focus")])
+        self.assertEqual(host.last_text, "保留文字。恢复输入。 ")
+        self.assertIn(("文字输入失败", {"error": True, "recording": True}), host.states)
+        self.assertFalse(host.states[-1][1].get("error"))
+
+    def test_paused_unavailable_result_is_neutral_but_actual_failure_remains_red(self):
+        for result in (InsertionResult.TEMPORARILY_UNAVAILABLE, InsertionResult.FAILED):
+            with self.subTest(result=result):
+                host = FakeHost([result])
+                controller = DictationController(host, DictationSettings(), FakeEngine(["最近文字。 "]))
+                controller._recognize(recording_with_chunks(1))
+                self.assertEqual(host.last_text, "最近文字。 ")
+                self.assertEqual(host.messages[-1][0], "已暂停")
+                self.assertEqual(bool(host.states[-1][1].get("error")), result is InsertionResult.FAILED)
 
     def test_cancel_during_inference_never_inserts_late_text(self):
         host = FakeHost()
