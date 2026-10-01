@@ -488,17 +488,6 @@ def _engine_failure_result(engine: str, exc: Exception) -> dict[str, Any]:
     }
 
 
-def _generate_once(audio_path: Path, engine: str, device: str, cache_dir: Path | None, config: ModelConfig) -> Any:
-    result, _ = _generate_once_with_identity(
-        audio_path,
-        engine,
-        device,
-        cache_dir,
-        config,
-    )
-    return result
-
-
 def _generate_once_with_identity(
     audio_path: Path,
     engine: str,

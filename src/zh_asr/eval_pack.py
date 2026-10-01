@@ -400,13 +400,6 @@ def _ps_single_quote(value: Path | str) -> str:
     return str(value).replace("'", "''")
 
 
-def _truth_text(corpus_root: Path, case: dict[str, Any]) -> str:
-    truth_path = corpus_root / str(case["truth"])
-    if truth_path.exists():
-        return truth_path.read_text(encoding="utf-8").strip()
-    return str(case.get("truth_text", "")).strip()
-
-
 def _evaluate_case(
     case: dict[str, Any],
     corpus_root: Path,

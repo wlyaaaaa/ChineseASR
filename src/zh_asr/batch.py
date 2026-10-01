@@ -580,13 +580,6 @@ def _output_dir_name(input_dir: Path, audio_path: Path) -> str:
     return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", raw).strip("._") or audio_path.stem
 
 
-def _expected_output_path(item_dir: Path, audio_path: Path, mode: str, engine: str | None) -> Path:
-    if mode == "strict":
-        return item_dir / f"{audio_path.stem}.strict.md"
-    engine_name = engine or "sensevoice"
-    return item_dir / f"{audio_path.stem}.{engine_name}.md"
-
-
 def _append_failure(path: Path, audio_path: Path, out_dir: Path, exc: Exception) -> None:
     payload = {
         "audio": str(audio_path),
