@@ -1,0 +1,18 @@
+# 默认搜索只排除生成物、缓存和依赖；不改变 Git 跟踪或文件内容。
+# 现行源码、配置、文档和有用的合成夹具保留。
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+/models/
+/outputs/
+/eval/corpus/
+/eval/runs/
+/offline/wheelhouse/
+/offline/current/
+/offline/staging-*/
+/offline/previous-*/
+/build/
+/dist/
+*.log
+/docs/search-hygiene-candidates.md
