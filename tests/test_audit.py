@@ -132,6 +132,33 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(report.similarity, 1.0)
         self.assertEqual(report.rule_hits, ())
 
+    def test_repeated_normalization_preserves_words_in_both_engines(self):
+        from zh_asr.audit import build_audit_report
+        from zh_asr.text_normalizer import to_simplified
+
+        original = "文字、文件、核心、軟件、信息、檔案、軟體、資訊。"
+        expected = "文字、文件、核心、软件、信息、档案、软体、资讯。"
+        report = build_audit_report("qwen", to_simplified(original), "sensevoice", original)
+
+        self.assertEqual(report.status, "consistent")
+        self.assertEqual(report.similarity, 1.0)
+        self.assertEqual(report.final_text, expected)
+        self.assertEqual(report.primary_text, expected)
+        self.assertEqual(report.secondary_text, expected)
+        for evidence in report.engine_evidence:
+            self.assertEqual(evidence.text, expected)
+            self.assertEqual(evidence.segments[0].text, expected)
+
+    def test_regional_word_differences_remain_visible(self):
+        from zh_asr.audit import build_audit_report
+
+        report = build_audit_report("qwen", "文字、文件、核心。", "sensevoice", "文本、文档、内核。")
+
+        self.assertEqual(report.status, "conflict")
+        self.assertEqual(report.primary_text, "文字、文件、核心。")
+        self.assertEqual(report.secondary_text, "文本、文档、内核。")
+        self.assertTrue(report.disagreements)
+
     def test_report_records_roles_segment_disagreements_and_review_items_without_voting(self):
         from zh_asr.audit import build_audit_report
         from zh_asr.result_writer import TranscriptSegment

@@ -66,6 +66,8 @@ _TRADITIONAL_TO_SIMPLIFIED = str.maketrans(
         "網": "网",
         "線": "线",
         "體": "体",
+        "軟": "软",
+        "庫": "库",
         "檔": "档",
         "案": "案",
         "標": "标",
@@ -132,4 +134,5 @@ def _opencc_converter():
         from opencc import OpenCC
     except ImportError:
         return None
-    return OpenCC("tw2sp")
+    # Convert character forms without rewriting regional vocabulary.
+    return OpenCC("t2s")
