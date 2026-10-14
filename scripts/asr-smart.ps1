@@ -35,7 +35,7 @@ if (-not (Test-Path $Python)) {
   $Python = 'python'
 }
 
-$AudioPath = (Resolve-Path $Audio).Path
+$AudioPath = (Resolve-Path -LiteralPath $Audio).Path
 $StateDir = Join-Path $Root 'outputs\api'
 $BaseUrl = "http://$HostName`:$Port"
 
@@ -144,7 +144,7 @@ if ($OutRoot) {
   $Payload.out_root = $OutRootPath
 }
 if ($CacheDir) {
-  $Payload.cache_dir = (Resolve-Path $CacheDir).Path
+  $Payload.cache_dir = (Resolve-Path -LiteralPath $CacheDir).Path
 }
 
 $Submit = Invoke-AsrApi -Method 'POST' -Uri "$BaseUrl/jobs/transcribe" -Body $Payload
