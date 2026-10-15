@@ -215,6 +215,10 @@ if ($FinalJob.status -in @('failed', 'blocked', 'canceled')) {
 }
 } finally {
   foreach ($entry in $PreviousProxyEnvironment) {
-    [Environment]::SetEnvironmentVariable($entry.Name, $entry.Value, 'Process')
+    if ($null -eq $entry.Value) {
+      Remove-Item -LiteralPath "Env:$($entry.Name)" -ErrorAction SilentlyContinue
+    } else {
+      [Environment]::SetEnvironmentVariable($entry.Name, $entry.Value, 'Process')
+    }
   }
 }

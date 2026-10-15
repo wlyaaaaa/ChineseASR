@@ -80,15 +80,13 @@ Start-AsrApi
     def test_restores_proxy_environment_on_success_throw_and_exit(self):
         command = r"""
 $names = 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy','NO_PROXY','no_proxy'
-if ($env:ASR_PROXY_TEST_CASE -eq 'succeeded') {
-  foreach ($name in 'ALL_PROXY','all_proxy') { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
-  foreach ($name in 'NO_PROXY','no_proxy') { [Environment]::SetEnvironmentVariable($name, '', 'Process') }
-}
-$before = @($names | ForEach-Object { [pscustomobject]@{ Name = $_; Value = [Environment]::GetEnvironmentVariable($_, 'Process') } })
+foreach ($name in 'ALL_PROXY','all_proxy') { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+foreach ($name in 'NO_PROXY','no_proxy') { [Environment]::SetEnvironmentVariable($name, '', 'Process') }
+$before = @($names | ForEach-Object { [pscustomobject]@{ Name = $_; Value = [Environment]::GetEnvironmentVariable($_, 'Process'); Present = (Test-Path -LiteralPath "Env:$_") } })
 $caught = $false; $LASTEXITCODE = 0
 try { $null = & $env:ASR_PROXY_TEST_SCRIPT -Audio $env:ASR_PROXY_TEST_AUDIO -Port ([int]$env:ASR_PROXY_TEST_PORT) -WaitSec 0 -Json } catch { $caught = $true }
-$preserved = @($before | ForEach-Object { [object]::Equals([Environment]::GetEnvironmentVariable($_.Name, 'Process'), $_.Value) })
-@{ preserved = $preserved; caught = $caught; exit_code = $LASTEXITCODE } | ConvertTo-Json -Compress
+$preserved = @($before | ForEach-Object { [object]::Equals([Environment]::GetEnvironmentVariable($_.Name, 'Process'), $_.Value) -and ((Test-Path -LiteralPath "Env:$($_.Name)") -eq $_.Present) })
+@{ before = $before; preserved = $preserved; caught = $caught; exit_code = $LASTEXITCODE } | ConvertTo-Json -Compress
 exit 0
 """
         for scenario in ('succeeded', 'missing', 'failed'):
@@ -110,6 +108,8 @@ exit 0
                     thread.join(timeout=2)
                 self.assertEqual(0, result.returncode, result.stderr)
                 payload = json.loads(result.stdout)
+                self.assertTrue(any(not item['Present'] for item in payload['before']))
+                self.assertTrue(any(item['Present'] and item['Value'] == '' for item in payload['before']))
                 self.assertEqual([True] * len(PROXY_NAMES), payload['preserved'])
                 self.assertEqual(scenario == 'missing', payload['caught'])
                 if scenario != 'missing': self.assertEqual(int(scenario == 'failed'), payload['exit_code'])
