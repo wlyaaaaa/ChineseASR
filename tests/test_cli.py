@@ -302,6 +302,50 @@ class CliTests(unittest.TestCase):
         self.assertEqual(transcribe.call_args.kwargs["engine"], "paraformer")
         self.assertEqual(transcribe.call_args.kwargs["preset_spk_num"], 2)
 
+    def test_transcribe_cli_exit_code_follows_objective_execution_without_changing_artifacts(self):
+        import contextlib
+        import io
+        import wave
+
+        from zh_asr.__main__ import main
+        from zh_asr.audio_outcome import load_objective_result
+        from zh_asr.result_writer import write_transcript_bundle
+
+        cases = (
+            ("failed", "synthetic inference failed", "", 1, "failed"),
+            ("corrupt", "invalid wav from synthetic engine", "", 1, "corrupt"),
+            ("unsupported", "unsupported audio from synthetic engine", "", 1, "unsupported"),
+            ("indeterminate", None, "", 0, "completed"),
+            ("text", None, "合成测试文本", 0, "completed"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "synthetic.wav"
+            with wave.open(str(audio), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(16000)
+                handle.writeframes((1200).to_bytes(2, "little", signed=True) * 160)
+            for name, message, text, expected_code, execution in cases:
+                with self.subTest(case=name):
+                    raw = {"text": text, "error": {"type": "RuntimeError", "message": message} if message else None}
+                    paths = write_transcript_bundle(audio, raw, root / name, "sensevoice")
+                    artifacts = {key: paths[key].read_bytes() for key in ("markdown", "json", "objective_result")}
+                    stdout = io.StringIO()
+                    with patch("zh_asr.__main__.transcribe_audio", return_value=paths), contextlib.redirect_stdout(stdout):
+                        code = main(["transcribe", str(audio), "--engine", "sensevoice", "--device", "cpu"])
+                    self.assertEqual(code, expected_code)
+                    objective = load_objective_result(paths["objective_result"])
+                    self.assertEqual(objective["execution"]["status"], execution)
+                    if name == "indeterminate":
+                        self.assertEqual(objective["objective_outcome"], "indeterminate")
+                    if text:
+                        self.assertIn(text, paths["markdown"].read_text(encoding="utf-8"))
+                    for label, key in (("Markdown", "markdown"), ("Raw JSON", "json"), ("Objective result", "objective_result")):
+                        self.assertIn(f"{label}: {paths[key]}", stdout.getvalue())
+                        self.assertEqual(paths[key].read_bytes(), artifacts[key])
+                    self.assertIn(f"Objective: {paths['objective_outcome']}", stdout.getvalue())
+
     def test_preset_speaker_count_is_not_accepted_by_default_engine(self):
         result = self.run_cli(
             "transcribe",

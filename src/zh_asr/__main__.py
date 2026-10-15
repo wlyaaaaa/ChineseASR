@@ -10,6 +10,7 @@ import sys
 import uuid
 from pathlib import Path
 
+from .audio_outcome import load_objective_result
 from .batch import run_batch
 from .benchmark import run_benchmark
 from .config import list_engine_names, list_transcription_engine_names, load_model_config, resolve_profile
@@ -372,7 +373,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Objective: {paths.get('objective_outcome', 'indeterminate')}")
             if paths.get("objective_result"):
                 print(f"Objective result: {paths['objective_result']}")
-            return 0
+            objective = load_objective_result(paths.get("objective_result")) or {}
+            execution = objective.get("execution")
+            return int(
+                isinstance(execution, dict)
+                and execution.get("status") in {"failed", "unsupported", "corrupt"}
+            )
         if args.command == "strict":
             paths = _run_with_gpu_lease(
                 args.device,
