@@ -27,6 +27,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1')
+$PreviousProxyEnvironment = @(
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'NO_PROXY', 'no_proxy' | ForEach-Object {
+    [pscustomobject]@{ Name = $_; Value = [Environment]::GetEnvironmentVariable($_, 'Process') }
+  }
+)
+try {
 Clear-ProxyEnv
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -206,4 +212,9 @@ if ($Json) {
 
 if ($FinalJob.status -in @('failed', 'blocked', 'canceled')) {
   exit 1
+}
+} finally {
+  foreach ($entry in $PreviousProxyEnvironment) {
+    [Environment]::SetEnvironmentVariable($entry.Name, $entry.Value, 'Process')
+  }
 }
