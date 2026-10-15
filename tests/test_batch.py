@@ -178,6 +178,48 @@ class BatchTests(unittest.TestCase):
                 self.assertEqual(saved_audio, state["identity"]["audio_path"])
                 self.assertEqual(final, Path(state["outputs"]["final"]["path"]).read_text(encoding="utf-8"))
 
+    def test_run_batch_excludes_nested_outputs_and_rejects_overlapping_roots(self):
+        from zh_asr.batch import run_batch
+
+        calls = []
+
+        def fake_strict(audio_path, *, primary_engine, secondary_engine, out_dir, **_kwargs):
+            calls.append(audio_path)
+            derived = out_dir / "_derived"
+            derived.mkdir(exist_ok=True)
+            (derived / "fixture.wav").write_bytes(b"synthetic derived audio")
+            return write_strict_bundle(
+                audio_path=audio_path,
+                primary_engine=primary_engine,
+                primary_result={"engine": primary_engine, "text": "ok", "error": None},
+                secondary_engine=secondary_engine,
+                secondary_result={"engine": secondary_engine, "text": "ok", "error": None},
+                out_dir=out_dir,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            output_dir = input_dir / "results"
+            input_dir.mkdir()
+            audio = input_dir / "original.wav"
+            audio.write_bytes(b"synthetic source audio")
+            first = run_batch(input_dir, output_dir, mode="strict", strict_fn=fake_strict)
+            self.assertEqual((1, 1, 0, 0), (first.total, first.processed, first.skipped, first.failed))
+            self.assertTrue((first.items[0].out_dir / "_derived" / "fixture.wav").is_file())
+            second = run_batch(input_dir, output_dir, mode="strict", strict_fn=fake_strict)
+            self.assertEqual(
+                (1, 0, 1, 0), (second.total, second.processed, second.skipped, second.failed),
+                repr(second.items),
+            )
+            self.assertEqual([audio.resolve()], calls)
+            for invalid_output in (input_dir, root):
+                with self.subTest(output=invalid_output):
+                    with self.assertRaises(ValueError):
+                        run_batch(input_dir, invalid_output, mode="strict", strict_fn=fake_strict)
+                    self.assertFalse((invalid_output / "failed.jsonl").exists())
+            self.assertEqual([audio.resolve()], calls)
+
     def test_run_batch_reprocesses_when_model_config_changes(self):
         from zh_asr.batch import run_batch
         from zh_asr.config import load_model_config

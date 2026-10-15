@@ -102,6 +102,11 @@ def run_batch(
 
     input_root = input_dir.resolve()
     output_root = out_dir.resolve()
+    if input_root.is_relative_to(output_root):
+        raise ValueError(
+            "Batch output directory must not equal or contain the input directory. "
+            "Use a separate directory or an output subdirectory within the input."
+        )
     model_config = config or load_model_config()
     quick_engine = engine or model_config.default_engine
     strict_primary = primary_engine or model_config.strict_primary_engine
@@ -111,7 +116,9 @@ def run_batch(
     if not failed_path.exists():
         failed_path.touch()
 
-    audio_files = find_audio_files(input_root)
+    audio_files = [
+        audio for audio in find_audio_files(input_root) if not audio.is_relative_to(output_root)
+    ]
     legacy_names = {audio: _output_dir_name(input_root, audio) for audio in audio_files}
     name_counts = Counter(name.casefold() for name in legacy_names.values())
     items_by_audio: dict[Path, BatchItem] = {}
