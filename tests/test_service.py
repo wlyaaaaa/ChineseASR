@@ -846,6 +846,75 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(refreshed.outputs["primary_raw_json"].endswith("sample.qwen3-asr-1.7b.raw.json"))
             self.assertTrue(refreshed.outputs["secondary_raw_json"].endswith("sample.sensevoice.raw.json"))
 
+    def test_failed_quick_job_preserves_only_validated_corrupt_or_unsupported_execution(self):
+        from zh_asr.result_writer import write_transcript_bundle
+
+        cases = (
+            ("corrupt", "invalid wav from synthetic engine", "", "corrupt", "corrupt"),
+            ("unsupported", "unsupported audio from synthetic engine", "", "unsupported", "unsupported"),
+            ("failed", "synthetic inference failed", "", "failed", "failed"),
+            ("completed", None, "合成测试文本", "completed", "failed"),
+            ("tampered", "invalid wav from synthetic engine", "", "failed", "failed"),
+        )
+        for name, message, text, validated, expected in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                audio = root / "synthetic.wav"
+                with wave.open(str(audio), "wb") as handle:
+                    handle.setnchannels(1)
+                    handle.setsampwidth(2)
+                    handle.setframerate(16000)
+                    handle.writeframes((1200).to_bytes(2, "little", signed=True) * 160)
+                expected_paths, artifacts = {}, {}
+
+                def fake_runner(job):
+                    raw = {
+                        "text": text,
+                        "error": {"type": "RuntimeError", "message": message} if message else None,
+                    }
+                    paths = write_transcript_bundle(audio, raw, job.out_dir, job.request.resolved_engine)
+                    if name == "tampered":
+                        payload = json.loads(paths["objective_result"].read_text(encoding="utf-8"))
+                        payload["raw_artifacts"][0]["sha256"] = "0" * 64
+                        paths["objective_result"].write_text(json.dumps(payload), encoding="utf-8")
+                    expected_paths.update({
+                        "markdown": str(paths["markdown"]),
+                        "raw_json": str(paths["json"]),
+                        "objective_result": str(paths["objective_result"]),
+                    })
+                    artifacts.update({value: Path(value).read_bytes() for value in expected_paths.values()})
+                    return ProcessResult(returncode=1)
+
+                service_options = dict(
+                    root=root,
+                    gpu_process_detector=lambda: [],
+                    process_runner=fake_runner,
+                    autostart=False,
+                )
+                service = TranscriptionService(**service_options)
+                request = JobRequest.from_payload(
+                    {"audio": str(audio), "mode": "quick", "engine": "sensevoice", "device": "cpu"}, root=root,
+                )
+                job, _ = service.submit(request)
+                self.assertTrue(service.run_next_job())
+                self.assertEqual(_objective_from_job_outputs(job.outputs, "quick")[1], validated)
+                if name == "tampered":
+                    sidecar = json.loads(Path(job.outputs["objective_result"]).read_text(encoding="utf-8"))
+                    self.assertEqual(sidecar["execution"]["status"], "corrupt")
+                state_path = root / "outputs" / "api" / "jobs.json"
+                saved = json.loads(state_path.read_text(encoding="utf-8"))["jobs"][0]
+                restored = TranscriptionService(**service_options).get_job(job.job_id)
+                self.assertIsNotNone(restored)
+                for snapshot in (job.to_dict(), saved, restored.to_dict()):
+                    self.assertEqual(snapshot["status"], "failed")
+                    self.assertEqual(snapshot["returncode"], 1)
+                    self.assertEqual(snapshot["objective_execution_status"], expected)
+                    self.assertEqual(snapshot["objective_outcome"], "indeterminate")
+                    self.assertEqual(snapshot["evidence_status"], "not_applicable")
+                    self.assertEqual(snapshot["outputs"], expected_paths)
+                for path, content in artifacts.items():
+                    self.assertEqual(Path(path).read_bytes(), content)
+
     def test_api_job_exposes_successful_firered_fallback_as_provisional(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

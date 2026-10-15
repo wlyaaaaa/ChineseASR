@@ -1044,10 +1044,13 @@ class TranscriptionService:
                         job.evidence_failures,
                     ) = _evidence_from_job_outputs(job)
                 else:
+                    validated_execution = job.objective_execution_status
                     _mark_job_evidence_unavailable(
                         job,
                         "Transcription command failed before evidence completed.",
                     )
+                    if job.request.mode == "quick" and validated_execution in {"corrupt", "unsupported"}:
+                        job.objective_execution_status = validated_execution
                 job.stage = "finished" if result.returncode == 0 else "failed"
                 job.message = "Completed." if result.returncode == 0 else "Transcription command failed."
                 job.finished_at = time.time()
