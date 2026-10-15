@@ -12,11 +12,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1')
-Clear-ProxyEnv
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$AudioPath = (Resolve-Path $Audio).Path
+$AudioPath = (Resolve-Path -LiteralPath $Audio).Path
 if ([string]::IsNullOrWhiteSpace($OutRoot)) {
   $OutRoot = Join-Path $Root 'outputs\evidence-smoke'
 }

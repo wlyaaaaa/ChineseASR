@@ -9,12 +9,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1')
-Clear-ProxyEnv
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if ($Audio) {
-  $AudioPath = (Resolve-Path $Audio).Path
+  $AudioPath = (Resolve-Path -LiteralPath $Audio).Path
 } else {
   $AudioPath = Join-Path $Root 'models\modelscope\iic\SenseVoiceSmall\example\zh.mp3'
   if (-not (Test-Path $AudioPath)) {

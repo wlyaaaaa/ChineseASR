@@ -1,3 +1,7 @@
+import json
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -176,7 +180,6 @@ class ScriptTests(unittest.TestCase):
     def test_smoke_asr_smart_script_runs_strict_local_chinese_audio(self):
         script = (PROJECT_ROOT / "scripts" / "smoke-asr-smart.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("Clear-ProxyEnv", script)
         self.assertIn("asr-smart.ps1", script)
         self.assertIn("-Mode strict", script)
         self.assertIn("-Force", script)
@@ -185,6 +188,54 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("final", script)
         self.assertIn("audit", script)
         self.assertIn("secondary_raw_json", script)
+
+    def test_smoke_wrappers_preserve_proxy_environment_and_literal_audio(self):
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("PowerShell is required for wrapper behavior testing")
+        with tempfile.TemporaryDirectory(prefix="smoke-wrappers-") as directory:
+            root = Path(directory)
+            for name in ("smoke-asr-smart.ps1", "smoke-evidence-asr.ps1", "Invoke-NoProxy.ps1"):
+                shutil.copy2(PROJECT_ROOT / "scripts" / name, root / name)
+            audio = root / "中文 录音[1].wav"
+            audio.write_bytes(b"fixture")
+            (root / "中文 录音1.wav").write_bytes(b"decoy")
+            (root / "asr-smart.ps1").write_text(
+                "param([string]$Audio)\n$global:CapturedAudio = $Audio\nthrow 'fixture-stop'\n",
+                encoding="utf-8-sig",
+            )
+            harness = root / "run.ps1"
+            harness.write_text("""
+$keys = 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'
+foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key, "fixture-$key", 'Process') }
+$before = @($keys | ForEach-Object { [Environment]::GetEnvironmentVariable($_, 'Process') })
+$rows = foreach ($name in 'smoke-asr-smart.ps1', 'smoke-evidence-asr.ps1') {
+  foreach ($inputName in 'missing.wav', '中文 录音[1].wav') {
+    $global:CapturedAudio = $null
+    $message = ''
+    try { & (Join-Path $PSScriptRoot $name) -Audio (Join-Path $PSScriptRoot $inputName) | Out-Null }
+    catch { $message = $_.Exception.Message }
+    $after = @($keys | ForEach-Object { [Environment]::GetEnvironmentVariable($_, 'Process') })
+    [pscustomobject]@{ wrapper = $name; input = $inputName; audio = $global:CapturedAudio; message = $message; proxies = $after }
+  }
+}
+[pscustomobject]@{ before = $before; rows = @($rows) } | ConvertTo-Json -Depth 5 -Compress
+""", encoding="utf-8-sig")
+            result = subprocess.run([pwsh, "-NoProfile", "-File", str(harness)],
+                                    capture_output=True, text=True, encoding="utf-8", timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(len(data["rows"]), 4)
+            for row in data["rows"]:
+                with self.subTest(wrapper=row["wrapper"], audio=row["input"]):
+                    self.assertEqual(row["proxies"], data["before"])
+                    if row["input"] == "missing.wav":
+                        self.assertIsNone(row["audio"])
+                        self.assertTrue(row["message"])
+                        self.assertNotEqual(row["message"], "fixture-stop")
+                    else:
+                        self.assertEqual(row["audio"], str(audio))
+                        self.assertEqual(row["message"], "fixture-stop")
 
     def test_evidence_smoke_uses_canonical_pair_and_verifies_every_chunk(self):
         script = (PROJECT_ROOT / "scripts" / "smoke-evidence-asr.ps1").read_text(
