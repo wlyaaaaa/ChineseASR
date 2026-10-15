@@ -10,6 +10,65 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ScriptTests(unittest.TestCase):
+    def test_no_proxy_command_restores_environment_without_extra_output(self):
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("PowerShell is required for proxy command testing")
+        with tempfile.TemporaryDirectory(prefix="no-proxy-command-") as directory:
+            root = Path(directory)
+            shutil.copy2(PROJECT_ROOT / "scripts" / "Invoke-NoProxy.ps1", root)
+            (root / "child.ps1").write_text("""
+param([int]$Code, [string]$NoProxy)
+foreach ($name in 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy') {
+  if (Test-Path -LiteralPath "Env:$name") { throw 'Proxy inherited' }
+}
+foreach ($name in 'NO_PROXY', 'no_proxy') {
+  if ([Environment]::GetEnvironmentVariable($name, 'Process') -cne $NoProxy) { throw 'Direct bypass changed' }
+}
+[Console]::WriteLine('fixture-output')
+exit $Code
+""", encoding="utf-8-sig")
+            harness = root / "run.ps1"
+            harness.write_text("""
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1')
+$pwsh = (Get-Process -Id $PID).Path
+$child = Join-Path $PSScriptRoot 'child.ps1'
+$keys = 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'NO_PROXY', 'no_proxy'
+foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key, "fixture-$key", 'Process') }
+Remove-Item -LiteralPath Env:ALL_PROXY
+[Environment]::SetEnvironmentVariable('HTTPS_PROXY', '', 'Process')
+$before = @($keys | ForEach-Object { [pscustomobject]@{ name = $_; value = [Environment]::GetEnvironmentVariable($_, 'Process'); present = Test-Path -LiteralPath "Env:$_" } })
+$rows = foreach ($code in '0', '7', 'missing') {
+  $output = @()
+  $caught = $false
+  try {
+    if ($code -eq 'missing') { Invoke-NoProxyCommand -FilePath 'fixture-missing-command-7893' }
+    else { $output = @(Invoke-NoProxyCommand -FilePath $pwsh -ArgumentList @('-NoProfile', '-File', $child, '-Code', $code, '-NoProxy', $script:NoProxyValue)) }
+  } catch { $caught = $true }
+  $after = @($keys | ForEach-Object { [pscustomobject]@{ name = $_; value = [Environment]::GetEnvironmentVariable($_, 'Process'); present = Test-Path -LiteralPath "Env:$_" } })
+  [pscustomobject]@{ case = $code; output = $output; exit = $LASTEXITCODE; caught = $caught; after = $after }
+}
+$cliOutput = @(& $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1') $pwsh -NoProfile -File $child -Code 7 -NoProxy $script:NoProxyValue)
+[pscustomobject]@{ before = $before; rows = @($rows); cliExit = $LASTEXITCODE; cliOutput = $cliOutput } | ConvertTo-Json -Depth 5 -Compress
+""", encoding="utf-8-sig")
+            result = subprocess.run([pwsh, "-NoProfile", "-File", str(harness)],
+                                    capture_output=True, text=True, encoding="utf-8", timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(len(data["before"]), 8)
+            self.assertTrue(any(not entry["present"] for entry in data["before"]))
+            self.assertTrue(any(entry["present"] and entry["value"] == "" for entry in data["before"]))
+            for row in data["rows"]:
+                with self.subTest(case=row["case"]):
+                    self.assertEqual(row["after"], data["before"])
+                    self.assertEqual(row["caught"], row["case"] == "missing")
+                    self.assertEqual(row["output"], [] if row["caught"] else ["fixture-output"])
+                    if not row["caught"]:
+                        self.assertEqual(row["exit"], int(row["case"]))
+            self.assertEqual(data["cliExit"], 7)
+            self.assertEqual(data["cliOutput"], ["fixture-output"])
+
     def test_setup_core_falls_back_to_official_pypi_and_checks_environment(self):
         script = (PROJECT_ROOT / "scripts" / "setup-core.ps1").read_text(encoding="utf-8")
 
@@ -66,7 +125,7 @@ class ScriptTests(unittest.TestCase):
     def test_transcribe_folder_uses_no_proxy_batch_cli_and_force_flag(self):
         script = (PROJECT_ROOT / "scripts" / "transcribe-folder.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("Clear-ProxyEnv", script)
+        self.assertIn("Invoke-NoProxyCommand -FilePath $Python -ArgumentList $CliArgs", script)
         self.assertIn("'batch', $InputDir", script)
         self.assertIn("--cache-dir", script)
         self.assertIn("[switch]$Force", script)
@@ -76,7 +135,7 @@ class ScriptTests(unittest.TestCase):
     def test_eval_script_uses_no_proxy_generate_flags_and_cache_dir(self):
         script = (PROJECT_ROOT / "scripts" / "eval.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("Clear-ProxyEnv", script)
+        self.assertIn("Invoke-NoProxyCommand -FilePath $Python -ArgumentList $CliArgs", script)
         self.assertIn("'eval'", script)
         self.assertIn("[switch]$Generate", script)
         self.assertIn("'--generate'", script)
@@ -88,7 +147,7 @@ class ScriptTests(unittest.TestCase):
     def test_benchmark_script_uses_no_proxy_and_required_dirs(self):
         script = (PROJECT_ROOT / "scripts" / "benchmark.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("Clear-ProxyEnv", script)
+        self.assertIn("Invoke-NoProxyCommand -FilePath $Python -ArgumentList $CliArgs", script)
         self.assertIn("'benchmark'", script)
         self.assertIn("[Parameter(Mandatory = $true)]", script)
         self.assertIn("--audio-dir", script)

@@ -25,19 +25,31 @@ function Invoke-NoProxyCommand {
     [string[]]$ArgumentList = @()
   )
 
-  Clear-ProxyEnv
-  & $FilePath @ArgumentList
-  return $LASTEXITCODE
+  $PreviousProxyEnvironment = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+  foreach ($name in ($script:ProxyEnvNames + @('NO_PROXY', 'no_proxy'))) {
+    $PreviousProxyEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+  }
+  try {
+    Clear-ProxyEnv
+    & $FilePath @ArgumentList
+  } finally {
+    foreach ($entry in $PreviousProxyEnvironment.GetEnumerator()) {
+      if ($null -eq $entry.Value) {
+        Remove-Item -LiteralPath "Env:$($entry.Key)" -ErrorAction SilentlyContinue
+      } else {
+        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
+      }
+    }
+  }
 }
 
 if ($args.Count -gt 0) {
-  Clear-ProxyEnv
   $cmd = $args[0]
   $rest = @()
   if ($args.Count -gt 1) {
     $rest = $args[1..($args.Count - 1)]
   }
-  & $cmd @rest
+  Invoke-NoProxyCommand -FilePath $cmd -ArgumentList $rest
   exit $LASTEXITCODE
 }
 

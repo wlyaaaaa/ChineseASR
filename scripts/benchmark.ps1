@@ -15,7 +15,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1')
-Clear-ProxyEnv
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
@@ -49,7 +48,7 @@ if (-not [string]::IsNullOrWhiteSpace($SecondaryEngine)) {
 }
 
 $env:ZH_ASR_WRAPPER = 'scripts\benchmark.ps1'
-& $Python @CliArgs
+Invoke-NoProxyCommand -FilePath $Python -ArgumentList $CliArgs
 if ($LASTEXITCODE -ne 0) {
   throw "Benchmark failed with exit code $LASTEXITCODE."
 }
