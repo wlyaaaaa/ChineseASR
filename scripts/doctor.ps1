@@ -16,4 +16,5 @@ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 Write-Host ''
 Write-Host '== ASR project =='
 Invoke-NoProxyCommand -FilePath $Python -ArgumentList @('-m', 'zh_asr', 'doctor')
+exit $LASTEXITCODE
 
