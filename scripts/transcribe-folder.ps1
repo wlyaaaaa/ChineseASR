@@ -10,7 +10,8 @@ param(
   [string]$Engine = '',
   [string]$PrimaryEngine = '',
   [string]$SecondaryEngine = '',
-  [switch]$Force
+  [switch]$Force,
+  [string]$Profile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,6 +34,9 @@ $CliArgs = @(
   '--out-dir', $OutDir,
   '--cache-dir', (Join-Path $Root 'models\modelscope')
 )
+if (-not [string]::IsNullOrWhiteSpace($Profile)) {
+  $CliArgs += @('--profile', $Profile)
+}
 if (-not [string]::IsNullOrWhiteSpace($Engine)) {
   $CliArgs += @('--engine', $Engine)
 }

@@ -139,6 +139,9 @@ cd <repo-root>
 
 # 批量转写文件夹
 .\scripts\transcribe-folder.ps1 -InputDir C:\path\to\audio-folder
+
+# 显式选择高质量配置批量转写
+.\scripts\transcribe-folder.ps1 -InputDir C:\path\to\audio-folder -Profile high_quality
 ```
 
 ### 已有转写的哈希回读
