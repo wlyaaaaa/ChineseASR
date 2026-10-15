@@ -430,12 +430,12 @@ python -m zh_asr attribute-speakers C:\private\call.raw.json `
 
 每个 quick/strict 结果都会旁写一个版本化的 `*.objective-result.json`（long-strict 为根目录的 `objective-result.json`，chunk 也各有一个）。它与旧 strict 两条 `engine_evidence` 和 receipt 分开，机器消费者必须读取 `objective_outcome`，不能把空字符串、空数组、零字节或 `expect_empty` 当作无语音：
 
-- `speech_transcribed`：至少有可观察转写文本；单引擎空文本会附带 `quality_status=low_confidence`，不能把双引擎链的 `verified` 当成准确性证明；
+- `speech_transcribed`：至少有可观察转写文本；单引擎空文本会附带 `quality.status=low_confidence`，不能把双引擎链的 `verified` 当成准确性证明；
 - `no_speech_detected`：只在完整音频覆盖下取得规范 VAD 零区间，或完整有效 PCM 的全零负证据时使用，并绑定 raw SHA-256、处理器/配置/策略/request hash、区间和非空负证据 hash；
 - `speech_detected_but_not_transcribable`：检测到语音区间但文本为空，保持 deferred/unknown，可交给音频理解路线；
 - `indeterminate`：没有完整 VAD/负证据，或存在预处理、模型、子进程、格式、覆盖等不确定性。
 
-sidecar 的正式正交字段是 `execution.status ∈ {completed, failed, unsupported, corrupt}`、`coverage.status ∈ {complete, partial, unknown}` 和 `quality.status ∈ {sufficient, low_confidence, unknown}`；旧 `*_status` 名称只在 `compatibility` 中保留。`media_kind` 固定为 `audio`。调用方若有 caller-owned 绑定，可通过 API `caller_binding` 原样透传；服务到 CLI 子进程只经 `ZH_ASR_CALLER_BINDING_JSON` 环境变量传递，不进入命令行，ChineseASR 不解释或伪造这些治理字段。long-strict 允许配置的 chunk overlap，但必须从 0 连续覆盖到原音频时长、没有 gap/exclusion、首尾闭合，且所有 child 负证据、区间、raw 引用和幂等身份都绑定时才允许聚合为 `no_speech_detected`。旧 Markdown 或缺 sidecar 的缓存最多是未验证的历史产物，不得据此宣称无语音。
+sidecar 的正式正交字段是 `execution.status ∈ {completed, failed, unsupported, corrupt}`、`coverage.status ∈ {complete, partial, unknown}` 和 `quality.status ∈ {sufficient, low_confidence, unknown}`；旧 `*_status` 别名在顶层及 `compatibility` 中保留兼容值，新消费者读取上述正式字段。`media_kind` 固定为 `audio`。调用方若有 caller-owned 绑定，可通过 API `caller_binding` 原样透传；服务到 CLI 子进程只经 `ZH_ASR_CALLER_BINDING_JSON` 环境变量传递，不进入命令行，ChineseASR 不解释或伪造这些治理字段。long-strict 允许配置的 chunk overlap，但必须从 0 连续覆盖到原音频时长、没有 gap/exclusion、首尾闭合，且所有 child 负证据、区间、raw 引用和幂等身份都绑定时才允许聚合为 `no_speech_detected`。旧 Markdown 或缺 sidecar 的缓存最多是未验证的历史产物，不得据此宣称无语音。
 
 ## 本地 API 与 Smart Wrapper
 
