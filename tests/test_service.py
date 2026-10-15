@@ -24,7 +24,7 @@ from zh_asr.service import (
     detect_gpu_processes,
 )
 from zh_asr.audio_outcome import build_objective_result, write_objective_result
-from zh_asr.service import _objective_from_job_outputs
+from zh_asr.service import _collect_outputs, _objective_from_job_outputs
 from zh_asr.strict_writer import write_strict_bundle
 
 
@@ -147,6 +147,37 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual(("no_speech_detected", "completed"), valid)
         self.assertEqual(("indeterminate", "failed"), tampered)
+
+    def test_service_strict_objective_binds_collected_raw_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "sample.wav"
+            with wave.open(str(audio), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(16000)
+                handle.writeframes(b"\0\0" * 1600)
+            write_strict_bundle(
+                audio_path=audio,
+                primary_engine="qwen3-asr-1.7b",
+                primary_result=[{"text": "正文"}],
+                secondary_engine="sensevoice",
+                secondary_result=[{"text": "正文"}],
+                out_dir=root,
+            )
+            outputs = _collect_outputs(
+                root, "strict", None, "qwen3-asr-1.7b", "sensevoice"
+            )
+            self.assertEqual(
+                ("speech_transcribed", "completed"),
+                _objective_from_job_outputs(outputs, "strict"),
+            )
+            Path(outputs["secondary_raw_json"]).write_text("[]", encoding="utf-8")
+            self.assertEqual(
+                ("indeterminate", "failed"),
+                _objective_from_job_outputs(outputs, "strict"),
+            )
+
     def test_stop_cancels_queued_and_running_jobs_and_terminates_active_process(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

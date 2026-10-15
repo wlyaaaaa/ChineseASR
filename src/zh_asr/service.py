@@ -1429,7 +1429,7 @@ def _objective_from_job_outputs(
     if not isinstance(payload, dict):
         return "indeterminate", "failed"
     raw_refs = []
-    for key in ("raw_json", "primary_json", "secondary_json"):
+    for key in ("raw_json", "primary_raw_json", "secondary_raw_json"):
         value = outputs.get(key)
         if not value:
             continue
