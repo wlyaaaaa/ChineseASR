@@ -10,9 +10,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1')
-if ($Engine -ne 'fireredasr2-llm') {
-  Clear-ProxyEnv
-}
 
 function Get-Sha256Hex {
   param(
@@ -137,7 +134,7 @@ if ($Engine -eq 'qwen3-asr-1.7b') {
     if ($ReceiptOnly) {
       throw "Existing Qwen cache not found for receipt-only migration: $QwenDir"
     }
-    & $Python -c "import os; from modelscope import snapshot_download; snapshot_download('Qwen/Qwen3-ASR-1.7B', revision=os.environ['ZH_ASR_QWEN_REVISION'], local_dir=os.environ['ZH_ASR_QWEN_DIR'], max_workers=8)"
+    Invoke-NoProxyCommand -FilePath $Python -ArgumentList @('-c', "import os; from modelscope import snapshot_download; snapshot_download('Qwen/Qwen3-ASR-1.7B', revision=os.environ['ZH_ASR_QWEN_REVISION'], local_dir=os.environ['ZH_ASR_QWEN_DIR'], max_workers=8)")
     if ($LASTEXITCODE -ne 0) {
       throw "ModelScope prefetch failed for Qwen/Qwen3-ASR-1.7B@$QwenRevision."
     }
@@ -150,7 +147,7 @@ if ($Engine -eq 'qwen3-asr-1.7b') {
     '--repository', 'Qwen/Qwen3-ASR-1.7B',
     '--revision', $QwenRevision
   )
-  & $Python @ReceiptArgs
+  Invoke-NoProxyCommand -FilePath $Python -ArgumentList $ReceiptArgs
   if ($LASTEXITCODE -ne 0) {
     throw "Qwen pinned model receipt verification failed for $QwenDir."
   }
@@ -165,7 +162,7 @@ $Args = @('-m', 'zh_asr', 'warmup', '--device', $Device, '--cache-dir', $CacheDi
 if (-not [string]::IsNullOrWhiteSpace($Engine)) {
   $Args += @('--engine', $Engine)
 }
-& $Python @Args
+Invoke-NoProxyCommand -FilePath $Python -ArgumentList $Args
 if ($LASTEXITCODE -ne 0) {
   throw "Warmup failed for engine '$Engine'."
 }
