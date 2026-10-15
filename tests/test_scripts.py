@@ -18,14 +18,17 @@ class ScriptTests(unittest.TestCase):
             root = Path(directory)
             shutil.copy2(PROJECT_ROOT / "scripts" / "Invoke-NoProxy.ps1", root)
             (root / "child.ps1").write_text("""
-param([int]$Code, [string]$NoProxy)
+param([int]$Code, [string]$NoProxy, [switch]$ReadInput)
 foreach ($name in 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy') {
   if (Test-Path -LiteralPath "Env:$name") { throw 'Proxy inherited' }
 }
 foreach ($name in 'NO_PROXY', 'no_proxy') {
   if ([Environment]::GetEnvironmentVariable($name, 'Process') -cne $NoProxy) { throw 'Direct bypass changed' }
 }
-[Console]::WriteLine('fixture-output')
+if ($ReadInput) {
+  [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+  [Console]::In.ReadToEnd() | ConvertTo-Json -Compress
+} else { [Console]::WriteLine('fixture-output') }
 exit $Code
 """, encoding="utf-8-sig")
             harness = root / "run.ps1"
@@ -39,18 +42,21 @@ foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key, "fixture-$
 Remove-Item -LiteralPath Env:ALL_PROXY
 [Environment]::SetEnvironmentVariable('HTTPS_PROXY', '', 'Process')
 $before = @($keys | ForEach-Object { [pscustomobject]@{ name = $_; value = [Environment]::GetEnvironmentVariable($_, 'Process'); present = Test-Path -LiteralPath "Env:$_" } })
-$rows = foreach ($code in '0', '7', 'missing') {
+$rows = foreach ($code in '0', '7', 'missing', 'stdin', 'empty') {
   $output = @()
   $caught = $false
   try {
     if ($code -eq 'missing') { Invoke-NoProxyCommand -FilePath 'fixture-missing-command-7893' }
-    else { $output = @(Invoke-NoProxyCommand -FilePath $pwsh -ArgumentList @('-NoProfile', '-File', $child, '-Code', $code, '-NoProxy', $script:NoProxyValue)) }
+    elseif ($code -in 'stdin', 'empty') {
+      $text = if ($code -eq 'empty') { '' } else { "中文 Ω`nsecond" }
+      $output = @(Invoke-NoProxyCommand -FilePath $pwsh -ArgumentList @('-NoProfile', '-File', $child, '-Code', 7, '-NoProxy', $script:NoProxyValue, '-ReadInput') -InputText $text)
+    } else { $output = @(Invoke-NoProxyCommand -FilePath $pwsh -ArgumentList @('-NoProfile', '-File', $child, '-Code', $code, '-NoProxy', $script:NoProxyValue)) }
   } catch { $caught = $true }
   $after = @($keys | ForEach-Object { [pscustomobject]@{ name = $_; value = [Environment]::GetEnvironmentVariable($_, 'Process'); present = Test-Path -LiteralPath "Env:$_" } })
   [pscustomobject]@{ case = $code; output = $output; exit = $LASTEXITCODE; caught = $caught; after = $after }
 }
 $cliOutput = @(& $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1') $pwsh -NoProfile -File $child -Code 7 -NoProxy $script:NoProxyValue)
-[pscustomobject]@{ before = $before; rows = @($rows); cliExit = $LASTEXITCODE; cliOutput = $cliOutput } | ConvertTo-Json -Depth 5 -Compress
+[pscustomobject]@{ before = $before; rows = @($rows); cliExit = $LASTEXITCODE; cliOutput = $cliOutput; newline = [Environment]::NewLine } | ConvertTo-Json -Depth 5 -Compress
 """, encoding="utf-8-sig")
             result = subprocess.run([pwsh, "-NoProfile", "-File", str(harness)],
                                     capture_output=True, text=True, encoding="utf-8", timeout=30)
@@ -63,11 +69,75 @@ $cliOutput = @(& $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-NoProxy
                 with self.subTest(case=row["case"]):
                     self.assertEqual(row["after"], data["before"])
                     self.assertEqual(row["caught"], row["case"] == "missing")
+                    if row["case"] in ("stdin", "empty"):
+                        self.assertEqual(len(row["output"]), 1)
+                        self.assertEqual(json.loads(row["output"][0]), ("中文 Ω\nsecond" if row["case"] == "stdin" else "") + data["newline"])
+                        self.assertEqual(row["exit"], 7)
+                        continue
                     self.assertEqual(row["output"], [] if row["caught"] else ["fixture-output"])
                     if not row["caught"]:
                         self.assertEqual(row["exit"], int(row["case"]))
             self.assertEqual(data["cliExit"], 7)
             self.assertEqual(data["cliOutput"], ["fixture-output"])
+
+    def test_setup_firered_restores_environment_and_passes_bash_stdin(self):
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("PowerShell is required for FireRed setup testing")
+        with tempfile.TemporaryDirectory(prefix="firered-setup-") as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            for name in ("setup-firered.ps1", "Invoke-NoProxy.ps1"):
+                shutil.copy2(PROJECT_ROOT / "scripts" / name, root / "scripts" / name)
+            (root / "requirements-firered.txt").touch()
+            runner = root / "run.ps1"
+            runner.write_text("""
+param([string]$Codes, [string]$OutFile)
+$ErrorActionPreference = 'Stop'
+$keys = 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy','NO_PROXY','no_proxy'
+foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key, "fixture-$key", 'Process') }
+Remove-Item -LiteralPath Env:ALL_PROXY
+[Environment]::SetEnvironmentVariable('HTTPS_PROXY', '', 'Process')
+function Snapshot { @($keys | ForEach-Object { [pscustomobject]@{ name=$_; present=Test-Path -LiteralPath "Env:$_"; value=[Environment]::GetEnvironmentVariable($_,'Process') } }) }
+$before = Snapshot
+$global:FixtureCalls = [System.Collections.Generic.List[object]]::new()
+$global:FixturePlan = @($Codes -split ',' | ForEach-Object { [int]$_ })
+function global:wsl.exe {
+  $text = @($input) -join "`n"
+  $global:FixtureCalls.Add([pscustomobject]@{ args=@($args); stdin=$text; env=@(Snapshot) })
+  $global:LASTEXITCODE = $global:FixturePlan[$global:FixtureCalls.Count - 1]
+  if ($global:FixtureCalls.Count -eq 1) { 'firered-wsl-ok' }
+  elseif ($global:FixtureCalls.Count -eq 3) { '/home/fixture' }
+}
+$caught = ''
+try { . (Join-Path $PSScriptRoot 'scripts\\setup-firered.ps1') -Distro 'Fixture Ubuntu' -InstallRoot '~/fixture' } catch { $caught = $_.Exception.Message }
+[pscustomobject]@{ before=$before; after=@(Snapshot); calls=@($global:FixtureCalls.ToArray()); caught=$caught; bash=$Bash; noProxy=$script:NoProxyValue } | ConvertTo-Json -Depth 7 -Compress | Set-Content -LiteralPath $OutFile -Encoding utf8
+""", encoding="utf-8-sig")
+            for plan, count, error in (((7, 0, 0), 1, "failed to start"), ((0, 7, 0), 2, "exit code 7"), ((0, 0, 0), 3, "")):
+                with self.subTest(plan=plan):
+                    log = root / "result.json"
+                    result = subprocess.run([pwsh, "-NoProfile", "-File", str(runner), "-Codes", ",".join(map(str, plan)), "-OutFile", str(log)],
+                                            capture_output=True, text=True, encoding="utf-8", timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    data = json.loads(log.read_text(encoding="utf-8-sig"))
+                    self.assertEqual(data["after"], data["before"])
+                    self.assertEqual(len(data["before"]), 8)
+                    self.assertTrue(any(not entry["present"] for entry in data["before"]))
+                    self.assertTrue(any(entry["present"] and entry["value"] == "" for entry in data["before"]))
+                    self.assertEqual(len(data["calls"]), count)
+                    self.assertIn(error, data["caught"])
+                    if not error:
+                        self.assertEqual(data["caught"], "")
+                        self.assertIn("'/home/fixture/fixture/.venv/bin/python'", result.stdout)
+                    expected = [["-d", "Fixture Ubuntu", "--", "sh", "-lc", "printf firered-wsl-ok"],
+                                ["-d", "Fixture Ubuntu", "--", "bash", "-s", "--"],
+                                ["-d", "Fixture Ubuntu", "--", "sh", "-lc", 'printf %s "$HOME"']]
+                    for index, call in enumerate(data["calls"]):
+                        self.assertEqual(call["args"], expected[index])
+                        self.assertEqual(call["stdin"], data["bash"] if index == 1 else "")
+                        for entry in call["env"]:
+                            self.assertEqual(entry["value"], data["noProxy"] if entry["name"] in ("NO_PROXY", "no_proxy") else None)
+                            self.assertEqual(entry["present"], entry["name"] in ("NO_PROXY", "no_proxy"))
 
     def test_windows_setup_stops_on_failure_and_restores_proxy_environment(self):
         pwsh = shutil.which("pwsh")

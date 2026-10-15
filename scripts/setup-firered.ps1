@@ -13,7 +13,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1')
-Clear-ProxyEnv
 
 function Quote-BashLiteral {
   param([Parameter(Mandatory = $true)][string]$Value)
@@ -45,7 +44,7 @@ if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
   throw 'wsl.exe is not available. Install WSL2 and an Ubuntu distribution first.'
 }
 
-$ProbeOutput = & wsl.exe -d $Distro -- sh -lc 'printf firered-wsl-ok'
+$ProbeOutput = Invoke-NoProxyCommand -FilePath wsl.exe -ArgumentList @('-d', $Distro, '--', 'sh', '-lc', 'printf firered-wsl-ok')
 if ($LASTEXITCODE -ne 0 -or (($ProbeOutput -join '').Trim() -ne 'firered-wsl-ok')) {
   throw "WSL distribution '$Distro' is unavailable or failed to start."
 }
@@ -156,14 +155,14 @@ printf 'source_commit=%s\n' "`$ACTUAL_SOURCE_COMMIT"
 echo "model_downloaded=false"
 "@
 
-$Bash | & wsl.exe -d $Distro -- bash -s --
+Invoke-NoProxyCommand -FilePath wsl.exe -ArgumentList @('-d', $Distro, '--', 'bash', '-s', '--') -InputText $Bash
 if ($LASTEXITCODE -ne 0) {
   throw "FireRed isolated runtime setup failed with exit code $LASTEXITCODE."
 }
 
 $NormalizedRoot = $InstallRoot
 if ($NormalizedRoot.StartsWith('~/')) {
-  $WslHome = (& wsl.exe -d $Distro -- sh -lc 'printf %s "$HOME"' | Out-String).Trim()
+  $WslHome = (Invoke-NoProxyCommand -FilePath wsl.exe -ArgumentList @('-d', $Distro, '--', 'sh', '-lc', 'printf %s "$HOME"') | Out-String).Trim()
   $NormalizedRoot = $WslHome.TrimEnd('/') + '/' + $NormalizedRoot.Substring(2)
 }
 $PythonWsl = $NormalizedRoot.TrimEnd('/') + '/.venv/bin/python'

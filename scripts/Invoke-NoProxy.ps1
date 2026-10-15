@@ -22,7 +22,9 @@ function Invoke-NoProxyCommand {
     [Parameter(Mandatory = $true)]
     [string]$FilePath,
 
-    [string[]]$ArgumentList = @()
+    [string[]]$ArgumentList = @(),
+
+    [AllowEmptyString()][string]$InputText
   )
 
   $PreviousProxyEnvironment = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
@@ -31,7 +33,11 @@ function Invoke-NoProxyCommand {
   }
   try {
     Clear-ProxyEnv
-    & $FilePath @ArgumentList
+    if ($PSBoundParameters.ContainsKey('InputText')) {
+      $InputText | & $FilePath @ArgumentList
+    } else {
+      & $FilePath @ArgumentList
+    }
   } finally {
     foreach ($entry in $PreviousProxyEnvironment.GetEnumerator()) {
       if ($null -eq $entry.Value) {
