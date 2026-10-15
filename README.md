@@ -144,6 +144,8 @@ cd <repo-root>
 .\scripts\transcribe-folder.ps1 -InputDir C:\path\to\audio-folder -Profile high_quality
 ```
 
+批量输出通常沿用原目录名；仅重名冲突项使用独立结果目录，可从 `summary.md` 定位，移走冲突同伴后仍复用该目录续跑。
+
 ### 已有转写的哈希回读
 
 需要让媒体检索复用已经存在的转写和时间段时，可以按原音频 SHA-256 只读回读 owner（归属方）管理的本地任务快照和已保留云结果：

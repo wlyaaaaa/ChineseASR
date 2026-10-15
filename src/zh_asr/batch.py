@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -23,6 +25,7 @@ from .result_writer import canonical_json_sha256, file_sha256
 
 
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac"}
+_BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 BATCH_ITEM_STATE_SCHEMA = "zh_asr.batch_item.v1"
 BATCH_ITEM_STATE_FILENAME = "batch-item.json"
 _STRICT_CACHE_OUTPUTS = (
@@ -109,10 +112,20 @@ def run_batch(
         failed_path.touch()
 
     audio_files = find_audio_files(input_root)
+    legacy_names = {audio: _output_dir_name(input_root, audio) for audio in audio_files}
+    name_counts = Counter(name.casefold() for name in legacy_names.values())
     items_by_audio: dict[Path, BatchItem] = {}
     pending: list[tuple[Path, Path, dict[str, Any]]] = []
     for audio_path in audio_files:
-        item_dir = output_root / _output_dir_name(input_root, audio_path)
+        legacy_name = legacy_names[audio_path]
+        source_hash = hashlib.sha256(
+            audio_path.relative_to(input_root).as_posix().encode("utf-8")
+        ).hexdigest()
+        source_dir = output_root / (".source-" + source_hash)
+        item_dir = (
+            source_dir if name_counts[legacy_name.casefold()] > 1 or source_dir.is_dir()
+            else output_root / legacy_name
+        )
         identity = _batch_item_identity(
             audio_path,
             mode=mode_key,
@@ -586,7 +599,7 @@ def _append_failure(path: Path, audio_path: Path, out_dir: Path, exc: Exception)
         "out_dir": str(out_dir),
         "error_type": type(exc).__name__,
         "error": str(exc),
-        "time": datetime.now().isoformat(timespec="seconds"),
+        "time": datetime.now(_BEIJING_TIMEZONE).isoformat(timespec="seconds"),
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -603,7 +616,7 @@ def _write_summary(path: Path, summary: BatchSummary) -> None:
         f"- Processed: {summary.processed}",
         f"- Skipped: {summary.skipped}",
         f"- Failed: {summary.failed}",
-        f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`",
+        f"- Generated: `{datetime.now(_BEIJING_TIMEZONE).isoformat(timespec='seconds')}`",
         "",
         "## Files",
         "",

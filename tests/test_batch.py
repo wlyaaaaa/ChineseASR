@@ -122,6 +122,62 @@ class BatchTests(unittest.TestCase):
         self.assertEqual((1, 0, 0), (second.processed, second.skipped, second.failed))
         self.assertEqual([b"first", b"second"], calls)
 
+    def test_run_batch_keeps_colliding_sources_separate_and_resumable(self):
+        from zh_asr.batch import run_batch
+
+        calls = []
+
+        def fake_strict(audio_path, *, primary_engine, secondary_engine, out_dir, **_kwargs):
+            calls.append(audio_path)
+            text = audio_path.read_text(encoding="utf-8")
+            return write_strict_bundle(
+                audio_path=audio_path,
+                primary_engine=primary_engine,
+                primary_result={"engine": primary_engine, "text": text, "error": None},
+                secondary_engine=secondary_engine,
+                secondary_result={"engine": secondary_engine, "text": text, "error": None},
+                out_dir=out_dir,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir, output_dir = root / "input", root / "output"
+            names = ("recording.wav", "recording.mp3", "recording[1].wav",
+                     "recording(1).wav", "group/recording.wav", "group__recording.wav",
+                     "Case.wav", "case.mp3")
+            for index, name in enumerate(names):
+                audio = input_dir / name
+                audio.parent.mkdir(parents=True, exist_ok=True)
+                audio.write_text(f"source transcript {index}", encoding="utf-8")
+            first = run_batch(input_dir, output_dir, mode="strict", strict_fn=fake_strict)
+            snapshots = []
+            for item in first.items:
+                state = json.loads((item.out_dir / "batch-item.json").read_text(encoding="utf-8"))
+                final = Path(state["outputs"]["final"]["path"]).read_text(encoding="utf-8")
+                snapshots.append((str(item.audio), str(item.out_dir), state["identity"]["audio_path"], final))
+            self.assertEqual(len(names), len({item.out_dir for item in first.items}), repr(snapshots))
+            self.assertEqual((len(names), 0, 0), (first.processed, first.skipped, first.failed))
+            for audio, _out_dir, saved_audio, final in snapshots:
+                self.assertEqual(str(Path(audio).resolve()), saved_audio)
+                self.assertIn(Path(audio).read_text(encoding="utf-8"), final)
+            calls.clear()
+            second = run_batch(input_dir, output_dir, mode="strict", strict_fn=fake_strict)
+            self.assertEqual((0, len(names), 0), (second.processed, second.skipped, second.failed))
+            self.assertEqual([], calls)
+            for name in names[1::2]:
+                (input_dir / name).rename(root / (name.replace("/", "__") + ".removed"))
+            third = run_batch(input_dir, output_dir, mode="strict", strict_fn=fake_strict)
+            self.assertEqual((0, len(names) // 2, 0), (third.processed, third.skipped, third.failed))
+            self.assertEqual([], calls)
+            self.assertEqual(
+                {item.audio: item.out_dir for item in first.items if item.audio.exists()},
+                {item.audio: item.out_dir for item in third.items},
+            )
+            for _audio, out_dir, saved_audio, final in snapshots:
+                state = json.loads((Path(out_dir) / "batch-item.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved_audio, state["identity"]["audio_path"])
+                self.assertEqual(final, Path(state["outputs"]["final"]["path"]).read_text(encoding="utf-8"))
+
     def test_run_batch_reprocesses_when_model_config_changes(self):
         from zh_asr.batch import run_batch
         from zh_asr.config import load_model_config
