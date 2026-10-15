@@ -11,6 +11,7 @@ from .audio_outcome import (
     classify_objective_outcome,
     file_sha256 as objective_file_sha256,
     load_objective_result,
+    raw_error_text as _raw_error_text,
     validate_objective_result,
 )
 from .result_writer import (
@@ -1160,21 +1161,6 @@ def _read_json_artifact(
         return None, _artifact_failure(
             f"{label} is unreadable: {type(exc).__name__}: {exc}"
         )
-
-
-def _raw_error_text(raw: Any) -> str | None:
-    if not isinstance(raw, dict):
-        return None
-    error = raw.get("error")
-    if error is None or error == "":
-        return None
-    if isinstance(error, dict):
-        error_type = str(error.get("type") or "").strip()
-        message = str(error.get("message") or "").strip()
-        if error_type and message:
-            return f"{error_type}: {message}"
-        return error_type or message or None
-    return str(error)
 
 
 def _normalize_error(value: str) -> str:

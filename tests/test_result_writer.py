@@ -29,6 +29,54 @@ class ResultWriterTests(unittest.TestCase):
             self.assertEqual(paths["evidence_status"], "not_applicable")
             self.assertEqual(json.loads(paths["json"].read_text(encoding="utf-8")), result)
 
+    def test_write_transcript_bundle_preserves_raw_engine_failures(self):
+        import wave
+
+        from zh_asr.audit import _raw_error_text
+        from zh_asr.audio_outcome import raw_error_text, validate_objective_result
+        from zh_asr.result_writer import write_transcript_bundle
+
+        self.assertIs(_raw_error_text, raw_error_text)
+        error = {"type": "RuntimeError", "message": "synthetic inference failed"}
+        cases = (
+            ("nonzero_error", 1200, "", error, "failed", "indeterminate", "unknown"),
+            ("fallback_text", 1200, "回退文本", error, "failed", "speech_transcribed", "low_confidence"),
+            ("zero_error", 0, "", error, "failed", "indeterminate", "unknown"),
+            ("zero_none", 0, "", None, "completed", "no_speech_detected", "sufficient"),
+            ("zero_empty", 0, "", "", "completed", "no_speech_detected", "sufficient"),
+            ("nonzero_none", 1200, "", None, "completed", "indeterminate", "unknown"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, sample, text, raw_error, execution, outcome, quality in cases:
+                with self.subTest(case=name):
+                    audio = root / f"{name}.wav"
+                    with wave.open(str(audio), "wb") as handle:
+                        handle.setnchannels(1)
+                        handle.setsampwidth(2)
+                        handle.setframerate(16000)
+                        handle.writeframes(sample.to_bytes(2, "little", signed=True) * 160)
+                    raw = {"text": text, "error": raw_error}
+                    original = json.loads(json.dumps(raw))
+                    paths = write_transcript_bundle(audio, raw, root / name, "sensevoice")
+                    payload = json.loads(paths["objective_result"].read_text(encoding="utf-8"))
+                    self.assertEqual(payload["execution"]["status"], execution)
+                    self.assertEqual(payload["objective_outcome"], outcome)
+                    self.assertEqual(payload["quality"]["status"], quality)
+                    self.assertEqual(validate_objective_result(payload), [])
+                    self.assertEqual(json.loads(paths["json"].read_text(encoding="utf-8")), original)
+                    self.assertEqual(raw, original)
+                    if raw_error:
+                        self.assertEqual(payload["failure"]["class"], "engine_failure")
+                    else:
+                        self.assertIsNone(payload["failure"])
+                    if outcome == "no_speech_detected":
+                        self.assertIsNotNone(payload["negative_evidence"])
+                    else:
+                        self.assertIsNone(payload["negative_evidence"])
+                    if text:
+                        self.assertIn(text, paths["markdown"].read_text(encoding="utf-8"))
+
     def test_write_transcript_bundle_handles_sentence_info_segments(self):
         from zh_asr.result_writer import extract_text
 

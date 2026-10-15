@@ -202,6 +202,21 @@ def analyze_audio(
     return result
 
 
+def raw_error_text(raw: Any) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    error = raw.get("error")
+    if error is None or error == "":
+        return None
+    if isinstance(error, dict):
+        error_type = str(error.get("type") or "").strip()
+        message = str(error.get("message") or "").strip()
+        if error_type and message:
+            return f"{error_type}: {message}"
+        return error_type or message or None
+    return str(error)
+
+
 def classify_objective_outcome(
     *,
     primary_text: str,
@@ -214,6 +229,8 @@ def classify_objective_outcome(
 ) -> dict[str, Any]:
     """Classify result semantics without upgrading an empty transcript."""
 
+    primary_error = primary_error or raw_error_text(primary_result)
+    secondary_error = secondary_error or raw_error_text(secondary_result)
     errors = [error for error in (primary_error, secondary_error) if error]
     texts = [str(primary_text or "").strip(), str(secondary_text or "").strip()]
     detection = _merge_detection_hints(primary_result, secondary_result)
