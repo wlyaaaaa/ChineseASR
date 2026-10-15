@@ -595,7 +595,10 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
 def _output_dir_name(input_dir: Path, audio_path: Path) -> str:
     relative = audio_path.relative_to(input_dir).with_suffix("")
     raw = "__".join(relative.parts)
-    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", raw).strip("._") or audio_path.stem
+    return (
+        re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", raw).strip("._")
+        or audio_path.stem.rstrip(" .") or "audio"
+    )
 
 
 def _append_failure(path: Path, audio_path: Path, out_dir: Path, exc: Exception) -> None:

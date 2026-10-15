@@ -144,7 +144,7 @@ class BatchTests(unittest.TestCase):
             input_dir, output_dir = root / "input", root / "output"
             names = ("recording.wav", "recording.mp3", "recording[1].wav",
                      "recording(1).wav", "group/recording.wav", "group__recording.wav",
-                     "Case.wav", "case.mp3")
+                     "Case.wav", "case.mp3", "...wav", "....wav", "_.wav", "_..wav")
             for index, name in enumerate(names):
                 audio = input_dir / name
                 audio.parent.mkdir(parents=True, exist_ok=True)
@@ -152,6 +152,7 @@ class BatchTests(unittest.TestCase):
             first = run_batch(input_dir, output_dir, mode="strict", strict_fn=fake_strict)
             snapshots = []
             for item in first.items:
+                self.assertTrue(item.out_dir.resolve().is_relative_to(output_dir.resolve()), str(item))
                 state = json.loads((item.out_dir / "batch-item.json").read_text(encoding="utf-8"))
                 final = Path(state["outputs"]["final"]["path"]).read_text(encoding="utf-8")
                 snapshots.append((str(item.audio), str(item.out_dir), state["identity"]["audio_path"], final))
