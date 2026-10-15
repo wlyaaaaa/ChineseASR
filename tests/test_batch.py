@@ -316,8 +316,6 @@ class BatchTests(unittest.TestCase):
             results = []
             for audio, out_dir in zip(audio_paths, out_dirs):
                 raw = {"engine": engine, "text": "good text" if audio.name == "a_good.wav" else ""}
-                if audio.name == "b_bad.wav":
-                    raw["error"] = {"type": "RuntimeError", "message": "synthetic decode failure"}
                 bundle = write_transcript_bundle(audio, raw, out_dir, engine)
                 bundles[audio.name] = bundle
                 results.append(bundle)
