@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -50,6 +51,31 @@ class AsrSmartCloudStatusTests(unittest.TestCase):
     def setUp(self):
         self.env = {name: os.environ[name] for name in os.environ if name.upper() not in {n.upper() for n in PROXY_NAMES}}
         self.env.update({name: "example.invalid" if name.upper() == "NO_PROXY" else "http://127.0.0.1:9" for name in PROXY_NAMES})
+
+    def test_start_process_preserves_state_directory_with_spaces(self):
+        command = r"""
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:ASR_ARGV_SCRIPT, [ref]$null, [ref]$null)
+$functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Assert-AsrPortBindable','Start-AsrApi') }, $true)
+foreach ($definition in $functions) { Invoke-Expression $definition.Extent.Text }
+$Root = $env:ASR_ARGV_ROOT; $StateDir = Join-Path $Root 'outputs\api'; $Python = $env:ASR_ARGV_PYTHON
+$HostName = '127.0.0.1'; $Port = 0; $StartupTimeoutSec = 4
+function Test-AsrApi { Test-Path -LiteralPath (Join-Path $Root 'argv.json') }
+Start-AsrApi
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / '中文 项目目录'
+            package = root / 'zh_asr'; package.mkdir(parents=True)
+            (package / '__init__.py').write_text('', encoding='utf-8')
+            (package / '__main__.py').write_text(
+                "import json, sys\nfrom pathlib import Path\nPath(__file__).resolve().parents[1].joinpath('argv.json').write_text(json.dumps(sys.argv), encoding='utf-8')\n", encoding='utf-8')
+            env = dict(self.env, PYTHONPATH=str(root), ASR_ARGV_ROOT=str(root), ASR_ARGV_PYTHON=sys.executable,
+                       ASR_ARGV_SCRIPT=str(ROOT / 'scripts/asr-smart.ps1'))
+            result = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-Command', command],
+                cwd=ROOT, env=env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
+            self.assertEqual(0, result.returncode, result.stderr)
+            argv = json.loads((root / 'argv.json').read_text(encoding='utf-8'))
+            self.assertEqual(['serve', '--host', '127.0.0.1', '--port', '0', '--state-dir', str(root / 'outputs/api')], argv[1:])
 
     def test_restores_proxy_environment_on_success_throw_and_exit(self):
         command = r"""

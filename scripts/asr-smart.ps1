@@ -98,7 +98,7 @@ function Start-AsrApi {
     'serve',
     '--host', $HostName,
     '--port', "$Port",
-    '--state-dir', $StateDir
+    '--state-dir', ('"{0}"' -f $StateDir)
   )
   Start-Process -FilePath $Python -ArgumentList $Args -WorkingDirectory $Root -WindowStyle Hidden | Out-Null
 
