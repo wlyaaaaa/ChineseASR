@@ -296,10 +296,74 @@ class BatchTests(unittest.TestCase):
 
             first = run_batch(input_dir, output_dir, mode="strict", strict_fn=fake_strict)
             second = run_batch(input_dir, output_dir, mode="strict", strict_fn=fake_strict)
+            self.assertIn("ok", (output_dir / "sample" / "sample.strict.md").read_text(encoding="utf-8"))
 
-        self.assertEqual((1, 0), (first.processed, first.skipped))
-        self.assertEqual((1, 0), (second.processed, second.skipped))
+        self.assertEqual((0, 0, 1), (first.processed, first.skipped, first.failed))
+        self.assertEqual((0, 0, 1), (second.processed, second.skipped, second.failed))
         self.assertEqual(2, len(calls))
+
+    def test_run_batch_retries_failed_quick_artifacts_without_losing_adjacent_results(self):
+        import wave
+        from zh_asr.audio_outcome import load_objective_result, validate_objective_result
+        from zh_asr.batch import _batch_item_identity, _write_batch_item_state, run_batch
+        from zh_asr.config import load_model_config
+        from zh_asr.result_writer import write_transcript_bundle
+
+        calls, bundles = [], {}
+
+        def fake_many(audio_paths, *, out_dirs, engine, **_kwargs):
+            calls.append([audio.name for audio in audio_paths])
+            results = []
+            for audio, out_dir in zip(audio_paths, out_dirs):
+                raw = {"engine": engine, "text": "good text" if audio.name == "a_good.wav" else ""}
+                if audio.name == "b_bad.wav":
+                    raw["error"] = {"type": "RuntimeError", "message": "synthetic decode failure"}
+                bundle = write_transcript_bundle(audio, raw, out_dir, engine)
+                bundles[audio.name] = bundle
+                results.append(bundle)
+            return results
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir, output_dir = root / "input", root / "output"
+            input_dir.mkdir()
+            names = ["a_good.wav", "b_bad.wav", "c_uncertain.wav"]
+            for name in (names[0], names[2]):
+                with wave.open(str(input_dir / name), "wb") as audio:
+                    audio.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                    audio.writeframes(b"\x01\x00" * 160)
+            bad_audio = input_dir / names[1]
+            bad_audio.write_bytes(b"synthetic corrupt audio")
+            config = load_model_config()
+            first = run_batch(input_dir, output_dir, mode="quick", engine="sensevoice",
+                              config=config, transcribe_many_fn=fake_many)
+            self.assertEqual((2, 0, 1), (first.processed, first.skipped, first.failed))
+            self.assertEqual(["processed", "failed", "processed"], [item.status for item in first.items])
+            failed_objective = load_objective_result(bundles[names[1]]["objective_result"])
+            self.assertEqual([], validate_objective_result(failed_objective))
+            self.assertEqual("corrupt", failed_objective["execution"]["status"])
+            uncertain = load_objective_result(bundles[names[2]]["objective_result"])
+            self.assertEqual(("completed", "indeterminate"),
+                             (uncertain["execution"]["status"], uncertain["objective_outcome"]))
+            preserved = {path: path.read_bytes() for name in (names[0], names[2])
+                         for path in bundles[name].values() if isinstance(path, Path)}
+            # Recreate the old version's valid, hash-bound failed-item cache.
+            identity = _batch_item_identity(
+                bad_audio.resolve(), mode="quick", quick_engine="sensevoice",
+                strict_primary=config.strict_primary_engine,
+                strict_secondary=config.strict_secondary_engine, config=config,
+                device="cuda:0", cache_dir=None, caller_binding=None,
+            )
+            _write_batch_item_state(output_dir / "b_bad", identity, bundles[names[1]],
+                                    failed_objective["objective_outcome"])
+            second = run_batch(input_dir, output_dir, mode="quick", engine="sensevoice",
+                               config=config, transcribe_many_fn=fake_many)
+            self.assertEqual((0, 2, 1), (second.processed, second.skipped, second.failed))
+            self.assertEqual([names, [names[1]]], calls)
+            self.assertEqual(preserved, {path: path.read_bytes() for path in preserved})
+            self.assertTrue(all(path.is_file() for path in bundles[names[1]].values() if isinstance(path, Path)))
+            failures = [json.loads(line) for line in (output_dir / "failed.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([str(bad_audio.resolve())] * 2, [item["audio"] for item in failures])
 
     def test_run_batch_keeps_previous_failure_receipts(self):
         from zh_asr.batch import run_batch

@@ -234,28 +234,35 @@ def run_batch(
                     f"Batch transcription returned {len(outputs_many)} results for {len(pending)} inputs."
                 )
             for (audio_path, item_dir, identity), outputs in zip(pending, outputs_many, strict=True):
-                if mode_key == "strict" and model_config.quality and isinstance(outputs, dict) and outputs.get("audit_json"):
-                    from .quality_review import enhance_single
-                    from .pipeline import default_cache_dir
-                    enhance_single(audio_path, outputs, config=model_config, device=device,
-                        cache_dir=cache_dir or default_cache_dir(), output_dir=item_dir)
-                objective_outcome = _result_objective_outcome(
-                    outputs,
-                    item_dir,
-                    audio_path,
-                )
-                _write_batch_item_state(
-                    item_dir,
-                    identity,
-                    outputs,
-                    objective_outcome,
-                )
-                items_by_audio[audio_path] = BatchItem(
-                    audio=audio_path,
-                    out_dir=item_dir,
-                    status="processed",
-                    objective_outcome=objective_outcome,
-                )
+                try:
+                    if mode_key == "strict" and model_config.quality and isinstance(outputs, dict) and outputs.get("audit_json"):
+                        from .quality_review import enhance_single
+                        from .pipeline import default_cache_dir
+                        enhance_single(audio_path, outputs, config=model_config, device=device,
+                            cache_dir=cache_dir or default_cache_dir(), output_dir=item_dir)
+                    objective_outcome = _result_objective_outcome(
+                        outputs,
+                        item_dir,
+                        audio_path,
+                    )
+                    _write_batch_item_state(
+                        item_dir,
+                        identity,
+                        outputs,
+                        objective_outcome,
+                    )
+                    items_by_audio[audio_path] = BatchItem(
+                        audio=audio_path,
+                        out_dir=item_dir,
+                        status="processed",
+                        objective_outcome=objective_outcome,
+                    )
+                except Exception as exc:
+                    items_by_audio[audio_path] = BatchItem(
+                        audio=audio_path, out_dir=item_dir, status="failed",
+                        message=str(exc), objective_outcome="indeterminate",
+                    )
+                    _append_failure(failed_path, audio_path, item_dir, exc)
         except Exception as exc:
             for audio_path, item_dir, _ in pending:
                 if audio_path in items_by_audio and items_by_audio[audio_path].status == "processed":
@@ -474,6 +481,8 @@ def _cached_item_objective_outcome(
     objective = load_objective_result(objective_path)
     if validate_objective_result(objective):
         return None
+    if mode == "quick" and objective["execution"]["status"] != "completed":
+        return None
     audio = objective.get("audio") if isinstance(objective, dict) else None
     if (
         not isinstance(audio, Mapping)
@@ -652,6 +661,14 @@ def _read_objective_outcome(item_dir: Path, audio_path: Path) -> str:
 
 def _result_objective_outcome(outputs: object, item_dir: Path, audio_path: Path) -> str:
     if isinstance(outputs, dict):
+        objective = load_objective_result(outputs.get("objective_result"))
+        if objective is not None and not validate_objective_result(objective):
+            execution_status = objective["execution"]["status"]
+            if execution_status in {"failed", "unsupported", "corrupt"}:
+                raise RuntimeError(
+                    f"Batch transcription execution {execution_status}: "
+                    f"{objective.get('reason') or 'see objective result sidecar'}"
+                )
         direct = outputs.get("objective_outcome") or outputs.get("audio_result_status")
         if direct:
             return str(direct)
