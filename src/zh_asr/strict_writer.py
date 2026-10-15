@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -16,6 +15,7 @@ from .audit import (
     validate_strict_artifact_bundle,
 )
 from .result_writer import (
+    beijing_timestamp,
     canonical_json_sha256,
     extract_segments,
     extract_text,
@@ -230,7 +230,7 @@ def _format_final_markdown(
             f"- Objective outcome: `{report.objective_outcome}`",
             f"- Objective result: `{report.objective_result_reference or 'not_recorded'}`",
             f"- Bundle receipt: `{receipt_path.name}`",
-            f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`",
+            f"- Generated: `{beijing_timestamp()}`",
             "",
             "## Transcript",
             "",

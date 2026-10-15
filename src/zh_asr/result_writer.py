@@ -4,11 +4,15 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
 from .audio_outcome import build_objective_result, write_objective_result
+
+
+def beijing_timestamp() -> str:
+    return datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
 
 
 @dataclass(frozen=True)
@@ -118,7 +122,7 @@ def write_transcript_bundle(
             "- Evidence status: `not_applicable`",
             f"- Objective outcome: `{objective['objective_outcome']}`",
             f"- Objective result: `{objective_path.name}`",
-            f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`",
+            f"- Generated: `{beijing_timestamp()}`",
             "",
             "## Transcript",
             "",

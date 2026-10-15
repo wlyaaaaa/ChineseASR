@@ -7,7 +7,6 @@ import re
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -21,11 +20,10 @@ from .pipeline import (
     transcribe_audio,
     transcribe_audio_many,
 )
-from .result_writer import canonical_json_sha256, file_sha256
+from .result_writer import beijing_timestamp, canonical_json_sha256, file_sha256
 
 
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac"}
-_BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 BATCH_ITEM_STATE_SCHEMA = "zh_asr.batch_item.v1"
 BATCH_ITEM_STATE_FILENAME = "batch-item.json"
 _STRICT_CACHE_OUTPUTS = (
@@ -606,7 +604,7 @@ def _append_failure(path: Path, audio_path: Path, out_dir: Path, exc: Exception)
         "out_dir": str(out_dir),
         "error_type": type(exc).__name__,
         "error": str(exc),
-        "time": datetime.now(_BEIJING_TIMEZONE).isoformat(timespec="seconds"),
+        "time": beijing_timestamp(),
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -623,7 +621,7 @@ def _write_summary(path: Path, summary: BatchSummary) -> None:
         f"- Processed: {summary.processed}",
         f"- Skipped: {summary.skipped}",
         f"- Failed: {summary.failed}",
-        f"- Generated: `{datetime.now(_BEIJING_TIMEZONE).isoformat(timespec='seconds')}`",
+        f"- Generated: `{beijing_timestamp()}`",
         "",
         "## Files",
         "",

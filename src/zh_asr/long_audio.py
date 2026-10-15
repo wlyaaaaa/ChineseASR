@@ -24,6 +24,7 @@ from .audio_frontend import PreparedAudio, prepare_pcm16_mono
 from .config import load_model_config
 from .metadata import file_metadata, sha256_file
 from .pipeline import default_cache_dir, strict_transcribe_many
+from .result_writer import beijing_timestamp
 
 
 @dataclass(frozen=True)
@@ -1032,7 +1033,7 @@ def _write_merged_transcript(path: Path, audio_path: Path, states: list[ChunkSta
         f"# {audio_path.stem} Long Transcript",
         "",
         f"- Audio: `{audio_path}`",
-        f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`",
+        f"- Generated: `{beijing_timestamp()}`",
         "",
         "## Transcript",
         "",
