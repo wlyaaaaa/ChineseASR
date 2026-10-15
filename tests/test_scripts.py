@@ -69,18 +69,87 @@ $cliOutput = @(& $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-NoProxy
             self.assertEqual(data["cliExit"], 7)
             self.assertEqual(data["cliOutput"], ["fixture-output"])
 
+    def test_windows_setup_stops_on_failure_and_restores_proxy_environment(self):
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("PowerShell is required for setup behavior testing")
+        cases = (
+            ("setup-qwen.ps1", (7, 0, 0), 1, 1),
+            ("setup-qwen.ps1", (0, 0, 7), 3, 7),
+            ("setup-qwen.ps1", (0, 0, 0), 3, 0),
+            ("install-torch-cu128-direct.ps1", (0, 7, 0), 2, 1),
+            ("install-torch-cu128-direct.ps1", (0, 0, 7), 3, 7),
+            ("install-torch-cu128-direct.ps1", (0, 0, 0), 3, 0),
+            ("setup-core.ps1", (7, 0, 0, 0, 0, 0), 6, 0),
+        )
+        with tempfile.TemporaryDirectory(prefix="windows-setup-") as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            python = root / ".venv" / "Scripts" / "python.exe"
+            python.parent.mkdir(parents=True)
+            python.touch()
+            for name in {case[0] for case in cases} | {"Invoke-NoProxy.ps1"}:
+                shutil.copy2(PROJECT_ROOT / "scripts" / name, root / "scripts" / name)
+            runner = root / "runner.ps1"
+            runner.write_text("""
+param([string]$ScriptName, [string]$Codes, [string]$OutFile)
+$ErrorActionPreference = 'Stop'
+$keys = 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy','NO_PROXY','no_proxy'
+foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key, "fixture-$key", 'Process') }
+Remove-Item -LiteralPath Env:ALL_PROXY
+[Environment]::SetEnvironmentVariable('HTTPS_PROXY', '', 'Process')
+$before = @($keys | ForEach-Object { [pscustomobject]@{ name = $_; value = [Environment]::GetEnvironmentVariable($_,'Process'); present = Test-Path -LiteralPath "Env:$_" } })
+$global:FixtureCalls = [System.Collections.Generic.List[object]]::new()
+$global:FixturePlan = @($Codes -split ',' | ForEach-Object { [int]$_ })
+$python = Join-Path $PSScriptRoot '.venv\\Scripts\\python.exe'
+Set-Item -LiteralPath ('Function:global:' + $python) -Value { $global:FixtureCalls.Add(@($args)); $global:LASTEXITCODE = $global:FixturePlan[$global:FixtureCalls.Count - 1] }
+$code = 0
+try { & (Join-Path $PSScriptRoot "scripts\\$ScriptName"); $code = $LASTEXITCODE } catch { $code = 1 }
+$after = @($keys | ForEach-Object { [pscustomobject]@{ name = $_; value = [Environment]::GetEnvironmentVariable($_,'Process'); present = Test-Path -LiteralPath "Env:$_" } })
+[pscustomobject]@{ calls = @($global:FixtureCalls.ToArray()); before = $before; after = $after } | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath $OutFile -Encoding utf8
+exit $code
+""", encoding="utf-8-sig")
+            for index, (name, plan, count, code) in enumerate(cases):
+                with self.subTest(script=name, plan=plan):
+                    log = root / f"case-{index}.json"
+                    result = subprocess.run(
+                        [pwsh, "-NoProfile", "-File", str(runner), "-ScriptName", name,
+                         "-Codes", ",".join(map(str, plan)), "-OutFile", str(log)],
+                        capture_output=True, text=True, encoding="utf-8", timeout=30,
+                    )
+                    self.assertEqual(result.returncode, code, result.stderr)
+                    data = json.loads(log.read_text(encoding="utf-8-sig"))
+                    self.assertEqual(len(data["calls"]), count)
+                    self.assertEqual(data["after"], data["before"])
+                    self.assertEqual(len(data["before"]), 8)
+                    self.assertTrue(any(not item["present"] for item in data["before"]))
+                    self.assertTrue(any(item["present"] and item["value"] == "" for item in data["before"]))
+                    if name == "setup-core.ps1":
+                        upgrade = ["-m", "pip", "install", "--upgrade", "pip"]
+                        mirror = ["-i", "https://pypi.tuna.tsinghua.edu.cn/simple", "--trusted-host", "pypi.tuna.tsinghua.edu.cn"]
+                        self.assertEqual(data["calls"], [
+                            upgrade + mirror, upgrade + ["-i", "https://pypi.org/simple"],
+                            ["-m", "pip", "install", "-r", str(root / "requirements-core.txt")] + mirror,
+                            ["-m", "pip", "install", "-e", str(root), "--no-deps"],
+                            ["-m", "pip", "check"], ["-m", "zh_asr", "doctor"],
+                        ])
+                    else:
+                        prefixes = (["-m", "pip", "install", "-r"], ["-m", "pip", "install", "-e"], ["-m", "zh_asr", "doctor"]) if name == "setup-qwen.ps1" else (["-m", "pip", "install", "--upgrade"], ["-m", "pip", "install", "torch"], ["-c"])
+                        for call, prefix in zip(data["calls"], prefixes):
+                            self.assertEqual(call[:len(prefix)], prefix)
+
     def test_setup_core_falls_back_to_official_pypi_and_checks_environment(self):
         script = (PROJECT_ROOT / "scripts" / "setup-core.ps1").read_text(encoding="utf-8")
 
         self.assertIn("pypi.tuna.tsinghua.edu.cn", script)
         self.assertIn("https://pypi.org/simple", script)
-        self.assertIn("pip check", script)
+        self.assertIn("@('-m', 'pip', 'check')", script)
         self.assertIn("$LASTEXITCODE", script)
 
     def test_setup_qwen_uses_no_proxy_and_local_requirements_file(self):
         script = (PROJECT_ROOT / "scripts" / "setup-qwen.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("Clear-ProxyEnv", script)
+        self.assertIn("Invoke-NoProxyCommand", script)
         self.assertIn("requirements-qwen.txt", script)
         self.assertIn("pypi.tuna.tsinghua.edu.cn", script)
 
