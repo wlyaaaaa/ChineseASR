@@ -10,6 +10,9 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+HEALTH = {"status": "ok", "active_job_id": None, "active_job_status": None,
+          "queue_length": 0, "gpu_conflicts": [], "persistence": {
+              "status": "ready", "ready": True, "error": None, "failed_at": None}}
 
 
 class _Api(BaseHTTPRequestHandler):
@@ -17,17 +20,18 @@ class _Api(BaseHTTPRequestHandler):
         pass
 
     def _reply(self, payload):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        body = payload if isinstance(payload, bytes) else json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", "text/plain; charset=utf-8" if isinstance(payload, bytes) else "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
-        self._reply({"status": "ok"})
+        self._reply(getattr(self.server, "health_payload", HEALTH))
 
     def do_POST(self):
+        self.server.post_count = getattr(self.server, "post_count", 0) + 1
         count = int(self.headers["Content-Length"])
         self.server.submitted_payload = json.loads(self.rfile.read(count))
         self._reply({"deduplicated": False, "job": {
@@ -41,6 +45,29 @@ class _Api(BaseHTTPRequestHandler):
 
 
 class AsrSmartCloudStatusTests(unittest.TestCase):
+    def test_rejects_unrelated_health_without_posting_audio(self):
+        for health in ({"status": "ok"}, "ok", b"not json"):
+            with self.subTest(health=health), tempfile.TemporaryDirectory() as tmp:
+                audio = Path(tmp) / "fixture.wav"
+                audio.write_bytes(b"fixture")
+                server = ThreadingHTTPServer(("127.0.0.1", 0), _Api)
+                server.health_payload = health
+                server.post_count = 0
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive",
+                        "-File", str(ROOT / "scripts" / "asr-smart.ps1"), "-Audio", str(audio),
+                        "-Port", str(server.server_port), "-WaitSec", "0", "-Json"], cwd=ROOT,
+                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("该端口响应不符合 ChineseASR 接口", result.stderr)
+                self.assertEqual(0, server.post_count)
+
     def test_json_exposes_pending_cloud_review_from_completed_job(self):
         with tempfile.TemporaryDirectory() as tmp:
             audio = Path(tmp) / "中文 录音[1].wav"
@@ -63,6 +90,7 @@ class AsrSmartCloudStatusTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
             self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(1, server.post_count)
             self.assertEqual({"audio": str(audio), "cache_dir": str(cache)}, {
                 field: server.submitted_payload[field] for field in ("audio", "cache_dir")})
             payload = json.loads(result.stdout)

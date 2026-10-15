@@ -58,11 +58,15 @@ function Invoke-AsrApi {
 
 function Test-AsrApi {
   try {
-    Invoke-AsrApi -Method 'GET' -Uri "$BaseUrl/health" | Out-Null
-    return $true
+    $Health = Invoke-AsrApi -Method 'GET' -Uri "$BaseUrl/health"
   } catch {
     return $false
   }
+  $RequiredFields = @('active_job_id', 'active_job_status', 'queue_length', 'gpu_conflicts', 'persistence')
+  if ($Health.status -ne 'ok' -or @($RequiredFields | Where-Object { $_ -notin $Health.PSObject.Properties.Name }).Count -gt 0) {
+    throw '该端口响应不符合 ChineseASR 接口，请核对端口及服务版本。'
+  }
+  return $true
 }
 
 function Assert-AsrPortBindable {
