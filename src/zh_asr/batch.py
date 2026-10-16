@@ -131,17 +131,25 @@ def run_batch(
             source_dir if name_counts[legacy_name.casefold()] > 1 or source_dir.is_dir()
             else output_root / legacy_name
         )
-        identity = _batch_item_identity(
-            audio_path,
-            mode=mode_key,
-            quick_engine=quick_engine,
-            strict_primary=strict_primary,
-            strict_secondary=strict_secondary,
-            config=model_config,
-            device=device,
-            cache_dir=cache_dir,
-            caller_binding=caller_binding,
-        )
+        try:
+            identity = _batch_item_identity(
+                audio_path,
+                mode=mode_key,
+                quick_engine=quick_engine,
+                strict_primary=strict_primary,
+                strict_secondary=strict_secondary,
+                config=model_config,
+                device=device,
+                cache_dir=cache_dir,
+                caller_binding=caller_binding,
+            )
+        except OSError as exc:
+            items_by_audio[audio_path] = BatchItem(
+                audio=audio_path, out_dir=item_dir, status="failed",
+                message=str(exc), objective_outcome="indeterminate",
+            )
+            _append_failure(failed_path, audio_path, item_dir, exc)
+            continue
 
         if not force:
             objective_outcome = _cached_item_objective_outcome(

@@ -8,6 +8,51 @@ from zh_asr.strict_writer import write_strict_bundle
 
 
 class BatchTests(unittest.TestCase):
+    def test_run_batch_continues_when_input_disappears_during_metadata_read(self):
+        import wave
+        from unittest.mock import patch
+        from zh_asr.batch import find_audio_files, run_batch
+        from zh_asr.metadata import sha256_file
+
+        calls = []
+        def fake_strict(audio_path, *, out_dir, **_kwargs):
+            calls.append(audio_path)
+            final = out_dir / "result.md"
+            final.write_text("ok", encoding="utf-8")
+            return {"final": final, "objective_outcome": "speech_transcribed"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir, output_dir = root / "input", root / "output"
+            input_dir.mkdir()
+            missing, healthy = input_dir / "a_missing.wav", input_dir / "b_healthy.wav"
+            for path in (missing, healthy):
+                with wave.open(str(path), "wb") as audio:
+                    audio.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                    audio.writeframes(b"\x01\x00" * 160)
+            discovered = find_audio_files(input_dir)
+
+            def remove_before_hash(path):
+                if path == missing:
+                    path.unlink()  # After file_metadata's existence checks, before its real read.
+                return sha256_file(path)
+
+            with patch("zh_asr.batch.find_audio_files", return_value=discovered), \
+                    patch("zh_asr.metadata.sha256_file", side_effect=remove_before_hash):
+                summary = run_batch(input_dir, output_dir, strict_fn=fake_strict)
+            failures = [json.loads(line) for line in (output_dir / "failed.jsonl").read_text(encoding="utf-8").splitlines()]
+            text = (output_dir / "summary.md").read_text(encoding="utf-8")
+            self.assertEqual((2, 1, 0, 1), (summary.total, summary.processed, summary.skipped, summary.failed))
+            self.assertEqual(["failed", "processed"], [item.status for item in summary.items])
+            self.assertEqual("indeterminate", summary.items[0].objective_outcome)
+            self.assertEqual([healthy], calls)
+            self.assertTrue((summary.items[1].out_dir / "result.md").is_file())
+            self.assertEqual([(str(missing), str(summary.items[0].out_dir), "FileNotFoundError")],
+                             [(item["audio"], item["out_dir"], item["error_type"]) for item in failures])
+            self.assertIn(repr(str(missing)), failures[0]["error"])
+            self.assertIn("Processed: 1", text)
+            self.assertIn("Failed: 1", text)
+
     def test_find_audio_files_recurses_and_filters_supported_extensions(self):
         from zh_asr.batch import find_audio_files
 
