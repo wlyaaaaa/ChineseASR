@@ -35,6 +35,8 @@
 
 Qwen 支持批量输入，批处理异常时隔离失败项，避免一个坏文件吞掉邻居结果。生成长度触及上限、异常短文本及边界风险作为完整性信号保留；这些信号不是经过校准的概率。
 
+固定的 `qwen-asr==0.0.6` 使用项目本地音频 SDPA 适配：ASR 与强制对齐加载后按 `cu_seqlens` 分窗口计算，保留窗口隔离；实现对应 [Transformers 官方 Qwen3-ASR](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_asr/modeling_qwen3_asr.py)。
+
 差异比较保留小数点、正负号和关键技术符号；否定、数值及明确配置的关键项不能被整段高相似度掩盖。常规 CER 与保留关键符号的 CER 分开统计。正常出现“字幕”“点赞”等词，不单独构成删除或改写理由。
 
 Qwen3-ForcedAligner-0.6B 接收音频与已经提供的文字，输出字词时间范围。它负责定位，不负责证明这些文字正确。对齐不完整时保留警告；只在文字和重叠音频时间共同支持时移除重复覆盖，不能因为连续两次真实说了同样的话而去重。

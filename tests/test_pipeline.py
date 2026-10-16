@@ -332,6 +332,62 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(model.context, "请只输出简体中文转写文本。")
 
+    def test_qwen_audio_sdpa_preserves_windows_and_other_attention_configs(self):
+        try:
+            import torch
+            from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+                Qwen3ASRAudioAttention, Qwen3ASRAudioEncoder,
+            )
+            from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        except ImportError as error:
+            self.skipTest(f"requires optional Qwen CPU runtime: {error}")
+        from zh_asr.adapters.qwen_asr import configure_qwen_audio_attention
+
+        config = types.SimpleNamespace(d_model=8, encoder_attention_heads=2,
+            attention_dropout=0.0, _attn_implementation="sdpa")
+        attention = Qwen3ASRAudioAttention(config).cpu().eval()
+        text_config = types.SimpleNamespace(_attn_implementation="sdpa")
+        thinker = types.SimpleNamespace(audio_tower=attention, config=text_config)
+        model = types.SimpleNamespace(model=types.SimpleNamespace(thinker=thinker))
+        original_sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
+        with torch.no_grad():
+            for projection in (attention.q_proj, attention.k_proj,
+                               attention.v_proj, attention.out_proj):
+                projection.weight.copy_(torch.eye(8))
+                projection.bias.zero_()
+        inputs = torch.arange(32, dtype=torch.float32).reshape(4, 8) / 32
+        changed = inputs.clone()
+        changed[2:] += 3.0
+        cu = torch.tensor([0, 2, 4], dtype=torch.int32)
+        single_cu = torch.tensor([0, 2], dtype=torch.int32)
+        owner = types.SimpleNamespace(config=config)
+        mask = Qwen3ASRAudioEncoder._prepare_attention_mask(owner, inputs, cu)
+        restricted_mask = mask.clone()
+        restricted_mask[..., 0, 1] = torch.finfo(inputs.dtype).min
+        with torch.inference_mode():
+            reference = attention(inputs, cu_seqlens=cu, attention_mask=mask)
+            restricted_reference = attention(inputs, cu_seqlens=cu,
+                attention_mask=restricted_mask)
+            single_reference = attention(inputs[:2], cu_seqlens=single_cu)
+        configure_qwen_audio_attention(model)
+        self.assertEqual(config._attn_implementation, "zh_asr_qwen_audio_sdpa")
+        self.assertEqual(text_config._attn_implementation, "sdpa")
+        self.assertIs(ALL_ATTENTION_FUNCTIONS["sdpa"], original_sdpa)
+        with torch.inference_mode():
+            output = attention(inputs, cu_seqlens=cu)
+            changed_output = attention(changed, cu_seqlens=cu)
+            restricted_output = attention(inputs, cu_seqlens=cu,
+                attention_mask=restricted_mask)
+            single_output = attention(inputs[:2], cu_seqlens=single_cu)
+        self.assertEqual((output[:2] - changed_output[:2]).abs().max().item(), 0.0)
+        torch.testing.assert_close(output, reference, rtol=0, atol=1e-6)
+        torch.testing.assert_close(restricted_output, restricted_reference, rtol=0, atol=1e-6)
+        torch.testing.assert_close(single_output, single_reference, rtol=0, atol=0)
+        fa2_config = types.SimpleNamespace(_attn_implementation="flash_attention_2")
+        thinker.audio_tower = types.SimpleNamespace(config=fa2_config)
+        configure_qwen_audio_attention(model)
+        self.assertEqual(fa2_config._attn_implementation, "flash_attention_2")
+
     def test_qwen_adapter_uses_local_modelscope_cache_path_when_available(self):
         from zh_asr.adapters.qwen_asr import qwen_from_pretrained_kwargs
         from zh_asr.config import EngineSpec

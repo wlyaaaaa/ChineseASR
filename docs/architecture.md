@@ -38,6 +38,8 @@ SHA-256 任一漂移都会在 `Qwen3ASRModel.from_pretrained` 前 fail-closed。
 `FireRedASR2-LLM + Qwen3-ASR-1.7B`，默认日常 strict 仍保持
 `Qwen3-ASR-1.7B + SenseVoiceSmall`。
 
+针对固定的 `qwen-asr==0.0.6`，加载 ASR/强制对齐后仅给音频塔登记项目专用 SDPA 函数，沿 `cu_seqlens` 分窗口调用原 SDPA 并拼回，无需完整序列方形 mask；依据 [Transformers 官方 Qwen3-ASR](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_asr/modeling_qwen3_asr.py)。
+
 官方 checkpoint 内的 `args.use_fp16=0` 会使 Qwen2-7B 先按 FP32 装载，而运行参数 `use_half` 原本要等整个模型构造完成后才转 BF16。隔离 worker 在 `use_half=true` + CUDA 时，仅在官方 `from_pretrained` 调用窗口内将首次 LLM 装载 dtype 约束为 BF16（不支持时 FP16），并在成功或异常后恢复官方绑定。这不修改固定源码或模型 checkpoint，raw 结果记录实际 `llm_initial_load_dtype`。
 
 FireRed worker 在校验大权重及装载前读取 WSL `/proc/meminfo`，同时检查配置总量和启动当下可用量；Linux CUDA 环境无法读取完整内存信息时 fail-closed。半精度装载要求至少 28 GiB RAM、34 GiB RAM+swap，并要求 `MemAvailable` 至少 18 GiB、`MemAvailable+SwapFree` 至少 22 GiB；FP32 对应门槛为 40/48 GiB 与 36/44 GiB。错误会区分配置不足和当前占用过高，并给出 `.wslconfig`、关闭占用进程与 `wsl --shutdown` 提示，避免模型装载后才被内核 OOM 直接 SIGKILL。本机 64GB Windows 工作站已用 WSL 32GB RAM + 8GB swap 完成真实 CUDA 验收；这是一项本机运行事实，而不是跨硬件统一阈值承诺。

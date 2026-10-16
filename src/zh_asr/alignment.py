@@ -6,6 +6,7 @@ from pathlib import Path
 import wave
 from typing import Any
 
+from .adapters.qwen_asr import configure_qwen_audio_attention
 from .config import ModelConfig, load_model_config
 from .model_lifecycle import alignment_contract, verify_aligner, file_hash, write_json_atomic
 from .result_writer import text_sha256
@@ -69,6 +70,7 @@ def align_many(
             dtype = getattr(torch, str(options.get("dtype", "bfloat16")))
             model = Qwen3ForcedAligner.from_pretrained(str(directory), dtype=dtype,
                 device_map=device, local_files_only=True)
+            configure_qwen_audio_attention(model)
             for index in valid:
                 audio, _, _ = jobs[index]
                 result = outcomes[index]

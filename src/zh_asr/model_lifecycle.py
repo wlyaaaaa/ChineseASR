@@ -77,6 +77,8 @@ def verify_aligner(config: ModelConfig) -> dict[str, Any]:
         "model_dir": str(model_dir), "artifact_lock_sha256": file_hash(lock_path),
         "receipt_sha256": receipt.sha256, "runtime": runtime, "status": "verified",
         "alignment_code_sha256": file_hash(Path(__file__).with_name("alignment.py")),
+        "qwen_audio_adapter_code_sha256": file_hash(
+            Path(__file__).with_name("adapters") / "qwen_asr.py"),
         "comparison_code_sha256": file_hash(Path(__file__).with_name("text_comparison.py"))}
 
 

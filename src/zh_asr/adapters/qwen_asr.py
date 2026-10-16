@@ -35,6 +35,7 @@ class QwenASRAdapter:
 
         model_ref = kwargs.pop("model")
         model = Qwen3ASRModel.from_pretrained(model_ref, **kwargs)
+        configure_qwen_audio_attention(model)
         return self.wrap_model(model, spec, runtime_identity=runtime_identity)
 
     def wrap_model(
@@ -87,6 +88,37 @@ class QwenASRModelWrapper:
                 item["generation"] = generation_diagnostics(self.model, item["text"])
             return [[item] for item in normalized]
         return isolated_batch(inputs, batch, self.generate)
+
+
+def configure_qwen_audio_attention(model: Any) -> None:
+    """Preserve packed audio windows in the pinned qwen-asr SDPA path."""
+    audio_config = model.model.thinker.audio_tower.config
+    if audio_config._attn_implementation != "sdpa":
+        return
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    name = "zh_asr_qwen_audio_sdpa"
+    ALL_ATTENTION_FUNCTIONS.register(name, _qwen_audio_window_sdpa)
+    audio_config._attn_implementation = name
+
+
+def _qwen_audio_window_sdpa(module, query, key, value, attention_mask=None, **kwargs):
+    import torch
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    cu_seqlens = kwargs.get("cu_seq_lens_q")
+    if cu_seqlens is None or len(cu_seqlens) <= 2:
+        return sdpa_attention_forward(module, query, key, value, attention_mask, **kwargs)
+    boundaries = cu_seqlens.tolist()
+    outputs = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        mask = None if attention_mask is None else attention_mask[..., start:end, start:end]
+        output, _ = sdpa_attention_forward(
+            module, query[:, :, start:end], key[:, :, start:end], value[:, :, start:end],
+            mask, **kwargs,
+        )
+        outputs.append(output)
+    return torch.cat(outputs, dim=1), None
 
 
 def ensure_qwen_asr_available(
