@@ -187,11 +187,11 @@ if ($OverlapSec -ge $ChunkSec) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'chunk_policy_invalid' -ExitCode 2
 }
 
-$resolvedRequestRoot = [IO.Path]::GetFullPath($RequestRoot)
+$resolvedRequestRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RequestRoot)
 if ($resolvedRequestRoot -cne $canonicalRequestRoot) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'request_root_not_allowed' -ExitCode 2
 }
-$audioPath = [IO.Path]::GetFullPath($Audio)
+$audioPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Audio)
 if (-not (Test-Path -LiteralPath $audioPath -PathType Leaf)) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'audio_file_missing' -ExitCode 2
 }
@@ -240,7 +240,7 @@ if ($EvidenceStatus) { $intent['evidence_status'] = $EvidenceStatus }
 if ($ModelProfile) { $intent['model_profile'] = $ModelProfile }
 if ($Legacy) { $intent['model_profile'] = 'legacy' }
 if ($LocalOutDir) {
-    $localPath = [IO.Path]::GetFullPath($LocalOutDir)
+    $localPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LocalOutDir)
     if (-not (Test-Path -LiteralPath $localPath -PathType Container)) {
         Write-BoundedReceipt -Status 'blocked' -ErrorCode 'local_result_missing' -ExitCode 2
     }

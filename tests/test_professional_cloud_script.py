@@ -23,12 +23,22 @@ def _write_wav(path: Path) -> None:
 
 class ProfessionalCloudScriptTests(unittest.TestCase):
     def test_json_stdout_contains_only_final_receipt_and_broker_receipts_are_logged(self) -> None:
+        self._assert_cloud_receipt(relative_paths=False)
+
+    def test_relative_paths_follow_powershell_location(self) -> None:
+        self._assert_cloud_receipt(relative_paths=True)
+
+    def _assert_cloud_receipt(self, *, relative_paths: bool) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scripts = root / "scripts"
             scripts.mkdir()
-            audio = root / "recording.wav"
+            caller = root / "调用目录 中文 [输入]"
+            caller.mkdir()
+            audio = (caller if relative_paths else root) / "recording.wav"
             _write_wav(audio)
+            local_out_dir = caller / "本地结果 [输出]"
+            local_out_dir.mkdir()
             broker = scripts / "fake-broker.ps1"
             request_root = root / "outputs" / "cloud-jobs"
             broker.write_text("""param([string]$Action, [string]$Query,
@@ -72,18 +82,36 @@ else:
                 "$brokerPath = '" + str(broker).replace("'", "''") + "'").replace(
                 "Global\\ChineseASRCloudUploadOnce",
                 "Global\\ChineseASRCloudUploadTest" + uuid.uuid4().hex), encoding="utf-8")
-            result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File",
-                str(relocated), "-Audio", str(audio), "-QualityReview",
-                "-CloudUploadAuthorized", "-Json"], cwd=root, capture_output=True,
+            arguments = [str(relocated), "-Audio", str(audio),
+                "-LocalOutDir", str(local_out_dir), "-RequestRoot", str(request_root),
+                "-QualityReview", "-CloudUploadAuthorized", "-Json"]
+            if relative_paths:
+                arguments[2] = audio.name
+                arguments[4] = local_out_dir.name
+                arguments[6] = r"..\outputs\cloud-jobs"
+                command = "Set-Location -LiteralPath '" + str(caller).replace("'", "''")
+                command += "'; & " + " ".join(
+                    value if value.startswith("-") else "'" + value.replace("'", "''") + "'"
+                    for value in arguments)
+                invocation = ["-Command", command]
+            else:
+                invocation = ["-File", *arguments]
+            result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", *invocation],
+                cwd=root, capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=60,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             decoder = json.JSONDecoder()
             receipt, end = decoder.raw_decode(result.stdout.strip())
             self.assertEqual(len(result.stdout.strip()), end)
             self.assertEqual("succeeded", receipt["status"])
             log_path = Path(receipt["broker_log_path"])
             self.assertTrue(log_path.is_file())
+            self.assertEqual(request_root, log_path.parent)
+            intent_path = log_path.with_name(log_path.name.replace(".broker.json", ".intent.json"))
+            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+            self.assertEqual(audio, Path(intent["audio_path"]))
+            self.assertEqual(local_out_dir, Path(intent["local_out_dir"]))
             log = json.loads(log_path.read_text(encoding="utf-8"))
             self.assertEqual("AgentSecretRef", log["agent_secret_ref_receipt"]["action"])
             self.assertEqual("ReportCredentialResult",
