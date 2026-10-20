@@ -403,19 +403,17 @@ def _split_prepared_wav(source: Path, output_dir: Path, *,
         total = reader.getnframes()
         if total == 0:
             raise CloudReviewError("audio_empty")
-        frames_per_chunk = 16000 * chunk_sec
-        limit = 16000 * (max_chunk_sec or chunk_sec)
+        frames_per_chunk = 16000 * min(chunk_sec, max_chunk_sec or chunk_sec)
+        overlap = 16000 * overlap_sec
+        step = frames_per_chunk - overlap
+        count = max(1, (total - overlap + step - 1) // step)
+        # Distribute the non-overlap frames evenly so a tiny remainder never
+        # becomes a separate tail and every chunk stays within both limits.
+        span = total - overlap
         chunks = []
-        start = 0
-        while start < total:
-            end = min(start + frames_per_chunk, total)
-            if 0 < total - end < 5 * 16000:
-                if total - start <= limit:
-                    end = total
-                elif frames_per_chunk > (overlap_sec + 5) * 16000:
-                    # Keep the final new content >=5 s without exceeding the
-                    # provider limit or losing the requested overlap.
-                    end = max(start + overlap_sec * 16000 + 1, total - 5 * 16000)
+        for index in range(count):
+            start = index * span // count
+            end = (index + 1) * span // count + overlap
             reader.setpos(start)
             path = output_dir / f"chunk-{len(chunks)+1:06d}.wav"
             with wave.open(str(path), "wb") as writer:
@@ -426,9 +424,6 @@ def _split_prepared_wav(source: Path, output_dir: Path, *,
             chunks.append({"index": len(chunks) + 1, "start_ms": round(start / 16),
                 "end_ms": round(end / 16), "path": str(path.resolve()),
                 "audio_sha256": _file_hash(path)})
-            if end >= total:
-                break
-            start = end - overlap_sec * 16000
     return chunks
 
 

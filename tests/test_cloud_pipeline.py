@@ -110,21 +110,37 @@ class CloudPipelineTests(unittest.TestCase):
         self.assertEqual(12000, value)
         self.assertEqual(1, request["selected_channel"])
 
-    def test_short_tail_merges_or_rebalances_within_provider_limit(self) -> None:
+    def test_chunks_are_balanced_within_requested_and_provider_limits(self) -> None:
         _wav(self.audio, frames=16000 * 12 + 1600)
-        merged = _split_prepared_wav(self.audio, self.base / "merged",
+        requested = _split_prepared_wav(self.audio, self.base / "requested",
             chunk_sec=12, overlap_sec=1, max_chunk_sec=18)
-        self.assertEqual([(0, 12100)], [(c["start_ms"], c["end_ms"]) for c in merged])
+        self.assertEqual([(0, 6550), (5550, 12100)],
+                         [(c["start_ms"], c["end_ms"]) for c in requested])
         bounded = _split_prepared_wav(self.audio, self.base / "bounded",
-            chunk_sec=12, overlap_sec=1, max_chunk_sec=12)
-        self.assertEqual(12100, bounded[-1]["end_ms"])
-        self.assertGreaterEqual(bounded[-1]["end_ms"] - bounded[-2]["end_ms"], 5000)
-        self.assertTrue(all(c["end_ms"] - c["start_ms"] <= 12000 for c in bounded))
-        self.assertEqual(1000, bounded[-2]["end_ms"] - bounded[-1]["start_ms"])
+            chunk_sec=18, overlap_sec=1, max_chunk_sec=12)
+        self.assertEqual([(c["start_ms"], c["end_ms"]) for c in requested],
+                         [(c["start_ms"], c["end_ms"]) for c in bounded])
         _wav(self.audio, frames=16000 * 120 + 1600)
         overlapped = _split_prepared_wav(self.audio, self.base / "overlapped",
             chunk_sec=120, overlap_sec=119, max_chunk_sec=120)
         self.assertEqual(2, len(overlapped))
+
+    def test_important_recording_has_no_tiny_tail_or_over_limit_chunk(self) -> None:
+        total = 16000 * 2143 + 1664
+        _wav(self.audio, frames=total)
+        chunks = _split_prepared_wav(self.audio, self.base / "balanced",
+            chunk_sec=120, overlap_sec=1, max_chunk_sec=120)
+        self.assertEqual(19, len(chunks))
+        self.assertEqual((0, 2143104), (chunks[0]["start_ms"], chunks[-1]["end_ms"]))
+        lengths = []
+        for chunk in chunks:
+            with wave.open(chunk["path"], "rb") as reader:
+                lengths.append(reader.getnframes())
+        self.assertTrue(all(5 * 16000 <= length <= 120 * 16000 for length in lengths))
+        self.assertLessEqual(max(lengths) - min(lengths), 1)
+        self.assertEqual(total, sum(lengths) - 18 * 16000)
+        self.assertTrue(all(left["end_ms"] - right["start_ms"] == 1000
+                            for left, right in zip(chunks, chunks[1:])))
 
     def test_resume_keeps_original_request_and_parameter_changes_start_new_job(self) -> None:
         original = self.intent()
