@@ -120,6 +120,16 @@ class SpeakerAttributionTests(unittest.TestCase):
         self.assertEqual(result["segments"][0]["candidate_role"], "unknown")
         self.assertEqual(result["segments"][1]["candidate_role"], "other")
 
+    def test_sentence_text_shifted_off_its_token_timestamps_is_refused(self):
+        from test_sentence_alignment import funasr_shifted_result
+        from zh_asr.speaker_attribution import SpeakerAttributionError, attribute_transcript_result
+
+        with self.assertRaisesRegex(SpeakerAttributionError, "re-run the transcription"):
+            attribute_transcript_result(
+                funasr_shifted_result(raw_tokens=False),
+                load_fixture("mono_unknown_context.json"),
+            )
+
     def test_mono_fixture_stays_unknown_and_never_turns_speaker_number_into_identity(self):
         from zh_asr.speaker_attribution import attribute_transcript_result
 

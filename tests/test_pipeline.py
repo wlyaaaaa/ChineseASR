@@ -190,14 +190,47 @@ class PipelineTests(unittest.TestCase):
             {
                 "input": "not-read.wav",
                 "batch_size_s": 300,
+                "return_raw_text": True,
                 "language": "zh",
                 "preset_spk_num": 2,
             },
         )
         self.assertEqual(
             model.calls[1],
-            {"input": "not-read.wav", "batch_size_s": 300, "language": "zh"},
+            {"input": "not-read.wav", "batch_size_s": 300, "return_raw_text": True, "language": "zh"},
         )
+
+    def test_paraformer_sentence_text_is_rebuilt_on_its_token_timestamps(self):
+        from zh_asr.config import load_model_config
+        from zh_asr.pipeline import (
+            _engine_generation_kwargs,
+            _generate_many_for_strict,
+            _generate_once_with_identity,
+        )
+        from test_sentence_alignment import funasr_shifted_result
+
+        class DummyModel:
+            def generate(self, **_kwargs):
+                return funasr_shifted_result()
+
+        config = load_model_config()
+        with patch("zh_asr.pipeline.build_model", side_effect=lambda *_args, **_kwargs: DummyModel()), patch(
+            "zh_asr.pipeline._empty_cuda_cache"
+        ):
+            once, _identity = _generate_once_with_identity(
+                Path("not-read.wav"), "paraformer", "cpu", None, config
+            )
+            many = _generate_many_for_strict(
+                [Path("not-read.wav")], [Path("not-written")], "paraformer", "cpu", None, config
+            )["results"][0]
+
+        for result in (once, many):
+            self.assertEqual(
+                [sentence["text"] for sentence in result[0]["sentence_info"]],
+                ["今天天气，", "我们出去。", "走走吧。"],
+            )
+            self.assertEqual(result[0]["sentence_info_alignment"]["status"], "aligned")
+        self.assertNotIn("return_raw_text", _engine_generation_kwargs("sensevoice", config))
 
     def test_fun_asr_nano_forwards_explicit_chinese_language_hint(self):
         from zh_asr.config import load_model_config

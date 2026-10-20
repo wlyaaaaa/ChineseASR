@@ -24,6 +24,7 @@ from .audio_frontend import (
 from .config import ModelConfig, get_engine_spec, load_model_config
 from .proxy_guard import sanitize_current_process_env
 from .result_writer import canonical_json_sha256, extract_text, write_transcript_bundle
+from .sentence_alignment import realign_sentence_info
 from .strict_writer import write_strict_bundle
 
 
@@ -377,10 +378,12 @@ def _generate_many_for_strict(
             else:
                 for index in valid_indices:
                     try:
-                        generated = model.generate(
-                            input=str(prepared[index]),
-                            batch_size_s=300,
-                            **generation_kwargs,
+                        generated = realign_sentence_info(
+                            model.generate(
+                                input=str(prepared[index]),
+                                batch_size_s=300,
+                                **generation_kwargs,
+                            )
                         )
                         results[index] = _attach_speech_detection_if_empty(
                             generated,
@@ -506,7 +509,7 @@ def _generate_once_with_identity(
         generate_kwargs.update(_engine_generation_kwargs(engine, config))
         if preset_spk_num is not None:
             generate_kwargs["preset_spk_num"] = preset_spk_num
-        result = model.generate(**generate_kwargs)
+        result = realign_sentence_info(model.generate(**generate_kwargs))
         result = _attach_speech_detection_if_empty(
             result,
             model,
@@ -556,17 +559,24 @@ def _engine_generation_kwargs(engine: str, config: ModelConfig) -> dict[str, Any
     especially important for Fun-ASR-Nano, whose official Chinese route uses
     the explicit ``中文`` prompt.  Qwen and FireRed adapters own their language
     handling, so they are intentionally left unchanged here.
+
+    Engines with a speaker model emit ``sentence_info``; they also return the
+    raw timed tokens so ``realign_sentence_info`` can rebuild sentence text.
     """
 
     spec = get_engine_spec(engine, config=config)
     if spec.adapter != "funasr":
         return {}
+    kwargs: dict[str, Any] = {}
+    if spec.spk_model:
+        kwargs["return_raw_text"] = True
     language = str(spec.language or "").strip()
     if not language or language.lower() == "auto":
-        return {}
+        return kwargs
     if engine == "fun-asr-nano" and language.lower() in {"chinese", "zh", "zh-cn"}:
         language = "中文"
-    return {"language": language}
+    kwargs["language"] = language
+    return kwargs
 
 
 def _attach_speech_detection_if_empty(

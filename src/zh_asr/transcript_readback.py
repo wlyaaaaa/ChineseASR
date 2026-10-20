@@ -18,6 +18,7 @@ from typing import Any, Mapping
 
 from .audio_outcome import validate_objective_result
 from .result_writer import extract_segments
+from .sentence_alignment import sentence_alignment_failures
 
 
 READBACK_SCHEMA = "chinese-asr.transcript-readback.v1"
@@ -591,6 +592,8 @@ def _inspect_candidate(
         raw_payload = json.loads(raw_bytes)
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None, "raw_artifact_unreadable"
+    if sentence_alignment_failures(raw_payload):
+        return None, "sentence_timestamps_misaligned"
     segments, total_segments, timed_segments = _normalize_segments(raw_payload)
     request = job.get("request")
     request = request if isinstance(request, Mapping) else {}

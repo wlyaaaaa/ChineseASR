@@ -99,6 +99,8 @@ CI 在干净 Windows 运行器上安装 FFmpeg 和无 GPU 测试依赖，仍使�
 
 **Paraformer 逐句时间先核实再截证据**：`sentence_info` 的时间只用来定位。时间不可靠时（与回听、云端分段时间或另一路结果对不上，或出现只有标点的空句），截取证据前先用 ffmpeg 按候选时间截出该段（前后各留几秒），单独放进一个文件夹用 `scripts\transcribe-folder.ps1`（strict）重新听写，确认片段里就是要截的那几句，再按核实过的时间截取。
 
+FunASR 1.4.14 在相邻两个中文 VAD 段之间少拼一个空格，自带的逐句文字会每过一段就往前错一个字，长录音里能差出几十秒，结尾只剩标点。本项目让 FunASR 同时返回逐字词元（`raw_text`），按逐字时间戳把每句文字放回它自己的时间上，结果标 `sentence_info_alignment.status=aligned`；词元和时间戳数不上时不给逐句时间（`status=unaligned`，原句移到 `sentence_info_unaligned`）。没有这个标记、文字和逐字时间戳对不上的旧结果，回读按 `sentence_timestamps_misaligned` 拒收，`attribute-speakers` 也会拒绝，重跑 Paraformer 即可。
+
 strict 模式即使一路模型失败，也会保留可用输出并生成审计包。正文会标记 `[疑似]`，`strict.audit.md` 会记录失败引擎、异常摘要和复核理由。两路都失败时输出 `[听不清]`。
 
 ## 一分钟使用
@@ -170,7 +172,7 @@ cd <repo-root>
 
 没有保留任务、结果完整性校验失败或匹配转写没有有效时间段时，命令返回 `status=not_found` 或 `status=gap`，
 并在 `gap.code` 给出原因，不猜测时间。仍在处理的任务会返回其 ID，应继续该任务而非重复提交。重复源哈希按时间段可用性、证据、质量、覆盖和段数确定性取优，任务新旧
-本身不被当作质量证明。Paraformer 的 `sentence_info` 是当前明确支持的逐句时间和匿名说话人结构；其他引擎只有
+本身不被当作质量证明。Paraformer 的 `sentence_info` 是当前明确支持的逐句时间和匿名说话人结构，句子文字与逐字时间戳对不上的结果以 `sentence_timestamps_misaligned` 拒收；其他引擎只有
 在 raw 结构明确提供有效时间段时才会被回读。云结果只在 schema、用途、成功状态、原音哈希和每块范围都一致时可回读；其范围的
 `timestamp_granularity=chunk`，不是句级时间戳，`quality.status=unknown`，且云端成功不构成逐字准确性或说话人归属证明。
 
@@ -570,6 +572,13 @@ $env:ZH_ASR_MODEL_CONFIG='C:\path\to\models.yaml'
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests
+```
+
+Paraformer 逐句时间的真实模型回归检查默认跳过；升级 FunASR 或 Paraformer 后显式运行。它把模型自带的公开示例音频重复三遍、中间隔 3 秒静音，用真实模型（默认 CPU，`ZH_ASR_MODEL_TEST_DEVICE` 可改）检查每句文字都落在自己的逐字时间上，并确认 FunASR 自带断句是否仍需重新对齐：
+
+```powershell
+$env:ZH_ASR_RUN_MODEL_TESTS = '1'
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_paraformer_sentence_timing_model.py"
 ```
 
 环境体检：

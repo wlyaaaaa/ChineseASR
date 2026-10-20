@@ -199,6 +199,38 @@ class TranscriptReadbackTests(unittest.TestCase):
             {item["reason"] for item in payload["lookup_scope"]["rejections"]},
         )
 
+    def test_sentence_text_shifted_off_its_token_timestamps_is_rejected(self):
+        from test_sentence_alignment import funasr_shifted_result
+        from zh_asr.sentence_alignment import realign_sentence_info
+        from zh_asr.transcript_readback import read_transcript_readback
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shifted_root = Path(tmp) / "shifted"
+            shifted_root.mkdir()
+            snapshot, source_hash, _raw, _objective = self._write_bundle(
+                shifted_root, raw_payload=funasr_shifted_result(raw_tokens=False)
+            )
+            shifted = read_transcript_readback(source_hash, snapshot)
+
+            aligned_root = Path(tmp) / "aligned"
+            aligned_root.mkdir()
+            snapshot, source_hash, _raw, _objective = self._write_bundle(
+                aligned_root, raw_payload=realign_sentence_info(funasr_shifted_result())
+            )
+            aligned = read_transcript_readback(source_hash, snapshot)
+
+        self.assertEqual(shifted["status"], "gap")
+        self.assertEqual(shifted["segments"], [])
+        self.assertIn(
+            "sentence_timestamps_misaligned",
+            {item["reason"] for item in shifted["lookup_scope"]["rejections"]},
+        )
+        self.assertEqual(aligned["status"], "ok")
+        self.assertEqual(
+            [(item["start_ms"], item["text"]) for item in aligned["segments"]],
+            [(0, "今天天气，"), (1000, "我们出去。"), (2000, "走走吧。")],
+        )
+
     def test_missing_timestamps_returns_gap_without_guessing(self):
         from zh_asr.transcript_readback import read_transcript_readback
 

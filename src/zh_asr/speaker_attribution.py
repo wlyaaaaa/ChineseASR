@@ -18,6 +18,7 @@ import re
 from typing import Any, Mapping, Sequence
 
 from .result_writer import TranscriptSegment, canonical_json_sha256, extract_segments
+from .sentence_alignment import sentence_alignment_failures
 from .speaker_evidence import (
     SELF_PERSON_ID,
     SELF_SPEAKER_PROFILE_SCHEMA,
@@ -75,6 +76,12 @@ def attribute_transcript_result(
 ) -> dict[str, Any]:
     """Attribute timestamped existing transcript segments without loading audio/models."""
 
+    misaligned = sentence_alignment_failures(transcript_result)
+    if misaligned:
+        raise SpeakerAttributionError(
+            "Transcript sentence text does not match its token timestamps "
+            f"({misaligned[0]}); re-run the transcription before attributing speakers."
+        )
     return attribute_segments(
         extract_segments(transcript_result),
         context,
