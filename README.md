@@ -97,6 +97,8 @@ CI 在干净 Windows 运行器上安装 FFmpeg 和无 GPU 测试依赖，仍使�
 | 显式时间线/匿名说话人 baseline | `paraformer` | 固定 `speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4`，输出逐句 `sentence_info` 时间和 CAM++ 匿名聚类；已知两方通话的调用方可传 `--preset-spk-num 2`，省略时自动聚类；不改变 quick/strict 默认 |
 | 未接通的配置占位 | `whisper-large-v3` | 配置存在，但当前没有 Whisper adapter；不能把它当作已经可运行的 fallback |
 
+**Paraformer 逐句时间先核实再截证据**：`sentence_info` 的时间只用来定位。时间不可靠时（与回听、云端分段时间或另一路结果对不上，或出现只有标点的空句），截取证据前先用 ffmpeg 按候选时间截出该段（前后各留几秒），单独放进一个文件夹用 `scripts\transcribe-folder.ps1`（strict）重新听写，确认片段里就是要截的那几句，再按核实过的时间截取。
+
 strict 模式即使一路模型失败，也会保留可用输出并生成审计包。正文会标记 `[疑似]`，`strict.audit.md` 会记录失败引擎、异常摘要和复核理由。两路都失败时输出 `[听不清]`。
 
 ## 一分钟使用
