@@ -237,6 +237,40 @@ class CloudPipelineTests(unittest.TestCase):
         self.assertEqual("", rejected)
         self.assertEqual(request["model"], candidate["engine"])
 
+    def test_finalizer_fails_when_all_provider_chunks_lack_text(self) -> None:
+        _wav(self.audio, frames=16000 * 12)
+        for profile in ("short", "message"):
+            intent = self.intent(model_profile=profile, chunk_sec=6, overlap_sec=0)
+            ready = prepare_cloud_request(intent, self.root, CONFIG)
+            document = json.loads(intent.read_text(encoding="utf-8"))
+            provider = self.root / (ready["job_id"] + ".provider.json")
+            chunks = [{**binding, "id": str(binding["index"]), "http_status": 200,
+                "raw_response": {"output": {"text": " \n"} if binding["index"] == 1
+                    else {"changed_text": "响应结构已变化"}},
+                "raw_events": [{"header": {"event": "task-finished"}}]}
+                for binding in document["chunk_bindings"]]
+            for generic in (False, True):
+                with self.subTest(profile=profile, generic=generic):
+                    body = {"status": "succeeded", "credential_result": "Success",
+                        "new_requests": 2, "cloud_upload_performed": True,
+                        "model": document["model"], "protocol": document["protocol"],
+                        "job_id": document["job_id"],
+                        "source_audio_sha256": document["source_audio_sha256"]}
+                    body.update({"schema": "passwordcenter.vendor-result.v1", "vendor": "qwen",
+                        "request_sha256": document["vendor_request_sha256"], "results": chunks}
+                        if generic else {"schema": "zh_asr.dashscope_transport_result.v1",
+                                         "chunks": chunks})
+                    provider.write_text(json.dumps(body), encoding="utf-8")
+                    final = finalize_cloud_result(intent, self.root, provider_path=provider,
+                                                  config_path=CONFIG)
+                    self.assertEqual("failed", final["status"])
+                    self.assertEqual("cloud_transcript_empty", final["error_code"])
+                    sidecar = json.loads((self.local / "cloud.review.json").read_text(encoding="utf-8"))
+                    self.assertEqual("failed", sidecar["status"])
+                    self.assertEqual(final["error_code"], sidecar["error_code"])
+                    self.assertTrue((self.root / (ready["job_id"] + ".work")).is_dir())
+                    self.assertFalse((self.root / (ready["job_id"] + ".transcript.txt")).exists())
+
     def test_finalizer_pauses_on_provider_quota_error(self) -> None:
         intent = self.intent()
         ready = prepare_cloud_request(intent, self.root, CONFIG)

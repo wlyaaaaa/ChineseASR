@@ -849,6 +849,10 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
         texts = [chunk["text"] for chunk in chunks if chunk["text"]]
         status = provider.get("status")
         error_code = str(provider.get("error_code") or "")
+        if status == "succeeded" and not texts:
+            status = "failed"
+            error_code = "cloud_transcript_empty"
+            final["message"] = "云端复核整份无文字，未获得可用正文。"
         final.update(status=status, error_code=error_code,
             model=provider.get("model"), protocol=provider.get("protocol"),
             provider_endpoint=provider.get("provider_endpoint"),
