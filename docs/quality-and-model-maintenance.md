@@ -27,7 +27,7 @@
 .\.venv\Scripts\python.exe -m zh_asr batch C:\audio\folder --profile high_quality --out-dir .\outputs\batch-example
 ```
 
-配置中存在某个模型，不等于 adapter 已实现、权重已安装或真实推理通过。Whisper 当前仅为配置占位，不是可调用的兜底引擎。Paraformer 的匿名说话人聚类继续保留；强制对齐器不替代说话人分离。
+配置中存在某个模型，不等于 adapter 已实现、权重已安装或真实推理通过。Paraformer 的匿名说话人聚类继续保留；强制对齐器不替代说话人分离。
 
 ## 从音频到可复核结果
 
@@ -126,7 +126,7 @@ File-transcription workers adopt their supervisor lease through the live broker.
 
 本次质量/运行时改造完成后，项目进入维护态。功能提交的完整测试执行 482 项，0 失败、0 错误；1 项因可选公开中文 VAD fixture 未安装而明确跳过。公开音频实际验收覆盖单模型桌面听写、`high_quality` 短音频、42 秒两切片长音频、FireRed + Qwen、Qwen3-ForcedAligner、正常 smart/API 入口，以及监督进程异常退出后的 worker/租约回收。PCConfig 的 64 项 GPU Broker 回归和 63 项相关配置/恢复契约测试通过；`chinese-asr` Skill 的供应健康检查通过。
 
-收尾审计同时核对了文档与实现：ASR/OCR 当前允许跨族并行，同族任务串行，Ollama 重型工作与两者互斥；文件 worker 会接管短租约的进程身份，监督进程消失时 watchdog 终止对应 worker；VAD 边界切分已经落地，不再是未来计划；Whisper 仍只有配置占位，没有可运行 adapter。桌面听写的模型准备、GPU 等待和麦克风故障是不同状态，原生模型调用使用有界恢复，不允许永久停在“准备中”。
+收尾审计同时核对了文档与实现：ASR/OCR 当前允许跨族并行，同族任务串行，Ollama 重型工作与两者互斥；文件 worker 会接管短租约的进程身份，监督进程消失时 watchdog 终止对应 worker；VAD 边界切分已经落地，不再是未来计划。桌面听写的模型准备、GPU 等待和麦克风故障是不同状态，原生模型调用使用有界恢复，不允许永久停在“准备中”。
 
 Wallpaper Engine 方面，收尾检查没有发现 ASR/OCR 主动 pause/stop、挂起其进程或写入广泛 Python/WSL 暂停规则的路径，也没有修改已有播放偏好；这一结论是代码/配置路径审计，不等于逐帧证明动画连续播放。
 

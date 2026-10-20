@@ -10,6 +10,7 @@ from difflib import SequenceMatcher
 import hashlib
 import json
 from pathlib import Path
+import shutil
 from typing import Any
 import uuid
 import wave
@@ -358,7 +359,7 @@ def _file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _bounded_intent(path: Path, root: Path) -> dict[str, Any]:
+def _bounded_intent(path: Path, root: Path, *, require_audio: bool = True) -> dict[str, Any]:
     try:
         if not path.resolve().is_relative_to(root.resolve()) or path.stat().st_size > 1024 * 1024:
             raise ValueError("intent outside request root or too large")
@@ -378,7 +379,7 @@ def _bounded_intent(path: Path, root: Path) -> dict[str, Any]:
         if purpose == "quality_review" and "importance" in intent:
             raise ValueError("quality purpose conflict")
         audio = Path(str(intent["audio_path"]))
-        if not audio.is_absolute() or not audio.is_file():
+        if not audio.is_absolute() or (require_audio and not audio.is_file()):
             raise ValueError("audio missing")
         local = intent.get("local_out_dir")
         if local and (not Path(str(local)).is_absolute() or not Path(str(local)).is_dir()):
@@ -393,7 +394,8 @@ def _bounded_intent(path: Path, root: Path) -> dict[str, Any]:
 
 
 def _split_prepared_wav(source: Path, output_dir: Path, *,
-                        chunk_sec: int, overlap_sec: int) -> list[dict[str, Any]]:
+                        chunk_sec: int, overlap_sec: int,
+                        max_chunk_sec: int | None = None) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     with wave.open(str(source), "rb") as reader:
         if (reader.getframerate(), reader.getnchannels(), reader.getsampwidth()) != (16000, 1, 2):
@@ -401,12 +403,19 @@ def _split_prepared_wav(source: Path, output_dir: Path, *,
         total = reader.getnframes()
         if total == 0:
             raise CloudReviewError("audio_empty")
-        step = 16000 * (chunk_sec - overlap_sec)
         frames_per_chunk = 16000 * chunk_sec
+        limit = 16000 * (max_chunk_sec or chunk_sec)
         chunks = []
         start = 0
         while start < total:
             end = min(start + frames_per_chunk, total)
+            if 0 < total - end < 5 * 16000:
+                if total - start <= limit:
+                    end = total
+                elif frames_per_chunk > (overlap_sec + 5) * 16000:
+                    # Keep the final new content >=5 s without exceeding the
+                    # provider limit or losing the requested overlap.
+                    end = max(start + overlap_sec * 16000 + 1, total - 5 * 16000)
             reader.setpos(start)
             path = output_dir / f"chunk-{len(chunks)+1:06d}.wav"
             with wave.open(str(path), "wb") as writer:
@@ -419,7 +428,7 @@ def _split_prepared_wav(source: Path, output_dir: Path, *,
                 "audio_sha256": _file_hash(path)})
             if end >= total:
                 break
-            start += step
+            start = end - overlap_sec * 16000
     return chunks
 
 
@@ -450,6 +459,7 @@ def _local_sidecar(intent: dict[str, Any], result: dict[str, Any]) -> None:
 
 def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
                           state_path: Path | None = None,
+                          resume_job_id: str = "",
                           now: datetime | None = None) -> dict[str, Any]:
     """Prepare all audio and model policy before a SecretRef worker is invoked."""
     from .audio_frontend import prepare_pcm16_mono
@@ -477,6 +487,7 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
     source = Path(intent["audio_path"])
     source_hash = _file_hash(source)
     work = root / (intent["job_id"] + ".work")
+    fresh_work = not work.exists()
     work.mkdir(parents=True, exist_ok=True)
     selected = source
     if intent.get("channel_index") is not None:
@@ -517,8 +528,6 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
         raise CloudReviewError("chunk_policy_invalid") from exc
     if chunk_sec < 1 or overlap_sec < 0 or overlap_sec >= chunk_sec:
         raise CloudReviewError("chunk_policy_invalid")
-    chunks = _split_prepared_wav(prepared.path, work / "chunks",
-        chunk_sec=chunk_sec, overlap_sec=overlap_sec)
     hotwords = intent.get("hotwords") or {}
     if (not isinstance(hotwords, dict) or len(hotwords) > 2000 or
             any(not isinstance(word, str) or not word.strip() or
@@ -541,6 +550,22 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
                        "text": "相关词语：" + terms}]}
     messages_prefix = [context_message] if hotwords and len(terms) <= 350 else []
     ws_input = {"context": [context_message]} if messages_prefix else {}
+    matching = {"source_audio_sha256": source_hash, "model": model["id"],
+        "protocol": protocol, "parameters": parameters, "messages_prefix": messages_prefix,
+        "input": ws_input, "ws_task": model.get("ws_task", {}),
+        "purpose": intent["purpose"], "selected_channel": intent.get("channel_index"),
+        "automatic_review": automatic,
+        "send_before_utc": model["free_until"] if automatic else None}
+    resumed = _resume_request(root, intent, matching, resume_job_id, billing_warning)
+    if resumed:
+        # Only this call's newly generated staging is discarded.
+        if resumed["job_id"] != intent["job_id"] and fresh_work and not intent.get("vendor_request_sha256"):
+            shutil.rmtree(work)
+            intent_path.unlink()
+        return {**resumed, "secret_ref_target": config["secret_ref_target"],
+                "credential_ref": config["credential_ref"]}
+    chunks = _split_prepared_wav(prepared.path, work / "chunks",
+        chunk_sec=chunk_sec, overlap_sec=overlap_sec, max_chunk_sec=int(model["max_chunk_sec"]))
     request = {"schema": TRANSPORT_SCHEMA, "job_id": intent["job_id"],
         "purpose": intent["purpose"], "important_only": intent["purpose"] == "important_evidence",
         "cloud_upload_authorized": True, "automatic_review": automatic,
@@ -572,11 +597,63 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
     _write_state(intent_path, intent)
     _write_state(pending, request)
     return {"status": "ready", "job_id": intent["job_id"],
+            "intent_path": str(intent_path),
             "model": model["id"], "protocol": protocol,
             "secret_ref_target": config["secret_ref_target"],
             "credential_ref": config["credential_ref"],
             "request_path": str(pending), "billing_warning": billing_warning,
             "source_audio_seconds": duration_sec, "chunk_count": len(chunks)}
+
+
+def _resume_request(root: Path, intent: dict[str, Any], matching: dict[str, Any],
+                    resume_job_id: str, billing_warning: str) -> dict[str, Any] | None:
+    if resume_job_id:
+        try:
+            candidates = [root / (str(uuid.UUID(resume_job_id)) + ".intent.json")]
+        except ValueError as exc:
+            raise CloudReviewError("resume_job_invalid") from exc
+    else:
+        candidates = sorted(root.glob("*.intent.json"), key=lambda path: path.stat().st_mtime_ns,
+                            reverse=True)
+    for path in candidates:
+        old = _read_json(path)
+        if not old or any(old.get(key, default) != intent.get(key, default)
+                for key, default in (("chunk_sec", 180), ("overlap_sec", 1),
+                                     ("local_out_dir", ""), ("evidence_status", ""))):
+            continue
+        try:
+            job_id = str(uuid.UUID(str(old.get("job_id"))))
+        except ValueError:
+            continue
+        if path.name != str(job_id) + ".intent.json":
+            continue
+        result = _read_json(root / (job_id + ".result.json"))
+        if result and result.get("status") == "succeeded":
+            continue
+        for suffix in (".pending.json", ".unclaimed.json"):
+            request_path = root / (job_id + suffix)
+            request = _read_json(request_path)
+            if not request or any(request.get(key) != value for key, value in matching.items()):
+                continue
+            digest = hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+            if digest != old.get("vendor_request_sha256"):
+                continue
+            pending = root / (job_id + ".pending.json")
+            if request_path != pending:
+                request_path.replace(pending)
+            if (old.get("billing_warning", "") != billing_warning or
+                    old.get("audio_path") != intent["audio_path"]):
+                old.update(billing_warning=billing_warning, audio_path=intent["audio_path"])
+                _write_state(path, old)
+            return {"status": "ready", "job_id": job_id, "intent_path": str(path),
+                "request_path": str(pending), "model": request["model"],
+                "protocol": request["protocol"], "billing_warning": billing_warning,
+                "source_audio_seconds": old.get("source_audio_seconds"),
+                "chunk_count": len(request["chunks"]), "resumed": True}
+    if resume_job_id:
+        raise CloudReviewError("resume_job_not_compatible")
+    return None
 
 
 def prepare_vendor_operations(request: dict[str, Any], work: Path) -> list[dict[str, Any]]:
@@ -633,11 +710,34 @@ def project_vendor_result(provider: dict[str, Any], intent: dict[str, Any]) -> d
         if raw.get("id") != str(binding["index"]):
             raise CloudReviewError("provider_result_binding_invalid")
         chunks.append({**raw, **binding})
+    # The generic worker can stop before appending a failed operation. Only
+    # NO_WORDS identifies that next chunk as silent; later chunks stay missing.
+    if provider.get("status") == "failed" and _no_words(provider) and len(chunks) < len(expected):
+        chunks.append({**expected[len(chunks)], "no_speech": True,
+                       "provider_error_code": provider.get("provider_error_code"),
+                       "provider_error_message": provider.get("provider_error_message")})
+    if (provider.get("status") == "failed" and _no_words(provider) and
+            len(chunks) == len(expected) and all(_chunk_completed(chunk) for chunk in chunks)):
+        provider = {**provider, "status": "succeeded", "error_code": "",
+                    "credential_result": "Success"}
     return {**provider, "schema": PROVIDER_SCHEMA, "job_id": intent["job_id"],
             "source_audio_sha256": intent.get("source_audio_sha256"), "model": intent.get("model"),
             "protocol": intent.get("protocol"), "chunks": chunks,
             "cloud_upload_performed": provider.get("new_requests", 0) > 0 or bool(chunks),
             "reused_chunks": provider.get("reused_requests", 0)}
+
+
+def _no_words(chunk: dict[str, Any]) -> bool:
+    response = chunk.get("raw_response") or {}
+    return "ASR_RESPONSE_HAVE_NO_WORDS" in (chunk.get("provider_error_code"),
+        chunk.get("provider_error_message"), response.get("code"), response.get("message"))
+
+
+def _chunk_completed(chunk: dict[str, Any]) -> bool:
+    return (chunk.get("no_speech") is True or _no_words(chunk) or
+            (isinstance(chunk.get("http_status"), int) and 200 <= chunk["http_status"] < 300) or
+            any((event.get("header") or {}).get("event") == "task-finished"
+                for event in chunk.get("raw_events") or []))
 
 
 def _provider_chunk_text(chunk: dict[str, Any], protocol: str) -> str:
@@ -693,7 +793,7 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
                           broker_error: str = "", state_path: Path | None = None,
                           config_path: Path | None = None) -> dict[str, Any]:
     root = root.resolve()
-    intent = _bounded_intent(intent_path, root)
+    intent = _bounded_intent(intent_path, root, require_audio=False)
     config = load_cloud_config(config_path or root.parents[1] / "configs" / "models.yaml")
     job_id = intent["job_id"]
     result_path = root / (job_id + ".result.json")
@@ -739,16 +839,16 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
             chunks.append({"index": raw["index"], "start_ms": raw["start_ms"],
                 "end_ms": raw["end_ms"], "audio_sha256": raw["audio_sha256"],
                 "provider_request_id": raw.get("provider_request_id"),
+                "status": "succeeded" if text else ("no_speech" if
+                    provider.get("status") == "succeeded" or _chunk_completed(raw) else "failed"),
+                "provider_error_code": raw.get("provider_error_code"),
+                "provider_error_message": raw.get("provider_error_message"),
                 "text": text, "usage": _provider_chunk_usage(raw, str(provider.get("protocol"))),
                 "raw_response": raw.get("raw_response"),
                 "raw_events": raw.get("raw_events")})
         texts = [chunk["text"] for chunk in chunks if chunk["text"]]
         status = provider.get("status")
-        if status == "succeeded" and len(texts) != len(chunks):
-            status = "failed"
-            error_code = "provider_transcript_missing"
-        else:
-            error_code = str(provider.get("error_code") or "")
+        error_code = str(provider.get("error_code") or "")
         final.update(status=status, error_code=error_code,
             model=provider.get("model"), protocol=provider.get("protocol"),
             provider_endpoint=provider.get("provider_endpoint"),
@@ -788,4 +888,31 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
     if final["status"] == "succeeded":
         (root / (job_id + ".transcript.txt")).write_text(final["text"] + "\n", encoding="utf-8")
     _local_sidecar(intent, final)
+    if final["status"] == "succeeded":
+        cleanup_completed_cloud_work(result_path)
     return final
+
+
+def cleanup_completed_cloud_work(result_path: Path) -> bool:
+    """Remove generated audio/body copies only after a retained successful result."""
+    result = _read_json(result_path)
+    if not result or result.get("status") != "succeeded":
+        return False
+    try:
+        job_id = str(uuid.UUID(str(result.get("job_id"))))
+    except ValueError:
+        return False
+    if result_path.name != job_id + ".result.json" or result_path.with_name(job_id + ".pending.json").exists():
+        return False
+    work = result_path.with_name(job_id + ".work")
+    intent = (_read_json(result_path.with_name(job_id + ".intent.json")) or
+              _read_json(result_path.with_name(job_id + ".done.json")))
+    source = Path(str((intent or {}).get("audio_path") or ""))
+    if not source.is_file() or source.resolve().is_relative_to(work.resolve()):
+        return False
+    try:
+        if work.exists():
+            shutil.rmtree(work)
+    except OSError:
+        return False
+    return True

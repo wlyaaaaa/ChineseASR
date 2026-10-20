@@ -39,7 +39,7 @@ class OfflineBundleTests(unittest.TestCase):
                                   "sense": {"adapter": "funasr", "model": "iic/Sense",
                                             "vad_model": "vad"},
                                   "optional": {"adapter": "funasr", "model": "iic/Missing"},
-                                  "whisper": {"adapter": "whisper", "model": "openai/whisper"}},
+                                  "unavailable": {"adapter": "missing", "model": "example/unavailable"}},
                       "alignment": {"model_dir": "models/aligner/Aligner"}}
             config_path = root / "models.yaml"
             config_path.write_text(yaml.safe_dump(config), encoding="utf-8")

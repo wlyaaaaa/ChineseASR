@@ -17,7 +17,7 @@ RESULT_SCHEMAS = {"important_evidence": "chineseasr.qwen-audio3-important-result
                   "quality_review": "chineseasr.qwen-audio3-quality-review-result.v1"}
 sys.path.insert(0, str(ROOT / "src"))
 from zh_asr.cloud_review import (CloudReviewError, auto_cloud_status,
-    compare_text, load_cloud_config, local_review_signals, pause_message)
+    compare_text, load_cloud_config, local_review_signals, pause_message, cleanup_completed_cloud_work)
 
 
 def _write_sidecar(out_dir: str, payload: dict) -> None:
@@ -87,6 +87,7 @@ def _link_result(group: dict, result_path: Path, *, reused: bool = False) -> boo
         _result_key(group["audio_sha256"], group["channel_index"],
                     "important_evidence" if group["important"] else "quality_review")):
         return False
+    cleanup_completed_cloud_work(result_path)
     for run in group["local_runs"]:
         reasons, local_text = local_review_signals(Path(run["out_dir"]),
             evidence_status=run["evidence_status"], important=run["important"])

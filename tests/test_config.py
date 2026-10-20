@@ -21,22 +21,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(spec.vad_model, "fsmn-vad")
         self.assertEqual(spec.punc_model, "ct-punc")
         self.assertIsNone(spec.spk_model)
-        self.assertFalse(spec.is_whisper)
-
-    def test_fun_asr_nano_is_an_explicit_gpu_flagship_profile(self):
-        from zh_asr.config import get_engine_spec
-
-        spec = get_engine_spec("fun-asr-nano")
-
-        self.assertEqual(spec.adapter, "funasr")
-        self.assertEqual(spec.role, "gpu_flagship")
-        self.assertEqual(spec.model, "FunAudioLLM/Fun-ASR-Nano-2512")
-        self.assertEqual(spec.vad_model, "fsmn-vad")
-        self.assertEqual(spec.language, "中文")
-        self.assertTrue(spec.options["requires_gpu"])
-        self.assertEqual(spec.options["runtime"], "funasr-automodel")
-        self.assertEqual(spec.options["model_revision"], "05201c46f1c38592b1567f857c0d56eab3d0d8ef")
-        self.assertTrue(spec.options["trust_remote_code"])
 
     def test_paraformer_is_an_explicit_timestamped_anonymous_diarization_profile(self):
         from zh_asr.config import get_engine_spec
@@ -53,14 +37,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(spec.vad_model, "fsmn-vad")
         self.assertEqual(spec.punc_model, "ct-punc")
         self.assertEqual(spec.spk_model, "cam++")
-
-    def test_whisper_is_marked_as_fallback_only(self):
-        from zh_asr.config import get_engine_spec
-
-        spec = get_engine_spec("whisper-large-v3")
-
-        self.assertTrue(spec.is_whisper)
-        self.assertEqual(spec.role, "fallback")
 
     def test_unknown_engine_raises_clear_error(self):
         from zh_asr.config import get_engine_spec
@@ -98,17 +74,6 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(any(line.startswith("more-itertools>=") for line in requirements))
         self.assertTrue(any(line.startswith("rapidfuzz>=") for line in requirements))
         self.assertTrue(any(line.startswith("websockets>=") for line in requirements))
-
-    def test_llm_arbitration_defaults_to_disabled_ollama_with_keep_alive_zero(self):
-        import yaml
-
-        data = yaml.safe_load((PROJECT_ROOT / "configs" / "models.yaml").read_text(encoding="utf-8"))
-        arbitration = data["llm_arbitration"]
-
-        self.assertFalse(arbitration["enabled"])
-        self.assertEqual(arbitration["provider"], "ollama")
-        self.assertEqual(arbitration["model"], "qwen-main-v1:latest")
-        self.assertEqual(arbitration["keep_alive"], 0)
 
     def test_qwen3_asr_is_registered_as_strict_primary_candidate(self):
         from zh_asr.config import get_engine_spec

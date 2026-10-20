@@ -28,7 +28,6 @@ class EngineSpec:
     punc_model: str | None = None
     spk_model: str | None = None
     language: str = "auto"
-    is_whisper: bool = False
     note: str = ""
     options: dict[str, Any] | None = None
 
@@ -117,7 +116,7 @@ def list_transcription_engine_names(config: ModelConfig | None = None) -> tuple[
     model_config = config or MODEL_CONFIG
     from .adapters import ADAPTERS
     return tuple(sorted(name for name, spec in model_config.engines.items()
-                        if spec.adapter in ADAPTERS and not spec.is_whisper))
+                        if spec.adapter in ADAPTERS))
 
 
 def _configured_model_config_path() -> Path:
@@ -152,7 +151,6 @@ def _parse_engines(raw: Any, path: Path) -> dict[str, EngineSpec]:
             punc_model=_optional_str(item.get("punc_model")),
             spk_model=_optional_str(item.get("spk_model")),
             language=str(item.get("language", "auto")).strip(),
-            is_whisper=bool(item.get("is_whisper", False)),
             note=str(item.get("note", "")).strip(),
             options=dict(_mapping(item.get("options", {}), f"engines.{name}.options", path)),
         )
@@ -239,13 +237,12 @@ def _parse_quality_configuration(data, engines, path):
         primary, secondary = profile.get("primary_engine"), profile.get("secondary_engine")
         if primary not in engines or secondary not in engines or primary == secondary:
             raise ValueError(f"profiles.{name} requires two different configured engines")
-        if any(engines[x].is_whisper for x in (primary, secondary)):
-            raise ValueError(f"profiles.{name} selects an unintegrated engine")
     return quality, alignment, profiles
 
 
 def resolve_profile(config: ModelConfig, name: str | None = None,
                     primary: str | None = None, secondary: str | None = None) -> tuple[str, str]:
+    from .adapters import ADAPTERS
     profile = {}
     if name:
         if name not in config.profiles:
@@ -254,7 +251,7 @@ def resolve_profile(config: ModelConfig, name: str | None = None,
     first = primary or profile.get("primary_engine") or config.strict_primary_engine
     second = secondary or profile.get("secondary_engine") or config.strict_secondary_engine
     for value in (first, second):
-        if value not in config.engines or config.engines[value].is_whisper:
+        if value not in config.engines or config.engines[value].adapter not in ADAPTERS:
             raise ValueError(f"Profile selects an unavailable transcription engine: {value}")
     if first == second:
         raise ValueError("Strict ASR requires two different engines")

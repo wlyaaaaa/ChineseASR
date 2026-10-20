@@ -4,7 +4,7 @@
 
 一次文件转写：录音 → `Qwen3-ASR-1.7B` 主转写、`SenseVoiceSmall` 对照 → 标出两路不一致、静音出字、异常重复等疑点 → 回听复核。最短入口见下文「一分钟使用」：通过本地接口提交任务、先返回任务状态，调用方不会被长时间卡住。
 
-`ChineseASR` 是一个本地优先的中文语音转文字项目，目标是把中文录音转成可审计、低幻觉、可复现的文本。它面向 Windows + CUDA 工作站，默认 quick 使用 `SenseVoiceSmall`，strict 使用 `Qwen3-ASR-1.7B + SenseVoiceSmall`。FunASR 官方 GPU flagship `Fun-ASR-Nano-2512` 已作为显式 `fun-asr-nano` 引擎提供，但不会因为安装完成而改变 quick 默认；可选的 `FireRedASR2-LLM` 是 `high_quality` 路线的词汇主引擎，也不会自动取代默认 strict 组合。
+`ChineseASR` 是一个本地优先的中文语音转文字项目，目标是把中文录音转成可审计、低幻觉、可复现的文本。它面向 Windows + CUDA 工作站，默认 quick 使用 `SenseVoiceSmall`，strict 使用 `Qwen3-ASR-1.7B + SenseVoiceSmall`。可选的 `FireRedASR2-LLM` 是 `high_quality` 路线的词汇主引擎，不会自动取代默认 strict 组合。
 
 项目同时提供录音转写和 Windows 桌面语音输入。本文是使用入口；项目执行规则见 `AGENTS.md`，机器状态以 PCConfig 和 Windows 现场为准。
 
@@ -60,7 +60,7 @@
 
 CI 在干净 Windows 运行器上安装 FFmpeg 和无 GPU 测试依赖，仍使用同一条 `unittest discover` 命令。需要预先下载 Qwen 模型缓存的个别测试在缓存缺失时明确跳过，其余测试继续执行；完整本机环境仍跑全部可用测试。
 
-软件测试和公开样例的结果只说明实际验证过的集成、恢复和故障边界，不能代表个人麦克风效果或通用中文准确率。默认模型提升仍需要同口径 holdout 证据；Ollama 纯文本仲裁继续默认关闭，不作为词汇真相裁决。Skill 的调用/维护说明和 PCConfig 的机器恢复契约已同步，项目业务事实仍以本仓库配置与实现为准。
+软件测试和公开样例的结果只说明实际验证过的集成、恢复和故障边界，不能代表个人麦克风效果或通用中文准确率。默认模型提升仍需要同口径 holdout 证据。Skill 的调用/维护说明和 PCConfig 的机器恢复契约已同步，项目业务事实仍以本仓库配置与实现为准。
 
 维护关闭标准继续是：
 
@@ -91,11 +91,9 @@ CI 在干净 Windows 运行器上安装 FFmpeg 和无 GPU 测试依赖，仍使�
 | `strict` 主引擎 | `qwen3-asr-1.7b` | 准确率优先的中文主转写线，基于 Qwen3-ASR 权重和 `qwen-asr` runtime |
 | `strict` 对照引擎 | `sensevoice` | 快速中文声学锚点，用于发现分歧和疑似幻觉 |
 | `quick` | `sensevoice` | 单模型快速转写 |
-| 显式 GPU flagship | `fun-asr-nano` | `FunAudioLLM/Fun-ASR-Nano-2512`；需要 GPU，作为较重的 LLM-ASR 候选，不改变 quick 默认 |
 | 可选证据级词汇主引擎 | `fireredasr2-llm` | 隔离在 WSL 中运行；仅在显式选择时作为 strict 主引擎 |
-| 疑难录音云复核 | `qwen-audio-3.1-asr-flash` / `qwen-audio-3.1-asr-flash-message` | 短录音、方言、说话人分离用 Flash；热词及较长录音用 Message 分段实时流；3.0 保留显式后备。模型与路由见 `configs/models.yaml` |
+| 疑难录音云复核 | `qwen-audio-3.1-asr-flash` / `qwen-audio-3.1-asr-flash-message` | 短录音、方言、说话人分离用 Flash；热词及较长录音用 Message 分段实时流。模型与路由见 `configs/models.yaml` |
 | 显式时间线/匿名说话人 baseline | `paraformer` | 固定 `speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4`，输出逐句 `sentence_info` 时间和 CAM++ 匿名聚类；已知两方通话的调用方可传 `--preset-spk-num 2`，省略时自动聚类；不改变 quick/strict 默认 |
-| 未接通的配置占位 | `whisper-large-v3` | 配置存在，但当前没有 Whisper adapter；不能把它当作已经可运行的 fallback |
 
 **Paraformer 逐句时间先核实再截证据**：`sentence_info` 的时间只用来定位。时间不可靠时（与回听、云端分段时间或另一路结果对不上，或出现只有标点的空句），截取证据前先用 ffmpeg 按候选时间截出该段（前后各留几秒），单独放进一个文件夹用 `scripts\transcribe-folder.ps1`（strict）重新听写，确认片段里就是要截的那几句，再按核实过的时间截取。
 
@@ -135,9 +133,6 @@ cd <repo-root>
 
 # 快速单模型，只在明确接受较少审计时使用
 .\scripts\asr-smart.ps1 -Audio C:\path\to\audio.wav -Mode quick -WaitSec 15 -Json
-
-# 显式使用 FunASR GPU flagship；不会改变 quick 默认
-.\scripts\asr-smart.ps1 -Audio C:\path\to\audio.wav -Mode quick -Engine fun-asr-nano -Device cuda:0 -WaitSec 15 -Json
 
 # 批量转写文件夹
 .\scripts\transcribe-folder.ps1 -InputDir C:\path\to\audio-folder
@@ -190,24 +185,24 @@ cd <repo-root>
 
 ## 重要录音与存疑质量复核云入口
 
-`scripts\asr-professional-cloud.ps1` 是唯一的云上传入口。3.1 Flash 用 HTTPS Base64，按配置每段最多 120 秒；3.1 Flash-Message 用 WebSocket，把本地录音切成最多 30 秒的单声道 PCM 段逐段送入。Message 是实时接口，不能直接提交长文件。录音原件及声道来源不改动；需要说话人分离时选 Flash，返回的说话人编号只在单段内有效。Filetrans 虽能处理长录音，但要求公网可访问 URL，本项目不使用。3.0 保留为显式 `-Legacy` 后备，不参加自动上传。
+`scripts\asr-professional-cloud.ps1` 是唯一的云上传入口。3.1 Flash 用 HTTPS Base64，按配置每段最多 120 秒；3.1 Flash-Message 用 WebSocket，把本地录音切成最多 30 秒的单声道 PCM 段逐段送入。Message 是实时接口，不能直接提交长文件。录音原件及声道来源不改动；需要说话人分离时选 Flash，返回的说话人编号只在单段内有效。Filetrans 虽能处理长录音，但要求公网可访问 URL，本项目不使用。
 
 入口在创建任务和读取音频前要求一个且仅一个用途开关，以及下列一种上传依据：
 
 1. `-Important`：当前录音已被明确归类为重要或专业录音。请求仍写入 `importance=important`，回执仍为 `important_only=true`；
 2. `-QualityReview`：仅用于已授权、当前选定的普通存疑本地转写质量复核。请求写入独立的 `purpose=quality_review`，没有 `importance` 字段，回执为 `important_only=false`；
 3. `-CloudUploadAuthorized`：调用方确认这次可以上传；或 `-AutomaticReview -LocalOutDir <本地结果目录>`：只在目录内已有疑难证据时，沿自动复核许可执行（决定：功能原话补录 FY03；9/26 疑难录音自动云复核的费用边界）；
-4. Password Center 对配置的受管目标及 worker 哈希的完整性验证通过。当前配置仍指向已有 `qwen-audio3-asr-important-once`；厂商一把 Key 的最终登记形式由 PCConfig 相关调查确定，本项目不绕过既有固定哈希。3.0 显式后备与 3.1 共用同一 DashScope worker。
+4. Password Center 对配置的受管目标及 worker 哈希的完整性验证通过。当前配置仍指向已有 `qwen-audio3-asr-important-once`；厂商一把 Key 的最终登记形式由 PCConfig 相关调查确定，本项目不绕过既有固定哈希。
 
 两个用途开关不能同时使用。普通质量复核不会自动启动 FireRed、Qwen 或其它本地双引擎；只有结果与上下文仍有影响理解的分歧时，才按实际需要回核原音和本地结果。重要证据录音仍适用下文的本地证据链与人工核听要求。
 
-流水线先按 `configs/models.yaml` 选模型、接口类型和免费期，抽取指定声道、重采样并在本机切段；请求只引用 `outputs\cloud-jobs` 内的音频段。受管 `scripts\qwen_audio3_broker_worker.py` 是自成一体的单文件，仅从 Password Center 的 SecretRef 接收 Key，校验请求根与音频段，按请求明写的 `http` 或 `websocket` 类型送往写死的北京 DashScope 地址，并留原始响应、HTTP 状态与 usage。worker 不导入本项目其它源码，也不读模型配置；模型名只检查基本字符格式，不设模型族白名单。模型或流水线配置更新无需因此重新固定 worker 哈希；worker 本身修改仍须由受管目标核对其新哈希。Key 不进入命令行、请求文件、结果或日志。WebSocket 使用现有 venv 的 websockets 客户端完成标准库缺少的握手和二进制帧。
+持钥传输由密码中心 `vendor_api_worker.py` 负责（受管目标 `qwen-audio3-asr-important-once`，PCConfig 安装并固定哈希），本项目只准备请求。
 
-每次尝试都在被 Git 忽略的 `outputs\cloud-jobs` 留请求、供应商原始结果、投影结果、原音哈希、模型、时间及每段 usage；这些是作业记录，本地不预留或计算剩余额度。百炼官方的 3.1 计量是 Token，3.0 是音频秒数，但本地不以此拦截调用。
+每次尝试都在被 Git 忽略的 `outputs\cloud-jobs` 留请求、供应商原始结果、投影结果、原音哈希、模型、时间及每段 usage；这些是作业记录，本地不预留或计算剩余额度。百炼官方的 3.1 计量是 Token，但本地不以此拦截调用。
 
 3.1 Flash-Message 的 WebSocket `result-generated.payload.usage` 是该段任务截至当前事件的**累计**用量，`task-finished.payload.usage` 是最终累计用量（[官方服务端事件说明](https://help.aliyun.com/zh/model-studio/qwen-asr-message-server-events)）。结果投影每段优先取最后一个非空 `task-finished` 用量；若完成事件没有用量，取最后一个非空 `result-generated` 用量，不把递增快照相加。作业级 `usage` 只在所有音频段均有相同的数值字段时逐字段相加；任何一段缺失或字段不一致则保留 `null`，不把未知当作零。这里的 `duration` 是供应商逐段报告的累计音频秒数之和，不是去重后的源音时长，也不用于本地额度计算。
 
-免费期截止日写在 `configs/models.yaml` 的每个云模型 `free_until` 中，按北京时间的带时区时刻作不含截止点的比较。3.1 两款按本人转述的 2026-12-21 暂取当日 00:00 早停；3.0 暂取 2026-09-27 02:00，均不是控制台实时核验的到期时刻。自动模式过期不上传并写 `cloud.review.json`；换成新模型或更新确有新免费期的日期后恢复。显式 `-CloudUploadAuthorized` 不受日期阻断，但过期结果标「可能计费」。这只比日期，不算用量。
+免费期截止日写在 `configs/models.yaml` 的每个云模型 `free_until` 中，按北京时间的带时区时刻作不含截止点的比较。3.1 两款按本人转述的 2026-12-21 暂取当日 00:00 早停，不是控制台实时核验的到期时刻。自动模式过期不上传并写 `cloud.review.json`；换成新模型或更新确有新免费期的日期后恢复。显式 `-CloudUploadAuthorized` 不受日期阻断，但过期结果标「可能计费」。这只比日期，不算用量。
 
 百炼返回免费额度用尽、欠费、余额不足、无权限或模型下线类错误时，`outputs\cloud-jobs\auto-cloud-state.json` 记录停用原因，后续疑难作业保留本地转写并在 `cloud.review.json` 写明云端未跑及原因。`python scripts/cloud-review-state.py status` 回执含 `enabled`、`free_until`、各自动路由模型的 `model_free_until`、`reason` 和 `failure_reason`，供驾驶舱读取。要主动停用时运行 `python scripts/cloud-review-state.py pause --reason "暂停原因"`；手动暂停不会因模型或免费期配置变化自动解除。本人说恢复时运行 `python scripts/cloud-review-state.py resume`；配置新增或替换模型 ID、更新免费期日期，或 `credit_cycle` 更新为实际新额度时，只解除旧供应商停用。恢复操作仍受免费期限制。网络抖动、超时、限流与服务端 5xx 只记本次失败，不触发持久停用。百炼的「免费额度用完即停」保持不启用，此入口不以该开关为条件（决定：9/26 疑难录音自动云复核的费用边界）。
 
@@ -234,7 +229,7 @@ cd <repo-root>
 .\scripts\setup-core.ps1
 ```
 
-核心依赖文件 `requirements-core.txt` 固定 `funasr==1.4.14`。Fun-ASR-Nano 是面向 GPU 的较重模型，先完成 CUDA/PyTorch 与核心依赖安装，再按需下载；不需要 Nano 的机器无需额外安装模型。
+核心依赖文件 `requirements-core.txt` 固定 `funasr==1.4.14`。先完成 CUDA/PyTorch 与核心依赖安装，再按需下载模型。
 
 `pyproject.toml` 有意不声明运行依赖：`pip install .` 只安装项目入口，不会下载 CUDA/PyTorch、模型框架或模型权重。完整本机环境按上面的安装脚本和 `requirements-core.txt` 配置；CI 直接读取项目的核心、听写和 Qwen 依赖文件安装测试环境，不另列软件包清单，不下载模型权重或运行 GPU 推理。
 
@@ -243,15 +238,6 @@ cd <repo-root>
 ```powershell
 .\scripts\download-models.ps1 -Engine sensevoice
 ```
-
-按需下载官方 GPU flagship `Fun-ASR-Nano-2512`：
-
-```powershell
-.\scripts\download-models.ps1 -Engine fun-asr-nano
-```
-
-该命令只准备显式 profile 的模型，不会把它设为默认 quick 引擎；profile 固定 ModelScope revision
-`05201c46f1c38592b1567f857c0d56eab3d0d8ef` 并启用官方 `trust_remote_code` 加载路径。没有可用 CUDA GPU 时继续使用 `sensevoice`。
 
 strict 主线需要 Qwen ASR runtime 和权重：
 
@@ -494,20 +480,6 @@ strict audit v2 保留两路引擎的原始文本、raw JSON 引用、provenance
 新生成的 strict bundle 使用包内相对引用，并由 receipt 绑定六项内容产物；完整目录复制
 到归档盘后仍可复验。旧版绝对引用在原位置继续兼容，但不会伪装成可搬迁包。
 
-## LLM 仲裁
-
-LLM 仲裁配置在 `configs\models.yaml` 的 `llm_arbitration`，默认关闭。
-
-当前设计是本地 Ollama evidence-only 仲裁：
-
-- 只读取 ASR audit 证据，不读取音频。
-- 只在 chunk 有 `flags`、`needs_review` 或低相似度时触发。
-- 仲裁结果写入 merged audit / metrics。
-- 不覆盖 raw ASR JSON。
-- 默认 `keep_alive=0`，避免长期占用 GPU。
-
-默认关闭是有意设计：基础转写链路必须在没有 Ollama、没有额外 GPU 驻留、没有 LLM 最终猜测时也能稳定工作。
-
 ## 评测与 Benchmark
 
 生成隐私友好的本地合成/对抗评测集：
@@ -534,7 +506,7 @@ benchmark 按文件 stem 匹配音频和 truth，写 `_manifest\manifest.json`�
 
 当前唯一的离线备用在 `E:\Projects\Tools\ChineseASR\offline\current\`，属于 PCConfig 已登记的 ChineseASR 项目运行数据，不进 Git，也不由现有每日备份再复制到 G/H。它是防模型或依赖包上游撤包的本机备用；E 盘本身损坏时，这份备用也不可用。
 
-备份从 `configs/models.yaml` 选择已安装、已接入适配器的引擎和支持模型：日常 quick/strict、`high_quality` 的 FireRed、显式 Paraformer/Fun-ASR、说话人模型和强制对齐器。另存 Windows 已安装环境及 FireRed WSL 隔离环境各自固定版本的 wheel、FireRed 固定提交的源码归档，以及源/副本 SHA-256 清单；不收下载缓存、示例、录音、转写正文或虚拟环境。Whisper 没有可运行适配器，不进入备份。两套 wheelhouse 的 Python/平台不同，不能混装。
+备份从 `configs/models.yaml` 选择已安装、已接入适配器的引擎和支持模型：日常 quick/strict、`high_quality` 的 FireRed、显式 Paraformer、说话人模型和强制对齐器。另存 Windows 已安装环境及 FireRed WSL 隔离环境各自固定版本的 wheel、FireRed 固定提交的源码归档，以及源/副本 SHA-256 清单；不收下载缓存、示例、录音、转写正文或虚拟环境。两套 wheelhouse 的 Python/平台不同，不能混装。
 
 模型或依赖升级并完成运行时验证后，在**同一次升级流程**里刷新备用：
 
@@ -564,7 +536,7 @@ $env:ZH_ASR_MODEL_CONFIG='C:\path\to\models.yaml'
 .\scripts\smoke-asr-smart.ps1 -Json
 ```
 
-新增不同运行时，例如 Whisper 本地实现、其他 LLM 音频模型或云 API，应新增 adapter，并保持 pipeline 只依赖统一的 `generate(...)` 输出形状。
+新增不同运行时，例如新的本地语音模型或云 API，应新增 adapter，并保持 pipeline 只依赖统一的 `generate(...)` 输出形状。
 
 ## 测试
 
@@ -639,10 +611,6 @@ LocalGpuBroker 不可用、同族 ChineseASR 已在运行、Ollama 重型请求/
 
 这表示模型证据不足、两路分歧大、某一路失败或命中风险规则。正文不强装确定，细节看 `strict.audit.md` 和 `strict.audit.json`。
 
-**是否会自动使用 LLM 猜最终答案？**
-
-不会。Ollama 仲裁默认关闭，并且只读取 audit 证据。需要时在 `configs\models.yaml` 显式打开。
-
 **换更强模型要改代码吗？**
 
 通常不用。优先改 `configs\models.yaml`，只有新增运行时时才写 adapter。
@@ -660,11 +628,14 @@ LocalGpuBroker 不可用、同族 ChineseASR 已在运行、Ollama 重型请求/
 用途判断都不进入持钥程序，也不产生新凭据登记。
 
 一次调用保留 `<job_id>.intent.json`、`<job_id>.unclaimed.json`、`.provider.json` 和检查点。
-恢复同一次作业时，用已安装的 `Invoke-PasswordCenterVendor.ps1 -Vendor qwen -RequestPath
-<原 unclaimed.json> -Json`，随后用 `scripts/cloud-review-pipeline.py finalize --root <原请求根>
---intent <原 intent.json> --provider <原 provider.json>`。已经成功的 operation 不重发；
+再次运行同样的云入口命令时，会按音频 SHA-256、用途、声道、模型及请求参数接续未完成作业，
+沿用原作业 ID 和请求；也可用 `-ResumeJobId <原作业 ID>` 指定，参数不一致时会说明无法续作。
+已经成功的 operation 由密码中心检查点跳过，不重发。
 `previous_outcome_unknown` 表示服务端是否完成尚不清楚，不自动新建作业。明确允许重试该
 不确定项后，才在原请求添加 `retry_uncertain: true`；请求体、模型及音频摘要仍必须相同。
+成功作业的原始录音、最终正文和云回执保留，生成的 `.work` 切段与 Base64/PCM 中间副本会清理；
+失败、未完成或原始录音已不在的作业继续保留中间文件。空文字或 `ASR_RESPONSE_HAVE_NO_WORDS`
+在结果中标为单段“无语音”；密码中心在中途停下而后续段尚未处理时，整份仍保留失败状态。
 
 厂商传输的执行状态回执现在带有封闭错误码；非法官方主机、管道交付失败和传输失败不会笼统
 显示为 `internal_error`。ASR 的上传授权、免费期和用途判断仍由流水线负责，不能把这些业务

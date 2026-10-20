@@ -5,17 +5,6 @@ strict:
   primary_engine: qwen3-asr-1.7b
   secondary_engine: sensevoice
 
-llm_arbitration:
-  enabled: false
-  provider: ollama
-  base_url: http://127.0.0.1:11434
-  model: qwen-main-v1:latest
-  fallback_model: qwen3.6-27b-256k:latest
-  mode: uncertain_only
-  temperature: 0.1
-  keep_alive: 0
-  timeout_sec: 120
-
 aliases:
   fsmn-vad: iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
   ct-punc: iic/punc_ct-transformer_cn-en-common-vocab471067-large
@@ -80,21 +69,6 @@ engines:
     language: auto
     note: Primary local Chinese lexical verifier; speaker attribution is intentionally disabled.
 
-  fun-asr-nano:
-    adapter: funasr
-    role: gpu_flagship
-    model: FunAudioLLM/Fun-ASR-Nano-2512
-    vad_model: fsmn-vad
-    language: 中文
-    options:
-      requires_gpu: true
-      runtime: funasr-automodel
-      hub: ms
-      model_revision: 05201c46f1c38592b1567f857c0d56eab3d0d8ef
-      trust_remote_code: true
-      remote_code: ./model.py
-    note: Official FunASR GPU flagship; explicit profile only because it is a heavier LLM-ASR path than the SenseVoice quick default.
-
   paraformer:
     adapter: funasr
     role: baseline
@@ -106,14 +80,6 @@ engines:
     options:
       model_revision: v2.0.4
     note: Explicit timestamped Mandarin baseline with anonymous CAM++ diarization; it does not change quick or strict defaults.
-
-  whisper-large-v3:
-    adapter: whisper
-    role: fallback
-    model: openai/whisper-large-v3
-    language: zh
-    is_whisper: true
-    note: Fallback/comparison only; not the primary Chinese low-hallucination path.
 
 # File transcription only. Dictation retains its own in-memory single-model path.
 quality:
@@ -186,11 +152,3 @@ cloud_review:
         task_group: audio
         task: asr
         function: recognition
-    legacy:
-      id: qwen-audio-3.0-asr-flash
-      free_until: '2026-09-27T02:00:00+08:00'
-      api: http
-      max_chunk_sec: 180
-      supports_speaker_diarization: false
-      supports_keep_dialect: false
-      supports_vocabulary: true

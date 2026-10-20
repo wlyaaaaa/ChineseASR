@@ -1292,7 +1292,7 @@ def _model_config(path: Path, *, primary: str, secondary: str):
         default_engine="sensevoice",
         strict_primary_engine=primary,
         strict_secondary_engine=secondary,
-        engines={name: SimpleNamespace(is_whisper=False, options={}) for name in (primary, secondary)},
+        engines={name: SimpleNamespace(adapter="funasr", options={}) for name in (primary, secondary)},
         quality={}, profiles={}, alignment={},
     )
 

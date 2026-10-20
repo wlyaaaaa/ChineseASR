@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import contextmanager
+import logging
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 from zh_asr.adapters.base import MissingDependencyError
@@ -15,6 +18,21 @@ from zh_asr.qwen_identity import (
 )
 from zh_asr.text_normalizer import to_simplified
 from zh_asr.inference_quality import isolated_batch, generation_diagnostics
+
+
+@contextmanager
+def qwen_load_stage(stage: str):
+    """Report load timing only; never include audio, text or model paths."""
+    logger = logging.getLogger("zh_asr.model_loading")
+    started = time.perf_counter()
+    logger.info("model load stage=%s started", stage,
+                extra={"load_stage": stage, "load_state": "started", "load_seconds": 0.0})
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - started
+        logger.info("model load stage=%s seconds=%.3f", stage, elapsed,
+                    extra={"load_stage": stage, "load_state": "finished", "load_seconds": elapsed})
 
 
 class QwenASRAdapter:
@@ -31,10 +49,12 @@ class QwenASRAdapter:
         kwargs, runtime_identity = _prepare_qwen_runtime(
             spec, device, cache_dir, model_aliases
         )
-        from qwen_asr import Qwen3ASRModel
+        with qwen_load_stage("import_qwen_asr"):
+            from qwen_asr import Qwen3ASRModel
 
         model_ref = kwargs.pop("model")
-        model = Qwen3ASRModel.from_pretrained(model_ref, **kwargs)
+        with qwen_load_stage("read_weights"):
+            model = Qwen3ASRModel.from_pretrained(model_ref, **kwargs)
         configure_qwen_audio_attention(model)
         return self.wrap_model(model, spec, runtime_identity=runtime_identity)
 
@@ -153,13 +173,15 @@ def _prepare_qwen_runtime(
     model_aliases: dict[str, str],
 ) -> tuple[dict[str, Any], dict[str, str]]:
     options = spec.options or {}
-    identity = qwen_runtime_identity(spec, cache_dir, model_aliases)
+    with qwen_load_stage("verify_identity"):
+        identity = qwen_runtime_identity(spec, cache_dir, model_aliases)
     kwargs: dict[str, Any] = {
         "model": identity["model_dir"],
         "device_map": device,
     }
     if "dtype" in options:
-        kwargs["dtype"] = _torch_dtype(str(options["dtype"]))
+        with qwen_load_stage("import_torch"):
+            kwargs["dtype"] = _torch_dtype(str(options["dtype"]))
     for key in ("max_inference_batch_size", "max_new_tokens"):
         if key in options:
             kwargs[key] = options[key]

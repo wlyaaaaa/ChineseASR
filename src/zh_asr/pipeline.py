@@ -53,8 +53,6 @@ def build_model(
 ) -> Any:
     model_config = config or load_model_config()
     spec = get_engine_spec(engine, config=model_config)
-    if spec.is_whisper:
-        raise ValueError(f"Engine '{engine}' is fallback/comparison only and cannot be used for direct transcription.")
     cache = prepare_model_env(cache_dir)
     if spec.adapter == "funasr":
         ensure_funasr_available()
@@ -555,10 +553,8 @@ def _engine_generation_kwargs(engine: str, config: ModelConfig) -> dict[str, Any
     """Return explicit inference hints owned by the model registry.
 
     FunASR's ``AutoModel`` does not inherit ``EngineSpec.language`` from its
-    loader configuration.  Supplying the configured hint at generation time is
-    especially important for Fun-ASR-Nano, whose official Chinese route uses
-    the explicit ``中文`` prompt.  Qwen and FireRed adapters own their language
-    handling, so they are intentionally left unchanged here.
+    loader configuration.  Supply the configured hint at generation time;
+    Qwen and FireRed adapters own their language handling.
 
     Engines with a speaker model emit ``sentence_info``; they also return the
     raw timed tokens so ``realign_sentence_info`` can rebuild sentence text.
@@ -573,8 +569,6 @@ def _engine_generation_kwargs(engine: str, config: ModelConfig) -> dict[str, Any
     language = str(spec.language or "").strip()
     if not language or language.lower() == "auto":
         return kwargs
-    if engine == "fun-asr-nano" and language.lower() in {"chinese", "zh", "zh-cn"}:
-        language = "中文"
     kwargs["language"] = language
     return kwargs
 

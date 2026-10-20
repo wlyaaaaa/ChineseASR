@@ -176,7 +176,7 @@ def model_status(config: ModelConfig) -> dict[str, Any]:
     rows = []
     for name, spec in config.engines.items():
         options = spec.options or {}
-        implemented = spec.adapter in ADAPTERS and not spec.is_whisper
+        implemented = spec.adapter in ADAPTERS
         canonical = config.model_aliases.get(spec.model, spec.model)
         directory = (project_path(config, options["model_dir"]) if options.get("model_dir")
                      else default_cache_dir().joinpath(*canonical.split("/")))
@@ -200,12 +200,13 @@ def model_status(config: ModelConfig) -> dict[str, Any]:
 
 def check_updates(config: ModelConfig) -> dict[str, Any]:
     """Report upstream identities only. A newer revision is not quality evidence."""
+    from .adapters import ADAPTERS
     from huggingface_hub import HfApi
     api = HfApi()
     rows = []
     candidates = [(name, spec.model, (spec.options or {}).get("model_revision"),
                    "modelscope" if spec.adapter in {"qwen-asr", "funasr"} else "huggingface")
-                  for name, spec in config.engines.items() if not spec.is_whisper]
+                  for name, spec in config.engines.items() if spec.adapter in ADAPTERS]
     if config.alignment:
         candidates.append(("forced-aligner", config.alignment["model"], config.alignment["model_revision"], "huggingface"))
     for name, repository, active, source in candidates:

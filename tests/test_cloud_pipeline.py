@@ -13,7 +13,7 @@ import wave
 import yaml
 
 from zh_asr.cloud_review import (auto_cloud_status, finalize_cloud_result,
-    prepare_cloud_request, CloudReviewError)
+    prepare_cloud_request, CloudReviewError, _split_prepared_wav)
 from zh_asr.transcript_readback import _inspect_cloud_result_candidate
 
 
@@ -84,9 +84,9 @@ class CloudPipelineTests(unittest.TestCase):
         self.assertFalse(sidecar["cloud_upload_performed"])
 
     def test_explicit_expired_upload_is_allowed_and_marked_billable(self) -> None:
-        intent = self.intent(automatic_review=False, model_profile="legacy")
+        intent = self.intent(automatic_review=False, model_profile="short")
         result = prepare_cloud_request(intent, self.root, CONFIG,
-            now=datetime.fromisoformat("2026-09-27T03:00:00+08:00"))
+            now=datetime.fromisoformat("2026-12-21T01:00:00+08:00"))
         self.assertEqual("ready", result["status"])
         self.assertIn("可能计费", result["billing_warning"])
         request = json.loads(Path(result["request_path"]).read_text(encoding="utf-8"))
@@ -109,6 +109,88 @@ class CloudPipelineTests(unittest.TestCase):
             value = int.from_bytes(chunk.readframes(1)[:2], "little", signed=True)
         self.assertEqual(12000, value)
         self.assertEqual(1, request["selected_channel"])
+
+    def test_short_tail_merges_or_rebalances_within_provider_limit(self) -> None:
+        _wav(self.audio, frames=16000 * 12 + 1600)
+        merged = _split_prepared_wav(self.audio, self.base / "merged",
+            chunk_sec=12, overlap_sec=1, max_chunk_sec=18)
+        self.assertEqual([(0, 12100)], [(c["start_ms"], c["end_ms"]) for c in merged])
+        bounded = _split_prepared_wav(self.audio, self.base / "bounded",
+            chunk_sec=12, overlap_sec=1, max_chunk_sec=12)
+        self.assertEqual(12100, bounded[-1]["end_ms"])
+        self.assertGreaterEqual(bounded[-1]["end_ms"] - bounded[-2]["end_ms"], 5000)
+        self.assertTrue(all(c["end_ms"] - c["start_ms"] <= 12000 for c in bounded))
+        self.assertEqual(1000, bounded[-2]["end_ms"] - bounded[-1]["start_ms"])
+        _wav(self.audio, frames=16000 * 120 + 1600)
+        overlapped = _split_prepared_wav(self.audio, self.base / "overlapped",
+            chunk_sec=120, overlap_sec=119, max_chunk_sec=120)
+        self.assertEqual(2, len(overlapped))
+
+    def test_resume_keeps_original_request_and_parameter_changes_start_new_job(self) -> None:
+        original = self.intent()
+        ready = prepare_cloud_request(original, self.root, CONFIG)
+        pending = Path(ready["request_path"])
+        payload = pending.read_bytes()
+        pending.replace(pending.with_name(ready["job_id"] + ".unclaimed.json"))
+        retry = self.intent()
+        resumed = prepare_cloud_request(retry, self.root, CONFIG)
+        self.assertEqual(ready["job_id"], resumed["job_id"])
+        self.assertEqual(payload, Path(resumed["request_path"]).read_bytes())
+        self.assertFalse(retry.exists())
+        changed = self.intent(overlap_sec=0)
+        fresh = prepare_cloud_request(changed, self.root, CONFIG)
+        self.assertNotEqual(ready["job_id"], fresh["job_id"])
+        with self.assertRaisesRegex(CloudReviewError, "resume_job_not_compatible"):
+            prepare_cloud_request(changed, self.root, CONFIG, resume_job_id=ready["job_id"])
+
+    def test_vendor_no_words_preserves_other_chunks_and_failed_intermediates(self) -> None:
+        _wav(self.audio, frames=16000 * 14)
+        intent = self.intent(chunk_sec=8, overlap_sec=1)
+        ready = prepare_cloud_request(intent, self.root, CONFIG)
+        request = json.loads(Path(ready["request_path"]).read_text(encoding="utf-8"))
+        document = json.loads(intent.read_text(encoding="utf-8"))
+        provider = self.root / (ready["job_id"] + ".provider.json")
+        body = {"schema": "passwordcenter.vendor-result.v1", "vendor": "qwen",
+            "request_sha256": document["vendor_request_sha256"], "status": "failed",
+            "credential_result": "Scope-Error", "error_code": "http_400",
+            "provider_error_message": "ASR_RESPONSE_HAVE_NO_WORDS", "new_requests": 2,
+            "results": [{"id": "1", "http_status": 200,
+                         "raw_response": {"output": {"text": "已有文字"}}}]}
+        pending = Path(ready["request_path"])
+        pending.replace(pending.with_name(ready["job_id"] + ".unclaimed.json"))
+        body["provider_error_message"] = "network_failure"
+        provider.write_text(json.dumps(body), encoding="utf-8")
+        failed = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
+        work = self.root / (ready["job_id"] + ".work")
+        self.assertEqual("failed", failed["status"])
+        self.assertTrue(work.is_dir())
+        body["provider_error_message"] = "ASR_RESPONSE_HAVE_NO_WORDS"
+        provider.write_text(json.dumps(body), encoding="utf-8")
+        final = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
+        self.assertEqual("succeeded", final["status"])
+        self.assertEqual("已有文字", final["text"])
+        self.assertEqual("no_speech", final["chunks"][-1]["status"])
+        self.assertEqual("Success", final["credential_result"])
+        self.assertFalse(work.exists())
+        self.assertTrue(self.audio.is_file())
+        self.assertEqual("已有文字", (self.root / (ready["job_id"] + ".transcript.txt")).read_text().strip())
+        self.audio.unlink()
+        restored = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
+        self.assertEqual("已有文字", restored["text"])
+
+    def test_explicit_resume_after_expiry_updates_warning_without_changing_request(self) -> None:
+        intent = self.intent(automatic_review=False, model_profile="short")
+        ready = prepare_cloud_request(intent, self.root, CONFIG,
+            now=datetime.fromisoformat("2026-10-20T00:00:00+08:00"))
+        payload = Path(ready["request_path"]).read_bytes()
+        retry = self.intent(automatic_review=False, model_profile="short")
+        resumed = prepare_cloud_request(retry, self.root, CONFIG,
+            now=datetime.fromisoformat("2026-12-22T00:00:00+08:00"))
+        self.assertEqual(ready["job_id"], resumed["job_id"])
+        self.assertEqual(payload, Path(resumed["request_path"]).read_bytes())
+        result = finalize_cloud_result(intent, self.root,
+            broker_error="fixture_broker_unavailable", config_path=CONFIG)
+        self.assertIn("可能计费", result["billing_warning"])
 
     def test_model_replacement_capabilities_come_from_config(self) -> None:
         document = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
@@ -218,8 +300,8 @@ class CloudPipelineTests(unittest.TestCase):
         self.assertEqual(4, final["chunks"][0]["usage"]["total_tokens"])
 
     def test_websocket_usage_prefers_final_task_and_sums_one_snapshot_per_chunk(self) -> None:
-        _wav(self.audio, frames=32000)
-        intent = self.intent(model_profile="message", chunk_sec=1, overlap_sec=0)
+        _wav(self.audio, frames=16000 * 12)
+        intent = self.intent(model_profile="message", chunk_sec=6, overlap_sec=0)
         ready = prepare_cloud_request(intent, self.root, CONFIG)
         request = json.loads(Path(ready["request_path"]).read_text(encoding="utf-8"))
         self.assertEqual(2, len(request["chunks"]))

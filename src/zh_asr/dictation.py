@@ -210,10 +210,12 @@ class QwenDictationEngine:
         lease.__enter__()
         self.lease = lease
         try:
+            from .adapters.qwen_asr import qwen_load_stage
             import torch
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA GPU is unavailable.")
-            self.wrapper.model.model.to("cuda:0")
+            with qwen_load_stage("move_to_gpu"):
+                self.wrapper.model.model.to("cuda:0")
         except BaseException:
             self.park()
             raise

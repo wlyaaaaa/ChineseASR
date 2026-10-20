@@ -35,7 +35,17 @@ def _engine_main(connection, settings) -> None:
             os._exit(1)  # Ends a stuck native call and the lease renewal thread.
 
     threading.Thread(target=watch_parent, name="dictation-parent", daemon=True).start()
-    from .dictation import QwenDictationEngine
+    class StageHandler(logging.Handler):
+        def emit(self, record):
+            connection.send({key: getattr(record, key)
+                             for key in ("load_stage", "load_state", "load_seconds")})
+
+    stage_logger = logging.getLogger("zh_asr.model_loading")
+    stage_logger.setLevel(logging.INFO)
+    stage_logger.addHandler(StageHandler())
+    from .adapters.qwen_asr import qwen_load_stage
+    with qwen_load_stage("import_dictation"):
+        from .dictation import QwenDictationEngine
     engine = QwenDictationEngine(settings)
     try:
         while True:
@@ -73,7 +83,7 @@ class ProcessDictationEngine:
     before replacement. Audio travels through an anonymous pipe and never lands
     in the filesystem. Inference may be retried once before returning any text.
     """
-    def __init__(self, settings, *, cancel_event=None, load_timeout=180.0,
+    def __init__(self, settings, *, cancel_event=None, load_timeout=600.0,
                  operation_timeout=60.0, warmup_timeout=40.0, worker_target=None):
         self.settings = settings
         self.cancel_event = cancel_event or threading.Event()
@@ -136,14 +146,19 @@ class ProcessDictationEngine:
         deadline = started + (self.operation_timeout if timeout is None else timeout)
         try:
             connection.send((operation, argument))
-            while not connection.poll(0.1):
+            while True:
+                if connection.poll(0.1):
+                    response = connection.recv()
+                    if "load_stage" not in response:
+                        break
+                    LOG.info("dictation model stage=%s state=%s seconds=%.3f",
+                             response["load_stage"], response["load_state"], response["load_seconds"])
                 if self.cancel_event.is_set():
                     raise DictationWorkerCancelled("Dictation operation cancelled")
                 if not process.is_alive():
                     raise DictationWorkerFailure(f"Model process exited during {operation}")
                 if time.monotonic() >= deadline:
                     raise DictationWorkerFailure(f"Model operation timed out: {operation}")
-            response = connection.recv()
         except (EOFError, BrokenPipeError, OSError, DictationWorkerFailure, DictationWorkerCancelled) as error:
             self._stop()
             if isinstance(error, DictationWorkerCancelled):

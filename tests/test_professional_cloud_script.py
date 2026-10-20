@@ -45,6 +45,10 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
     [string]$ResultCode, [string]$OperationId, [string]$SecretRefRequestPath, [switch]$Json)
 $root = '%s'
 if ($Action -eq 'AgentSecretRef') {
+    if (Test-Path (Join-Path $root 'deny.marker')) {
+        [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"error","error":"runtime_rebind_required"}')
+        exit 3
+    }
     [IO.File]::WriteAllText((Join-Path $root ($Query + '.provider.json')), '{}')
     [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"ok","action":"AgentSecretRef"}')
     exit 0
@@ -62,8 +66,12 @@ root = Path(sys.argv[sys.argv.index('--root') + 1])
 intent = json.loads(Path(sys.argv[sys.argv.index('--intent') + 1]).read_text(encoding='utf-8'))
 job_id = intent['job_id']
 if action == 'prepare':
+    if '--resume-job-id' in sys.argv:
+        job_id = sys.argv[sys.argv.index('--resume-job-id') + 1]
     (root / (job_id + '.pending.json')).write_text('{}', encoding='utf-8')
     print(json.dumps({'status': 'ready', 'secret_ref_target': job_id,
+                      'job_id': job_id, 'intent_path': str(root / (job_id + '.intent.json')),
+                      'request_path': str(root / (job_id + '.pending.json')),
                       'credential_ref': 'fixture'}))
 else:
     result = {'schema': 'chineseasr.qwen-audio3-quality-review-result.v1',
@@ -71,6 +79,8 @@ else:
               'important_only': False, 'status': 'succeeded', 'error_code': '',
               'credential_result': 'Success', 'cloud_upload_performed': True,
               'text': 'fixture transcript'}
+    if '--broker-error' in sys.argv:
+        result.update(status='failed', error_code=sys.argv[sys.argv.index('--broker-error') + 1])
     (root / (job_id + '.result.json')).write_text(json.dumps(result), encoding='utf-8')
     print(json.dumps({'status': 'succeeded'}))
 """, encoding="utf-8")
@@ -116,6 +126,14 @@ else:
             self.assertEqual("AgentSecretRef", log["agent_secret_ref_receipt"]["action"])
             self.assertEqual("ReportCredentialResult",
                 log["credential_result_report_receipt"]["action"])
+            if not relative_paths:
+                (request_root / 'deny.marker').touch()
+                retry = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File",
+                    *arguments, "-ResumeJobId", receipt["job_id"]], cwd=root,
+                    capture_output=True, text=True, encoding="utf-8", timeout=60,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self.assertEqual(3, retry.returncode, retry.stdout + retry.stderr)
+                self.assertEqual("runtime_rebind_required", json.loads(retry.stdout)["error_code"])
 
     def test_relocated_script_uses_its_own_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

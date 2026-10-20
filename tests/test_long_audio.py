@@ -17,7 +17,6 @@ MODEL_CACHE_TESTS = {
     "test_long_resume_reprocesses_chunk_when_receipt_bound_text_is_tampered",
     "test_long_resume_reprocesses_chunk_when_required_raw_is_missing",
     "test_merged_transcript_removes_only_exact_adjacent_overlap",
-    "test_run_long_transcription_arbitrates_only_flagged_chunks",
     "test_run_long_transcription_bounds_batches_and_continues_after_batch_failure",
     "test_run_long_transcription_default_batches_pending_chunks_and_preserves_resume_force",
     "test_run_long_transcription_fingerprint_includes_device_cache_and_runtime_receipt",
@@ -586,41 +585,6 @@ class LongAudioTests(unittest.TestCase):
         self.assertEqual((1, 1, 0), (resumed.processed, resumed.skipped, resumed.failed))
         self.assertEqual("verified", resumed.evidence_status)
 
-    def test_run_long_transcription_arbitrates_only_flagged_chunks(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            audio = root / "meeting.wav"
-            out_dir = root / "out"
-            _write_wav(audio, seconds=4)
-
-            def fake_strict(audio_path, **kwargs):
-                conflict = audio_path.stem == "chunk-000002"
-                return _write_fake_outputs(
-                    audio_path,
-                    kwargs["out_dir"],
-                    f"文本 {audio_path.stem}",
-                    primary_engine=kwargs["primary_engine"],
-                    secondary_engine=kwargs["secondary_engine"],
-                    primary_text=(
-                        f"甲方明确表示不同意 {audio_path.stem}"
-                        if conflict
-                        else None
-                    ),
-                    secondary_text=(
-                        f"乙方完全没有相关表态 {audio_path.stem}"
-                        if conflict
-                        else None
-                    ),
-                )
-
-            arbiter = _FakeArbiter()
-
-            run_long_transcription(audio, out_dir, chunk_sec=2, overlap_sec=0, strict_fn=fake_strict, arbiter=arbiter)
-            metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
-
-        self.assertEqual(["chunk-000002"], arbiter.calls)
-        self.assertEqual("LLM 仲裁文本", metrics["chunks"][1]["arbitration"]["final_text"])
-
     def test_run_long_transcription_uses_both_engine_capabilities_and_records_effective_chunk(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1091,20 +1055,6 @@ def _model_config(
         strict_secondary_engine=secondary,
         engines=engines,
     )
-
-
-class _FakeDecision:
-    def to_dict(self):
-        return {"final_text": "LLM 仲裁文本", "confidence": 0.9}
-
-
-class _FakeArbiter:
-    def __init__(self):
-        self.calls = []
-
-    def arbitrate(self, evidence):
-        self.calls.append(evidence.chunk_id)
-        return _FakeDecision()
 
 
 if __name__ == "__main__":

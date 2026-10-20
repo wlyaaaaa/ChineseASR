@@ -12,7 +12,6 @@
 2. `strict.primary_engine` / `strict.secondary_engine` 决定严格模式双模型组合。
 3. `aliases` 记录 VAD、标点、说话人等可复用模型别名；`speaker_verification` 只配置按需的本地 `person:self` CAM++ 锚，不进入默认转写。
 4. `engines.*.adapter` 决定运行时适配器；当前已实现 `funasr`、`qwen-asr` 和 `firered-worker`。
-5. `llm_arbitration` 配置本地 Ollama 仲裁，默认关闭。
 
 当前默认策略如下。命名配置 `baseline` 对应 Qwen + SenseVoice，`high_quality` 对应 FireRed + Qwen；显式配置不会自动提升为全局默认：
 
@@ -20,7 +19,6 @@
 2. `sensevoice`：quick 默认和 strict 低幻觉锚点。组合 `iic/SenseVoiceSmall`、`fsmn-vad`、`ct-punc`；默认明确**不**加载 `cam++`。
 3. `fireredasr2-llm`：可选的证据级词汇主引擎，仅在显式选择时进入 strict；安装或下载不会改变默认组合。
 4. `paraformer`：显式时间线/匿名说话人备用线，固定 `iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4`，通过现有 FunASR adapter 传入 VAD、PUNC 与 `cam++`，输出逐句 `sentence_info` 时间和匿名 diarization/聚类。FunASR 1.4.14 自带的逐句文字会在每个中文 VAD 段边界前移一个字，因此生成时要求 `return_raw_text`，由 `sentence_alignment.realign_sentence_info` 按逐字时间戳重建每句文字并写 `sentence_info_alignment`；对不上时把原句移到 `sentence_info_unaligned`，不给逐句时间。回读和说话人归属用 `sentence_alignment_failures` 拒绝文字与逐字时间戳不符的旧结果。单文件 `transcribe --engine paraformer --preset-spk-num N` 只在调用方已知人数时把 `N` 传给 FunASR，并把 `automatic`/`preset` 与人数写入 objective-result 的 `request.speaker_diarization`；省略则保留自动聚类，其他引擎、quick、strict 和批量路径不会接受或传播该参数。它不改变 quick/strict 默认，且 cluster 仍不是用户身份确认，可能过拆或合并。
-5. `whisper-large-v3`：当前仅保留配置占位；仓库没有 Whisper adapter，因此不是可运行的 fallback/comparison。真正接入前必须新增 adapter、依赖和测试。
 
 `speaker-enroll` / `speaker-evidence` 在真实问题需要时才按需读取有限音频片段。enroll 只允许创建一个可替换、永远为 `inferred` 的本机私有 `person:self` 向量；跨录音域模式限定 2–3 个不同来源，逐向量 L2 归一化后只保存一个再次归一化的质心、源哈希/大小、片段和证据选择绑定，不保存各参考向量、源路径或原音。held-out 模式禁止用任一 enrollment 原件回测；普通模式也会按源哈希标出同原件关系，归属投影将这种分数降为非方向性 `unknown`，防止设备、声道或背景底色泄漏。目标片段只输出源哈希、时间、模型哈希和相似度。它不建设通用声纹平台，也不让分数、匿名 cluster 或默认下混音频单独产生 `confirmed`，并且不为样本调模型固定阈值。归属投影内部可融合来源、联系人、声道、对话角色、句义、跨录音与声纹，但对外只交付匿名说话人、状态、角色、单句依据、原转写 JSON pointer 与输入哈希绑定，不下发声纹分数或逐项内部线索。当前没有独立可信 receipt adapter，`authority_ref` 仅是 caller 提供的来源指针，不能使结果变为 `confirmed`；具体的来源/语义判断可以解释性地压过相反的弱声学线索，无法合理消解的实质冲突才是 `unknown`。
 
@@ -83,7 +81,6 @@ long audio
   -> each chunk writes strict audit v2
   -> optional forced alignment / targeted quality review
   -> skip completed chunks on resume
-  -> optional uncertain-only Ollama arbitration
   -> transcript.md + audit.md + metrics.json
 ```
 
@@ -94,8 +91,6 @@ long audio
 待处理 chunk 按两路引擎中较小的 `max_request_inputs` 分批。FireRed 的上限是 16；每个批次先加载主引擎一次并处理整批，再加载对照引擎一次并处理整批。该边界控制内存与 IPC 规模，也避免逐 chunk 重复加载模型。
 
 请求 fingerprint 包含音频内容 hash、设备、GPU 冲突策略、规范化缓存目录、模型配置、固定源码/模型 revision、模型/runtime receipt SHA-256 和运行代码 SHA-256。相同长音频请求在失败或取消后复用稳定输出目录；schema 1 或身份变化均安全重跑。Windows 子进程树、带 job token 的 WSL worker、ffmpeg 和 LocalGpuBroker lease 都有明确的超时、取消和终态释放路径。
-
-LLM 仲裁默认关闭，配置在 `configs/models.yaml` 的 `llm_arbitration`。当前 provider 是本地 Ollama，默认模型 `qwen-main-v1:latest`，`keep_alive=0`。仲裁只读取 chunk audit 证据，不读取音频；只在 `flags`、`needs_review` 或低相似度 chunk 上触发。仲裁结果写入 merged audit / metrics，不覆盖原始 strict raw JSON。
 
 ## 本地 API / Smart 调用层
 
@@ -146,7 +141,7 @@ strict receipt、两路成功且非空、无 `engine_failure`，并检查 FireRe
 .\scripts\strict.ps1 -Audio C:\path\to\audio.wav
 ```
 
-新增不同运行时，例如 Whisper 本地实现、其他 LLM 音频模型或云 API 时，应新增 adapter，并保持 pipeline 只依赖统一的 `build_model(...)` / `generate(...)` 形状。当前已有 `funasr`、`qwen-asr` 和隔离 WSL 的 `firered-worker`。
+新增不同运行时，例如新的本地语音模型或云 API 时，应新增 adapter，并保持 pipeline 只依赖统一的 `build_model(...)` / `generate(...)` 形状。当前已有 `funasr`、`qwen-asr` 和隔离 WSL 的 `firered-worker`。
 
 ## 已实现的审计闭环
 
@@ -157,9 +152,6 @@ strict receipt、两路成功且非空、无 `engine_failure`，并检查 FireRe
 - 幻觉规则库：静音出字、常见模板废话、异常重复、双模型大分歧、繁体残留、超长无标点都会进入 audit / metrics / review。
 - 评测与 benchmark：内置隐私友好的合成/对抗评测集；用户私有音频可通过同名 audio/truth 目录跑 `benchmark.md`、`benchmark.json`、`review.md`。
 - 人工复核队列：`review.md` 按 P0/P1/P2 排序，给出复核原因、建议动作、截断证据和源文件路径。
-- 可选 LLM 仲裁：长音频模式可接本地 Ollama，只对不确定 chunk 做 evidence-only 仲裁，结果写入 audit / metrics，不改写 raw ASR 证据。
-
-LLM 仲裁刻意默认关闭。这是资源和可信度边界：默认转写链路必须在没有 Ollama、没有额外 GPU 驻留、没有顶级模型猜测的情况下稳定工作；需要最终猜测时再显式打开。
 
 长音频 planner 已按引擎能力限制实际切片，并以 schema 2 manifest 支持内容寻址的断点续跑。当前 `cut_strategy=vad` 时，CPU FSMN-VAD 只用于在目标长度附近寻找更自然的停顿切口，仍覆盖整条原始时间线；VAD 不可用或失败时显式回退固定切分。manifest 继续保留请求值、有效值、VAD 状态、provenance、内容 hash 和 resume 判定，不得退回无来源的固定 300 秒描述。
 

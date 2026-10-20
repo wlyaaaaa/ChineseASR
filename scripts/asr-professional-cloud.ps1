@@ -13,7 +13,7 @@ param(
 
     [switch] $AutomaticReview,
 
-    [switch] $Legacy,
+    [string] $ResumeJobId = '',
 
     [string] $ModelProfile = '',
 
@@ -180,9 +180,6 @@ if (-not $CloudUploadAuthorized -and -not $AutomaticReview) {
 if ($AutomaticReview -and -not $LocalOutDir) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'local_review_required' -ExitCode 2
 }
-if ($Legacy -and ($AutomaticReview -or $ModelProfile)) {
-    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'legacy_options_unsupported' -ExitCode 2
-}
 if ($OverlapSec -ge $ChunkSec) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'chunk_policy_invalid' -ExitCode 2
 }
@@ -238,7 +235,6 @@ $intent['hotwords'] = $Hotwords
 if ($null -ne $ChannelIndex) { $intent['channel_index'] = [int]$ChannelIndex }
 if ($EvidenceStatus) { $intent['evidence_status'] = $EvidenceStatus }
 if ($ModelProfile) { $intent['model_profile'] = $ModelProfile }
-if ($Legacy) { $intent['model_profile'] = 'legacy' }
 if ($LocalOutDir) {
     $localPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LocalOutDir)
     if (-not (Test-Path -LiteralPath $localPath -PathType Container)) {
@@ -251,8 +247,9 @@ if ($LocalOutDir) {
     ($intent | ConvertTo-Json -Depth 8),
     $utf8NoBom
 )
-$prepareRaw = & $python $pipelineScript prepare `
-    --root $resolvedRequestRoot --intent $intentPath 2>&1 | Out-String
+$prepareArguments = @($pipelineScript, 'prepare', '--root', $resolvedRequestRoot, '--intent', $intentPath)
+if ($ResumeJobId) { $prepareArguments += @('--resume-job-id', $ResumeJobId) }
+$prepareRaw = & $python @prepareArguments 2>&1 | Out-String
 $prepareExit = $LASTEXITCODE
 try { $prepared = $prepareRaw | ConvertFrom-Json -Depth 30 }
 catch { Write-BoundedReceipt -Status 'failed' -ErrorCode 'cloud_prepare_receipt_invalid' -ExitCode 3 }
@@ -264,6 +261,12 @@ if ($prepareExit -ne 0 -or [string]$prepared.status -cne 'ready') {
     Write-BoundedReceipt -Status $status -ErrorCode $errorCode -ExitCode 2 `
         -Message $prepareMessage -BillingWarning $prepareWarning
 }
+$jobId = [string]$prepared.job_id
+$intentPath = [string]$prepared.intent_path
+$requestPath = [string]$prepared.request_path
+$providerPath = Join-Path $resolvedRequestRoot ($jobId + '.provider.json')
+$resultPath = Join-Path $resolvedRequestRoot ($jobId + '.result.json')
+$brokerLogPath = Join-Path $resolvedRequestRoot ($jobId + '.broker.json')
 $brokerTarget = [string]$prepared.secret_ref_target
 $credentialRef = [string]$prepared.credential_ref
 if (-not $brokerTarget -or -not $credentialRef) {
@@ -272,6 +275,9 @@ if (-not $brokerTarget -or -not $credentialRef) {
 
 $brokerOutput = ''
 $brokerExitCode = 1
+$providerBefore = if (Test-Path -LiteralPath $providerPath -PathType Leaf) {
+    (Get-Item -LiteralPath $providerPath).LastWriteTimeUtc.Ticks
+} else { 0 }
 try {
     if (Test-Path -LiteralPath $brokerPath -PathType Leaf) {
         # The broker writes directly to Console.Out; a child process makes that
@@ -294,7 +300,9 @@ Write-BrokerReceiptLog -Path $brokerLogPath -JobId $jobId `
     -AgentSecretRefRaw $brokerOutput -CredentialReportRaw ''
 
 $brokerError = ''
-if (-not (Test-Path -LiteralPath $providerPath -PathType Leaf)) {
+$providerUpdated = (Test-Path -LiteralPath $providerPath -PathType Leaf) -and
+    (Get-Item -LiteralPath $providerPath).LastWriteTimeUtc.Ticks -ne $providerBefore
+if (-not $providerUpdated) {
     $brokerErrorCode = Get-SafeBrokerErrorCode -Raw $brokerOutput
     $brokerError = if (-not (Test-Path -LiteralPath $brokerPath -PathType Leaf)) {
         'secret_broker_unavailable'

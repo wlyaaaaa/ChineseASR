@@ -20,11 +20,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--provider", type=Path)
     parser.add_argument("--broker-error", default="")
+    parser.add_argument("--resume-job-id", default="")
     args = parser.parse_args(argv)
     try:
         if args.action == "prepare":
             value = prepare_cloud_request(args.intent, args.root,
-                args.config or ROOT / "configs" / "models.yaml")
+                args.config or ROOT / "configs" / "models.yaml", resume_job_id=args.resume_job_id)
             code = 0 if value["status"] == "ready" else 2
         else:
             value = finalize_cloud_result(args.intent, args.root,

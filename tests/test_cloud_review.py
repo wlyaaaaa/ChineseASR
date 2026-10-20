@@ -157,15 +157,10 @@ class CloudReviewTests(unittest.TestCase):
 
     def test_free_period_cutoffs_are_timezone_aware_and_exclusive(self) -> None:
         short = self.config["models"]["short"]
-        legacy = self.config["models"]["legacy"]
         self.assertFalse(free_period_expired(short,
             now=datetime.fromisoformat("2026-12-20T23:59:59+08:00")))
         self.assertTrue(free_period_expired(short,
             now=datetime.fromisoformat("2026-12-21T00:00:00+08:00")))
-        self.assertFalse(free_period_expired(legacy,
-            now=datetime.fromisoformat("2026-09-27T01:59:59+08:00")))
-        self.assertTrue(free_period_expired(legacy,
-            now=datetime.fromisoformat("2026-09-27T02:00:00+08:00")))
         self.assertEqual("free_period_expired", auto_cloud_status(
             self.root / "missing.json", self.config,
             now=datetime.fromisoformat("2026-12-21T00:00:00+08:00"))["reason"])

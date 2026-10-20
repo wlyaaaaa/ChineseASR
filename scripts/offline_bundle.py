@@ -74,7 +74,7 @@ def selected_models(runtime_root: Path, config_path: Path) -> tuple[list[dict[st
             firered_source = within(model_root, runtime_root / source)
         elif adapter in {"funasr", "qwen-asr"}:
             # Preserve every installed, runnable configured engine, including
-            # explicit Paraformer/Fun-ASR routes.  An absent optional engine is
+            # the explicit Paraformer route.  An absent optional engine is
             # not presented as recoverable.
             repo = spec["model"]
             add(f"modelscope/{repo}", f"engine:{name}",

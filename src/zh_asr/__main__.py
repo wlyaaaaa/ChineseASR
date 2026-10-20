@@ -15,7 +15,6 @@ from .batch import run_batch
 from .benchmark import run_benchmark
 from .config import list_engine_names, list_transcription_engine_names, load_model_config, resolve_profile
 from .eval_pack import generate_builtin_corpus, run_evaluation
-from .arbitration import load_arbitration_config, make_arbiter
 from .gpu_broker import (
     GPU_BROKER_CHILD_TOKEN_ENV,
     GpuBrokerError,
@@ -407,7 +406,6 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Objective result: {paths['objective_result']}")
             return 1 if paths.get("failed_chunks") else 0
         if args.command == "long":
-            arbiter = make_arbiter(load_arbitration_config(model_config.path))
             summary = _run_with_gpu_lease(
                 args.device,
                 lambda: run_long_transcription(
@@ -422,7 +420,6 @@ def main(argv: list[str] | None = None) -> int:
                     device=args.device,
                     cache_dir=args.cache_dir,
                     force=args.force,
-                    arbiter=arbiter,
                     caller_binding=caller_binding,
                 ),
             )

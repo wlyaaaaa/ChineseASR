@@ -12,7 +12,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Any, Mapping
 
-from .arbitration import ArbitrationEvidence
 from .audit import validate_strict_artifact_bundle
 from .audio_outcome import (
     aggregate_objective_result,
@@ -53,7 +52,6 @@ class ChunkState:
     evidence_failures: list[dict[str, str]] = field(default_factory=list)
     outputs: dict[str, str] = field(default_factory=dict)
     error: str = ""
-    arbitration: dict[str, Any] | None = None
     objective_outcome: str = "indeterminate"
 
     def to_dict(self) -> dict[str, Any]:
@@ -65,7 +63,6 @@ class ChunkState:
                 "evidence_failures": self.evidence_failures,
                 "outputs": self.outputs,
                 "error": self.error,
-                "arbitration": self.arbitration,
                 "objective_outcome": self.objective_outcome,
             }
         )
@@ -157,7 +154,6 @@ def run_long_transcription(
     cache_dir: Path | None = None,
     force: bool = False,
     strict_fn: StrictFn | None = None,
-    arbiter=None,
     caller_binding: Mapping[str, Any] | None = None,
     config=None,
     channel_index: int | None = None,
@@ -348,7 +344,6 @@ def run_long_transcription(
                             resolved_primary_engine,
                             resolved_secondary_engine,
                         )
-                        _maybe_arbitrate(state, arbiter)
                         state.status = "succeeded"
                         processed += 1
                     except Exception as exc:
@@ -399,7 +394,6 @@ def run_long_transcription(
                     resolved_primary_engine,
                     resolved_secondary_engine,
                 )
-                _maybe_arbitrate(state, arbiter)
                 state.status = "succeeded"
                 processed += 1
             except Exception as exc:
@@ -786,7 +780,6 @@ def _build_states(
                     evidence_failures=evidence_failures,
                     outputs=outputs,
                     error=str(saved.get("error") or ""),
-                    arbitration=saved.get("arbitration"),
                     objective_outcome=str(saved.get("objective_outcome") or "indeterminate"),
                 )
             )
@@ -999,35 +992,6 @@ def _can_skip(
     )
 
 
-def _maybe_arbitrate(state: ChunkState, arbiter) -> None:
-    if not arbiter or not state.outputs.get("audit_json"):
-        return
-    audit_json = Path(state.outputs["audit_json"])
-    if not audit_json.exists():
-        return
-    audit = json.loads(audit_json.read_text(encoding="utf-8"))
-    if not _needs_arbitration(audit):
-        return
-    evidence = ArbitrationEvidence.from_audit(
-        chunk_id=state.spec.chunk_id,
-        time_range=f"{_fmt_ms(state.spec.start_ms)}-{_fmt_ms(state.spec.end_ms)}",
-        audit=audit,
-    )
-    decision = arbiter.arbitrate(evidence)
-    if decision:
-        state.arbitration = decision.to_dict() if hasattr(decision, "to_dict") else decision
-        state.arbitration["policy"] = "advisory_only_never_rewrites_lexical_output"
-
-
-def _needs_arbitration(audit: dict[str, Any]) -> bool:
-    flags = set(audit.get("flags", []) or [])
-    if flags:
-        return True
-    if audit.get("needs_review"):
-        return True
-    return float(audit.get("similarity", 1.0) or 1.0) < 0.72
-
-
 def _write_merged_transcript(path: Path, audio_path: Path, states: list[ChunkState]) -> None:
     lines = [
         f"# {audio_path.stem} Long Transcript",
@@ -1128,8 +1092,6 @@ def _write_merged_audit(path: Path, audio_path: Path, states: list[ChunkState]) 
                 f"- Error: `{state.error or 'none'}`",
             ]
         )
-        if state.arbitration:
-            lines.append(f"- Arbitration: `{json.dumps(state.arbitration, ensure_ascii=False)}`")
         audit_path = state.outputs.get("audit")
         if audit_path and Path(audit_path).exists():
             lines.extend(["", Path(audit_path).read_text(encoding="utf-8").strip(), ""])

@@ -290,7 +290,7 @@ class BatchTests(unittest.TestCase):
             input_dir.mkdir()
             (input_dir / "sample.wav").write_bytes(b"sample")
             config = load_model_config()
-            changed_config = replace(config, default_engine="fun-asr-nano")
+            changed_config = replace(config, default_engine="paraformer")
 
             first = run_batch(
                 input_dir,
