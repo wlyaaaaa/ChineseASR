@@ -129,6 +129,7 @@ exit 0
                     result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive",
                         "-File", str(ROOT / "scripts" / "asr-smart.ps1"), "-Audio", str(audio),
                         "-Port", str(server.server_port), "-WaitSec", "0", "-Json"], cwd=ROOT,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                         env=self.env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
                 finally:
                     server.shutdown()

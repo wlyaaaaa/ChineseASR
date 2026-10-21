@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory = $true)]
   [string]$Audio,
   [ValidateSet('strict', 'quick', 'long-strict')]
@@ -25,6 +25,7 @@ param(
   [switch]$Json
 )
 
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Invoke-NoProxy.ps1')
 $PreviousProxyEnvironment = @(
