@@ -1125,6 +1125,7 @@ class FireRedRuntimeWorkerTests(unittest.TestCase):
 
             completed = subprocess.run(
                 [sys.executable, str(runtime)],
+                env=dict(os.environ, PYTHONUTF8="0"),
                 input=json.dumps(request, ensure_ascii=False),
                 text=True,
                 encoding="utf-8",

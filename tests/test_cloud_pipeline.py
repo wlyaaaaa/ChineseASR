@@ -189,7 +189,7 @@ class CloudPipelineTests(unittest.TestCase):
         self.assertEqual("Success", final["credential_result"])
         self.assertFalse(work.exists())
         self.assertTrue(self.audio.is_file())
-        self.assertEqual("已有文字", (self.root / (ready["job_id"] + ".transcript.txt")).read_text().strip())
+        self.assertEqual("已有文字", (self.root / (ready["job_id"] + ".transcript.txt")).read_text(encoding="utf-8").strip())
         self.audio.unlink()
         restored = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
         self.assertEqual("已有文字", restored["text"])

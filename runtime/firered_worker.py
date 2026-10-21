@@ -699,6 +699,9 @@ def _error_response(exc: BaseException) -> dict[str, Any]:
 
 
 def main() -> int:
+    for stream in (sys.stdin, sys.stdout):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     try:
         request = json.load(sys.stdin)
         if not isinstance(request, dict):
