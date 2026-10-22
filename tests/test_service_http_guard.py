@@ -25,7 +25,7 @@ class ServiceHttpGuardTests(unittest.TestCase):
             root = Path(temp_dir)
             audio = root / "sample.wav"
             audio.write_bytes(b"RIFF")
-            service = TranscriptionService(root=root, autostart=False)
+            service = TranscriptionService(root=root, autostart=False, gpu_process_detector=lambda: [])
             server = ThreadingHTTPServer(("127.0.0.1", 0), create_handler(service))
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
