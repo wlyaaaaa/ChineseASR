@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import uuid
 from pathlib import Path
 
@@ -668,10 +669,39 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 3
     except Exception as exc:
-        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        print(_error_summary(exc), file=sys.stderr)
         return 1
 
     return 1
+
+
+def _error_summary(exc: Exception) -> str:
+    summary = " ".join(f"{type(exc).__name__}: {exc}".splitlines())
+    current = exc
+    seen = set()
+    for _ in range(10):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        if isinstance(current, subprocess.CalledProcessError) and current.stderr:
+            stderr = current.stderr
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+            lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+            if lines:
+                tail = " | ".join(lines[-5:])
+                if len(tail) > 800:
+                    tail = "…" + tail[-800:]
+                command = current.cmd
+                program = "subprocess"
+                if isinstance(command, (list, tuple)) and command:
+                    try:
+                        program = Path(os.fsdecode(command[0])).stem or program
+                    except (TypeError, ValueError):
+                        pass
+                return " ".join(f"{summary} [{program} stderr: {tail}]".splitlines())
+        current = current.__cause__ or current.__context__
+    return summary
 
 
 def _caller_binding_from_env() -> dict | None:
@@ -720,11 +750,15 @@ def _command_requires_gpu_supervision(args: argparse.Namespace) -> bool:
 def _supervise_gpu_cli(argv: list[str], *, timeout_seconds: float | None = None, gpu: bool = True) -> int:
     """Run one public GPU CLI invocation in a killable supervised worker."""
     process_holder: dict[str, subprocess.Popen] = {}
+    worker_stopped_on_loss = threading.Event()
     process_token = f"chineseasr-cli-{uuid.uuid4().hex}"
     wsl_distributions = _cli_wsl_distributions(argv)
 
     def terminate_on_loss(_error) -> None:
         process = process_holder.get("process")
+        if process is not None and process.poll() is not None:
+            return
+        worker_stopped_on_loss.set()
         if process is not None:
             terminate_process_tree(process)
         # ``wsl.exe`` is only the Windows-side launcher.  A Linux worker can
@@ -747,6 +781,8 @@ def _supervise_gpu_cli(argv: list[str], *, timeout_seconds: float | None = None,
             [sys.executable, "-m", "zh_asr", *argv],
             cwd=project_root(),
             env=env,
+            # One explicit standard handle preserves inherited stdout/stderr with CREATE_NO_WINDOW.
+            stdin=subprocess.DEVNULL,
             **managed_popen_kwargs(),
         )
         process_holder["process"] = process
@@ -754,10 +790,10 @@ def _supervise_gpu_cli(argv: list[str], *, timeout_seconds: float | None = None,
             if lease:
                 lease.raise_if_lost()
             returncode = process.wait(timeout=timeout_seconds) if timeout_seconds is not None else process.wait()
-            # A finished, successful worker may already have been reclaimed by
-            # process-bound lease cleanup. That is normal completion, not a
-            # failed job. Actual lease loss kills a still-running worker.
-            if lease and returncode == 0:
+            # A finished worker may already have been reclaimed by
+            # process-bound lease cleanup. Actual lease loss kills a
+            # still-running worker instead.
+            if lease and not worker_stopped_on_loss.is_set():
                 complete_worker = getattr(lease, "complete_worker", None)
                 if callable(complete_worker):
                     complete_worker()

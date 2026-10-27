@@ -113,6 +113,7 @@ class CliTests(unittest.TestCase):
 
             def __init__(self, _owner):
                 self.error = None
+                self.completed = False
                 state["lease"] = self
 
             def set_on_lost(self, callback):
@@ -124,6 +125,9 @@ class CliTests(unittest.TestCase):
             def raise_if_lost(self):
                 if self.error is not None:
                     raise self.error
+
+            def complete_worker(self):
+                self.completed = True
 
             def __exit__(self, *_args):
                 return None
@@ -158,9 +162,80 @@ class CliTests(unittest.TestCase):
                     _supervise_gpu_cli(["transcribe", "note.wav"])
 
         self.assertEqual(terminated, [1234])
+        self.assertFalse(state["lease"].completed)
         self.assertEqual(cleanup_wsl.call_count, 2)
         self.assertEqual(cleanup_wsl.call_args.args[0], ("Ubuntu",))
         self.assertTrue(cleanup_wsl.call_args.args[1].startswith("chineseasr-cli-"))
+
+    def test_gpu_cli_supervisor_preserves_failed_worker_after_lease_reclamation(self):
+        from zh_asr.__main__ import _supervise_gpu_cli
+        from zh_asr.gpu_broker import GpuBrokerLease, GpuBrokerLeaseLost
+
+        def transport(action, _payload):
+            if action == "acquire":
+                return {"ok": True, "token": "worker-token"}
+            return {"ok": False, "reason": "lease_not_found"}
+
+        for renewal_race in (False, True):
+            with self.subTest(renewal_race=renewal_race):
+                lease = GpuBrokerLease(
+                    "chineseasr-cli", transport=transport, renew_interval_seconds=0,
+                )
+
+                class Process:
+                    returncode = 1
+
+                    def wait(self):
+                        if renewal_race:
+                            lease._mark_lost(GpuBrokerLeaseLost(
+                                "worker lease reclaimed", reason="lease_not_found",
+                            ))
+                        return self.returncode
+
+                    def poll(self):
+                        return self.returncode
+
+                with patch("zh_asr.__main__.GpuBrokerLease", return_value=lease), patch(
+                    "zh_asr.__main__.subprocess.Popen", return_value=Process(),
+                ), patch("zh_asr.__main__.terminate_process_tree") as terminate, patch(
+                    "zh_asr.__main__.terminate_wsl_processes",
+                ):
+                    self.assertEqual(_supervise_gpu_cli(["strict", "bad.m4a"]), 1)
+                terminate.assert_not_called()
+
+    def test_gpu_cli_supervisor_inherits_captured_stdout(self):
+        result = subprocess.run(
+            [sys.executable, "-c", (
+                "from zh_asr.__main__ import _supervise_gpu_cli; "
+                "raise SystemExit(_supervise_gpu_cli(['--help'], gpu=False))"
+            )],
+            cwd=PROJECT_ROOT,
+            env={**os.environ, "PYTHONPATH": PYTHONPATH, "PYTHONUTF8": "1"},
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout.lower())
+
+    def test_error_summary_includes_chained_subprocess_stderr_on_one_line(self):
+        from zh_asr.__main__ import _error_summary
+
+        cause = subprocess.CalledProcessError(
+            1, ["C:/x/ffprobe.exe", "-v", "error"],
+            stderr=b"[mov] moov atom not found\r\nbad.m4a: Invalid data found when processing input\r\n",
+        )
+        error = RuntimeError("Media duration probe failed; validity and coverage remain unknown")
+        error.__cause__ = cause
+
+        summary = _error_summary(error)
+
+        self.assertTrue(summary.startswith(f"RuntimeError: {error}"))
+        self.assertIn("ffprobe stderr", summary)
+        self.assertIn("Invalid data found when processing input", summary)
+        self.assertNotIn("\n", summary)
+        self.assertNotIn("\r", summary)
 
     def test_gpu_cli_supervisor_terminates_worker_before_releasing_on_interrupt(self):
         from zh_asr.__main__ import _supervise_gpu_cli

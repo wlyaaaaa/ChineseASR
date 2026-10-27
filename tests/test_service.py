@@ -268,7 +268,7 @@ class ServiceTests(unittest.TestCase):
             )
             job, _ = service.submit(request)
             job.status = "running"
-            process = SimpleNamespace(pid=1234)
+            process = SimpleNamespace(pid=1234, poll=lambda: None)
             service._processes[job.job_id] = process
             error = GpuBrokerLeaseLost("lease expired")
 
@@ -286,6 +286,42 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual("lease expired", job.gpu_broker_loss_error)
         self.assertIn("lease expired", job.message)
         self.assertEqual("degraded", health["persistence"]["status"])
+
+    def test_lease_loss_ignores_already_exited_worker(self):
+        from zh_asr.gpu_broker import GpuBrokerLeaseLost
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = _write_audio(root / "sample.wav")
+            service = TranscriptionService(
+                root=root, gpu_process_detector=lambda: [], autostart=False,
+            )
+            request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "quick", "device": "cuda:0"}, root=root,
+            )
+            job, _ = service.submit(request)
+            job.status = "running"
+            job.message = "worker is finishing"
+            original_updated_at = job.updated_at
+            service._processes[job.job_id] = SimpleNamespace(poll=lambda: 1)
+            with (
+                patch.object(service, "_persist_jobs_locked") as persist,
+                patch("zh_asr.service._terminate_job_process") as terminate,
+            ):
+                service._terminate_job_after_lease_loss(job.job_id, GpuBrokerLeaseLost("lease_not_found"))
+
+        self.assertEqual(job.gpu_broker_loss_error, "")
+        self.assertEqual(job.message, "worker is finishing")
+        self.assertEqual(job.updated_at, original_updated_at)
+        persist.assert_not_called()
+        terminate.assert_not_called()
+
+    def test_command_failure_message_keeps_exit_prefix_for_long_stderr(self):
+        from zh_asr.service import _command_failure_message
+
+        message = _command_failure_message(ProcessResult(returncode=1, stderr="x" * 1300))
+
+        self.assertTrue(message.startswith("Transcription command failed (exit 1): …"))
 
     def test_run_next_job_marks_persistence_failure_and_rejects_new_work(self):
         runner_calls = []

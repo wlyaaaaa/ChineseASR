@@ -169,10 +169,11 @@ class GpuBrokerLease:
             callback(existing)
 
     def complete_worker(self) -> None:
-        """A caller proved its supervised process exited successfully.
+        """A caller observed its supervised worker exit with any return code.
 
-        Only that evidence makes process-exit reclamation a normal completion;
-        transport failure or rejected renewal during live work remains an error.
+        The worker must have exited on its own, not been stopped for lease loss.
+        Only lease_not_found from process-exit reclamation is tolerated;
+        transport failures and other rejected renewals remain errors.
         """
         self._worker_completed = True
         self._stop.set()

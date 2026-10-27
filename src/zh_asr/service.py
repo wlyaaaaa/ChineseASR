@@ -973,6 +973,7 @@ class TranscriptionService:
             job.outputs["cloud_review"] = str(out_dir / "cloud.review.json")
 
     def _process_job(self, job_id: str) -> None:
+        result = None
         try:
             with self._lock:
                 job = self._jobs[job_id]
@@ -1013,7 +1014,7 @@ class TranscriptionService:
                 try:
                     result = self._process_runner(job)
                     complete_worker = getattr(lease, "complete_worker", None)
-                    if result.returncode == 0 and callable(complete_worker):
+                    if not job.gpu_broker_loss_error and callable(complete_worker):
                         complete_worker()
                     raise_if_lost = getattr(lease, "raise_if_lost", None)
                     if callable(raise_if_lost):
@@ -1052,7 +1053,7 @@ class TranscriptionService:
                     if job.request.mode == "quick" and validated_execution in {"corrupt", "unsupported"}:
                         job.objective_execution_status = validated_execution
                 job.stage = "finished" if result.returncode == 0 else "failed"
-                job.message = "Completed." if result.returncode == 0 else "Transcription command failed."
+                job.message = "Completed." if result.returncode == 0 else _command_failure_message(result)
                 job.finished_at = time.time()
                 job.updated_at = job.finished_at
                 if result.returncode == 0:
@@ -1075,16 +1076,26 @@ class TranscriptionService:
         except GpuBrokerLeaseLost as exc:
             with self._lock:
                 if job.status != "canceled":
+                    if result is not None:
+                        job.returncode = result.returncode
+                        job.stdout_tail = _tail(result.stdout)
+                        job.stderr_tail = _tail(result.stderr)
                     job.status = "failed"
                     _mark_job_evidence_unavailable(job, str(exc))
                     job.stage = "gpu_broker_lost"
                     job.message = str(exc)
+                    if result is not None and result.returncode != 0 and not job.gpu_broker_loss_error:
+                        job.message = f"{_command_failure_message(result)}; {job.message}"
                     job.finished_at = time.time()
                     job.updated_at = job.finished_at
                     self._persist_jobs_locked()
         except Exception as exc:
             with self._lock:
                 if job.status != "canceled":
+                    if result is not None:
+                        job.returncode = result.returncode
+                        job.stdout_tail = _tail(result.stdout)
+                        job.stderr_tail = _tail(result.stderr)
                     job.status = "failed"
                     _mark_job_evidence_unavailable(
                         job,
@@ -1092,6 +1103,8 @@ class TranscriptionService:
                     )
                     job.stage = "failed"
                     job.message = f"{type(exc).__name__}: {exc}"
+                    if result is not None and result.returncode != 0 and not job.gpu_broker_loss_error:
+                        job.message = f"{_command_failure_message(result)}; {job.message}"
                     job.finished_at = time.time()
                     job.updated_at = job.finished_at
                     self._persist_jobs_locked()
@@ -1110,6 +1123,8 @@ class TranscriptionService:
             job = self._jobs.get(job_id)
             process = self._processes.get(job_id)
             if job is None or job.status == "canceled":
+                return
+            if process is not None and process.poll() is not None:
                 return
             job.gpu_broker_loss_error = str(error)
             job.message = str(error)
@@ -1790,6 +1805,17 @@ def _optional_str(value) -> str | None:
 
 def _tail(text: str, max_chars: int = 4000) -> str:
     return text[-max_chars:] if len(text) > max_chars else text
+
+
+def _command_failure_message(result: ProcessResult) -> str:
+    detail = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()), "")
+    if not detail:
+        detail = next((line.strip() for line in reversed(result.stdout.splitlines()) if line.strip()), "")
+    if len(detail) > 1200:
+        detail = "…" + detail[-1200:]
+    message = f"Transcription command failed (exit {result.returncode})"
+    message += f": {detail}" if detail else "."
+    return message
 
 
 def _observer_limit(value: int | str | None) -> int:

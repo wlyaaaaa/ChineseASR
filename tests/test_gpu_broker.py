@@ -298,6 +298,42 @@ class ServiceLeaseTests(unittest.TestCase):
         self.assertEqual(service.get_job(job.job_id).status, "succeeded")
         self.assertEqual(events, ["lease_enter", "runner", "lease_exit"])
 
+    def test_failed_worker_keeps_result_when_lease_was_reclaimed(self):
+        def transport(action, _payload):
+            if action == "acquire":
+                return {"ok": True, "token": "failed-worker", "owner": "chineseasr"}
+            return {"ok": False, "reason": "lease_not_found"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "sample.wav"
+            audio.write_bytes(b"RIFF")
+            service = TranscriptionService(
+                root=root,
+                gpu_process_detector=lambda: [],
+                process_runner=lambda _job: ProcessResult(
+                    returncode=1,
+                    stderr="RuntimeError: Media duration probe failed; validity and coverage remain unknown\n",
+                ),
+                gpu_lease_factory=lambda owner: GpuBrokerLease(
+                    owner, transport=transport, renew_interval_seconds=0,
+                ),
+                autostart=False,
+            )
+            request = JobRequest.from_payload(
+                {"audio": str(audio), "mode": "strict", "device": "cuda:0"}, root=root,
+            )
+            job, _ = service.submit(request)
+            service.run_next_job()
+
+        refreshed = service.get_job(job.job_id)
+        self.assertEqual(refreshed.status, "failed")
+        self.assertEqual(refreshed.returncode, 1)
+        self.assertIn("Media duration probe failed", refreshed.stderr_tail)
+        self.assertIn("exit 1", refreshed.message)
+        self.assertIn("Media duration probe failed", refreshed.message)
+        self.assertNotIn("lease_not_found", refreshed.message)
+
     def test_broker_conflict_marks_job_blocked(self):
         class ConflictLease:
             def __enter__(self):
@@ -348,7 +384,7 @@ class ServiceLeaseTests(unittest.TestCase):
             service = TranscriptionService(
                 root=root,
                 gpu_process_detector=lambda: [],
-                process_runner=lambda _job: ProcessResult(returncode=0),
+                process_runner=lambda _job: ProcessResult(returncode=1, stderr="killed"),
                 gpu_lease_factory=lambda owner: LostLease(),
                 autostart=False,
             )
@@ -364,6 +400,8 @@ class ServiceLeaseTests(unittest.TestCase):
         self.assertEqual(refreshed.stage, "gpu_broker_lost")
         self.assertEqual(refreshed.evidence_status, "unavailable")
         self.assertIn("lease expired", refreshed.message)
+        self.assertEqual(refreshed.returncode, 1)
+        self.assertIn("killed", refreshed.stderr_tail)
 
     def test_legacy_allow_gpu_conflicts_does_not_bypass_machine_broker(self):
         events = []
@@ -403,7 +441,7 @@ if __name__ == "__main__":
 
 
 class CompletedWorkerLeaseTests(unittest.TestCase):
-    def test_reclaimed_successful_worker_lease_release_is_not_a_job_failure(self):
+    def test_reclaimed_completed_worker_lease_release_is_not_a_job_failure(self):
         def transport(action, payload):
             if action == "acquire":
                 return {"ok": True, "token": "completed-worker", "owner": "chineseasr"}
@@ -411,7 +449,7 @@ class CompletedWorkerLeaseTests(unittest.TestCase):
         with GpuBrokerLease("chineseasr", transport=transport, renew_interval_seconds=0) as lease:
             lease.complete_worker()
 
-    def test_missing_lease_without_successful_worker_exit_remains_error(self):
+    def test_missing_lease_without_observed_worker_exit_remains_error(self):
         def transport(action, payload):
             if action == "acquire":
                 return {"ok": True, "token": "live-worker", "owner": "chineseasr"}
@@ -420,7 +458,7 @@ class CompletedWorkerLeaseTests(unittest.TestCase):
             with GpuBrokerLease("chineseasr", transport=transport, renew_interval_seconds=0):
                 pass
 
-    def test_success_does_not_hide_other_authoritative_lease_loss(self):
+    def test_worker_completion_does_not_hide_other_authoritative_lease_loss(self):
         with self.assertRaises(GpuBrokerLeaseLost):
             with GpuBrokerLease("chineseasr", transport=RecordingTransport(), renew_interval_seconds=0) as lease:
                 lease._mark_lost(GpuBrokerLeaseLost("network error", reason="transport_failure"))
