@@ -3,8 +3,7 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
-
-HAS_QWEN_MODEL_CACHE = (Path(__file__).resolve().parents[1] / "models" / "modelscope" / "Qwen" / "Qwen3-ASR-1.7B").is_dir()
+from unittest.mock import patch
 
 def write_tiny_wav(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -16,6 +15,22 @@ def write_tiny_wav(path: Path) -> None:
 
 
 class BenchmarkTests(unittest.TestCase):
+    def setUp(self):
+        # Synthetic pipeline fixtures must never verify real model weights.
+        def synthetic_identity(spec, cache_dir, model_aliases):
+            return {
+                "engine": spec.name,
+                "adapter": spec.adapter,
+                "model": model_aliases.get(spec.model, spec.model),
+                "options": json.dumps(spec.options or {}, sort_keys=True),
+                "cache_dir": str(cache_dir.resolve()) if cache_dir else "",
+                "model_receipt_status": "fixture",
+            }
+
+        mocked = patch("zh_asr.qwen_identity.qwen_runtime_identity", side_effect=synthetic_identity)
+        mocked.start()
+        self.addCleanup(mocked.stop)
+
     def test_build_benchmark_manifest_matches_audio_and_truth_by_stem_without_copying_audio(self):
         from zh_asr.benchmark import build_benchmark_manifest
 
@@ -56,7 +71,6 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(case_002["truth_size_bytes"], 0)
         self.assertEqual(copied_audio, [])
 
-    @unittest.skipUnless(HAS_QWEN_MODEL_CACHE, "requires prefetched local Qwen model cache")
     def test_run_benchmark_writes_benchmark_json_markdown_and_review(self):
         from zh_asr.benchmark import run_benchmark
 
@@ -101,7 +115,12 @@ class BenchmarkTests(unittest.TestCase):
             write_tiny_wav(audio_dir / "missing.wav")
             (truth_dir / "001.txt").write_text("开放时间早上九点。", encoding="utf-8")
 
-            summary = run_benchmark(audio_dir, truth_dir, out_dir, strict_fn=fake_strict)
+            with patch(
+                "zh_asr.qwen_identity.verify_model_receipt",
+                side_effect=AssertionError("synthetic benchmark must not verify real model weights"),
+            ) as verifier:
+                summary = run_benchmark(audio_dir, truth_dir, out_dir, strict_fn=fake_strict)
+            verifier.assert_not_called()
             benchmark_json = json.loads((out_dir / "benchmark.json").read_text(encoding="utf-8"))
             benchmark_md = (out_dir / "benchmark.md").read_text(encoding="utf-8")
             review_md = (out_dir / "review.md").read_text(encoding="utf-8")

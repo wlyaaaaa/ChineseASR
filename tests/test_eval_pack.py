@@ -3,8 +3,7 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
-
-HAS_QWEN_MODEL_CACHE = (Path(__file__).resolve().parents[1] / "models" / "modelscope" / "Qwen" / "Qwen3-ASR-1.7B").is_dir()
+from unittest.mock import patch
 
 def write_tiny_wav(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -16,6 +15,22 @@ def write_tiny_wav(path: Path) -> None:
 
 
 class EvalPackTests(unittest.TestCase):
+    def setUp(self):
+        # Synthetic pipeline fixtures must never verify real model weights.
+        def synthetic_identity(spec, cache_dir, model_aliases):
+            return {
+                "engine": spec.name,
+                "adapter": spec.adapter,
+                "model": model_aliases.get(spec.model, spec.model),
+                "options": json.dumps(spec.options or {}, sort_keys=True),
+                "cache_dir": str(cache_dir.resolve()) if cache_dir else "",
+                "model_receipt_status": "fixture",
+            }
+
+        mocked = patch("zh_asr.qwen_identity.qwen_runtime_identity", side_effect=synthetic_identity)
+        mocked.start()
+        self.addCleanup(mocked.stop)
+
     def test_char_error_rate_ignores_punctuation_and_simplifies_text(self):
         from zh_asr.eval_pack import char_error_rate
 
@@ -72,7 +87,6 @@ class EvalPackTests(unittest.TestCase):
         self.assertTrue(any(case["expect_empty"] for case in manifest["cases"]))
         self.assertFalse(any(case["kind"] == "tts" and case["available"] for case in manifest["cases"]))
 
-    @unittest.skipUnless(HAS_QWEN_MODEL_CACHE, "requires prefetched local Qwen model cache")
     def test_run_evaluation_writes_metrics_benchmark_and_review(self):
         from zh_asr.eval_pack import generate_builtin_corpus, run_evaluation
 
