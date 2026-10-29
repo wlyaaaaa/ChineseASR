@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from zh_asr.transcript_readback import read_transcript_readback
+
 
 class TranscriptReadbackTests(unittest.TestCase):
     def _write_bundle(
@@ -103,6 +105,56 @@ class TranscriptReadbackTests(unittest.TestCase):
         )
         return snapshot, digest, raw, objective_path
 
+    def _write_batch_bundle(self, root: Path, *, timestamped=False):
+        api, item = root / "api", root / "batch" / "run" / "item"
+        api.mkdir()
+        item.mkdir(parents=True)
+        snapshot, digest, _, objective = self._write_bundle(
+            api, timestamped=timestamped, quality_status="low_confidence", coverage_status="partial")
+        final, review = item / "transcript.md", item / "quality.review.json"
+        final.write_text("已有批量稿", encoding="utf-8")
+        review.write_text(json.dumps({"status": "completed", "needs_review": True}), encoding="utf-8")
+        audit = item / "strict.audit.json"
+        audit.write_text(json.dumps({"status": "conflict", "needs_review": True, "evidence_status": "verified"}), encoding="utf-8")
+        outputs = {key: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                        "size_bytes": path.stat().st_size}
+                   for key, path in (("final", final), ("objective_result", objective), ("quality_review", review), ("audit_json", audit))}
+        (item / "batch-item.json").write_text(json.dumps({"schema": "zh_asr.batch_item.v1",
+            "identity": {"audio_sha256": digest, "engine": "paraformer"}, "outputs": outputs}), encoding="utf-8")
+        return snapshot, digest, final, review
+
+    def test_batch_discovery_retains_quality_and_reports_missing_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot, digest, final, review = self._write_batch_bundle(Path(tmp))
+            snapshot.unlink()
+            payload = read_transcript_readback(digest, snapshot)
+            self.assertEqual(payload["artifact"]["transcript"]["path"], str(final))
+            self.assertEqual(payload["quality"]["review"], {"status": "completed", "needs_review": True})
+            self.assertEqual(payload["quality"]["audit"]["status"], "conflict")
+            self.assertEqual(payload["quality"]["status"], "low_confidence")
+            self.assertEqual(payload["coverage"]["status"], "partial")
+            self.assertEqual(payload["gap"]["code"], "timestamps_unavailable")
+            review.write_text("damaged", encoding="utf-8")
+            payload = read_transcript_readback(digest, snapshot)
+            self.assertEqual(payload["quality"]["review"]["status"], "unavailable")
+            snapshot.write_text('{"jobs": []}', encoding="utf-8")
+            final.write_text("changed", encoding="utf-8")
+            self.assertEqual(read_transcript_readback(digest, snapshot)["gap"]["code"], "no_valid_transcript_artifact")
+            self.assertEqual(read_transcript_readback("0" * 64, snapshot)["status"], "not_found")
+
+    def test_single_and_batch_use_existing_priority_and_report_alternative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot, digest, final, _ = self._write_batch_bundle(Path(tmp), timestamped=True)
+            batch = read_transcript_readback(digest, snapshot)
+            self.assertEqual(batch["status"], "ok")
+            self.assertEqual(batch["evidence_status"], "verified")
+            job = json.loads(snapshot.read_bytes())["jobs"][0]
+            job.update(evidence_status="verified", job_id="a-single")
+            snapshot.write_text(json.dumps({"jobs": [job]}), encoding="utf-8")
+            single = read_transcript_readback(digest, snapshot)
+            self.assertEqual(single["artifact"]["job_id"], "a-single")
+            self.assertEqual(single["lookup_scope"]["alternatives"][0]["transcript"]["path"], str(final))
+
     def _write_cloud_result(
         self,
         root: Path,
@@ -151,8 +203,6 @@ class TranscriptReadbackTests(unittest.TestCase):
         return path
 
     def test_readback_returns_verified_hash_and_timestamped_segments(self):
-        from zh_asr.transcript_readback import read_transcript_readback
-
         with tempfile.TemporaryDirectory() as tmp:
             snapshot, source_hash, raw, _objective = self._write_bundle(Path(tmp))
             payload = read_transcript_readback(source_hash, snapshot)

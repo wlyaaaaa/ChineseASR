@@ -156,6 +156,7 @@ cd <repo-root>
 ```
 
 该命令只读取 `jobs.json` 和其中明确引用的结果文件，以及 `outputs\cloud-jobs` 中已完成、哈希绑定的云结果；不读取原音频，不启动服务或模型，不创建数据库、缓存或新结果。
+也会按原音 SHA-256 查询快照所属 `outputs\batch` 下的 `batch-item.json`，校验并返回 `artifact.transcript` 稿件路径、原始质量与覆盖信息（`quality.review` 保留复核状态和 `needs_review`，`quality.audit` 保留严格审计的 `conflict` 等状态）；单条与批量并存时沿用现有优先规则，其他稿件位置见 `lookup_scope.alternatives`，只有稿件而无可回读时间段时仍返回 `gap / timestamps_unavailable`，不会当作没有转写。
 它同时核对 `job.request.audio_sha256`、objective sidecar（目标结果旁路文件）的 `audio.raw_sha256` 与
 `idempotency_basis.source_audio_sha256`，确认处理已完成，并按 sidecar 声明的路径、字节数和 SHA-256 核对实际解析的 raw artifact（原始结果文件）字节。
 

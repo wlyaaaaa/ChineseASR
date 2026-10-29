@@ -76,36 +76,19 @@ def read_transcript_readback(
     try:
         payload = json.loads(snapshot.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return _response(
-            status="gap",
-            source_audio_sha256=requested_hash,
-            gap={
-                "code": "jobs_snapshot_missing",
-                "message": "The owner-managed jobs snapshot is unavailable.",
-            },
-            lookup_scope=lookup_scope,
-        )
+        payload = {"jobs": []}
+        lookup_scope["jobs_snapshot_gap"] = {
+            "code": "jobs_snapshot_missing", "message": "The owner-managed jobs snapshot is unavailable."}
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        return _response(
-            status="gap",
-            source_audio_sha256=requested_hash,
-            gap={
-                "code": "jobs_snapshot_unreadable",
-                "message": f"Could not read the owner-managed jobs snapshot: {type(exc).__name__}.",
-            },
-            lookup_scope=lookup_scope,
-        )
+        payload = {"jobs": []}
+        lookup_scope["jobs_snapshot_gap"] = {
+            "code": "jobs_snapshot_unreadable",
+            "message": f"Could not read the owner-managed jobs snapshot: {type(exc).__name__}."}
 
     if not isinstance(payload, Mapping) or not isinstance(payload.get("jobs"), list):
-        return _response(
-            status="gap",
-            source_audio_sha256=requested_hash,
-            gap={
-                "code": "jobs_snapshot_invalid",
-                "message": "The owner-managed jobs snapshot has no jobs list.",
-            },
-            lookup_scope=lookup_scope,
-        )
+        payload = {"jobs": []}
+        lookup_scope["jobs_snapshot_gap"] = {
+            "code": "jobs_snapshot_invalid", "message": "The owner-managed jobs snapshot has no jobs list."}
 
     jobs = payload["jobs"]
     lookup_scope["jobs_examined"] = len(jobs)
@@ -160,6 +143,7 @@ def read_transcript_readback(
                 objective_path=objective_path,
             )
             if candidate is not None:
+                candidate["artifact"]["transcript"] = {"path": outputs.get("final") or outputs.get("markdown")}
                 valid_candidates.append(candidate)
             else:
                 _record_rejection(rejected, job_id, reason, output_key)
@@ -171,6 +155,9 @@ def read_transcript_readback(
     valid_candidates.extend(cloud_candidates)
     rejected.extend(cloud_rejections)
     lookup_scope.update(cloud_scope)
+    batch_root = snapshot.parent.parent / "batch"
+    valid_candidates.extend(_read_batch_candidates(batch_root, requested_hash, rejected))
+    lookup_scope.update(kind="jobs_snapshot_cloud_and_batch_artifacts", batch_results_root=str(batch_root))
 
     lookup_scope["valid_candidates"] = len(valid_candidates)
     lookup_scope["rejected_candidates"] = len(rejected)
@@ -181,9 +168,16 @@ def read_transcript_readback(
         lookup_scope["pending_jobs"] = pending_jobs[:_MAX_REJECTIONS]
 
     if not valid_candidates:
+        if lookup_scope.get("jobs_snapshot_gap"):
+            return _response(
+                status="gap", source_audio_sha256=requested_hash,
+                gap=lookup_scope["jobs_snapshot_gap"],
+                lookup_scope=lookup_scope,
+            )
         if (
             lookup_scope["matching_jobs"] == 0
             and lookup_scope["matching_cloud_results"] == 0
+            and not rejected
         ):
             return _response(
                 status="not_found",
@@ -209,6 +203,7 @@ def read_transcript_readback(
         )
 
     selected = _select_candidate(valid_candidates)
+    lookup_scope["alternatives"] = [c["artifact"] for c in valid_candidates if c is not selected]
     lookup_scope["selected_job_id"] = selected["job_id"]
     lookup_scope["selected_engine"] = selected["engine"]
     lookup_scope["segments_examined"] = selected["total_segments"]
@@ -244,6 +239,69 @@ def read_transcript_readback(
         selection_reason=selected["selection_reason"],
         lookup_scope=lookup_scope,
     )
+
+
+def _read_batch_candidates(root: Path, requested_hash: str, rejected: list) -> list[dict[str, Any]]:
+    candidates = []
+    for path in sorted(root.rglob("batch-item.json")):
+        matches = False
+        try:
+            state = json.loads(path.read_bytes())
+            identity = state["identity"]
+            if state.get("schema") != "zh_asr.batch_item.v1" or str(identity["audio_sha256"]).lower() != requested_hash:
+                continue
+            matches = True
+            outputs = state["outputs"]
+            final_key = next(key for key in ("final", "markdown", "transcript") if key in outputs)
+            final_ref, _ = _read_batch_record(outputs[final_key], path.parent)
+            objective_ref, data = _read_batch_record(outputs["objective_result"], path.parent)
+            objective = json.loads(data)
+            if (validate_objective_result(objective) or objective["execution"]["status"] != "completed"
+                    or objective["audio"]["raw_sha256"].lower() != requested_hash
+                    or objective["idempotency_basis"]["source_audio_sha256"].lower() != requested_hash):
+                raise ValueError("batch_objective_invalid")
+            quality = copy.deepcopy(objective["quality"])
+            summaries = (("quality_review", "review"), ("audit_json", "audit"), ("manifest", "manifest"))
+            for key, summary_key in summaries:
+                if key not in outputs:
+                    continue
+                try:
+                    _, review_data = _read_batch_record(outputs[key], path.parent)
+                    review = json.loads(review_data)
+                    if not isinstance(review, Mapping):
+                        raise ValueError("batch_summary_not_object")
+                    quality[summary_key] = {k: review[k] for k in
+                        ("status", "needs_review", "conflict", "conflicts", "review_count", "evidence_status") if k in review}
+                except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError):
+                    quality[summary_key] = {"status": "unavailable"}
+            evidence = (quality.get("audit") or quality.get("manifest") or {}).get("evidence_status", "unknown")
+            job_id = f"batch:{path}"
+            artifact = {"job_id": job_id, "batch_item": str(path),
+                        "transcript": final_ref, "objective_result": objective_ref}
+            engine = identity.get("engine") or identity.get("primary_engine") or "unknown"
+            candidate = dict(job_id=job_id, engine=engine, segments=[],
+                total_segments=0, timed_segments=0, quality=quality, coverage=objective["coverage"],
+                evidence_status=evidence, objective_outcome=objective["objective_outcome"], artifact=artifact,
+                selection_reason="Selected a hash-bound batch transcript by the existing candidate priority.")
+            for ref in objective.get("raw_artifacts", []):
+                parsed, _ = _inspect_candidate(job={**candidate, "request": identity}, request_hash=requested_hash,
+                    output_key="batch_raw", raw_value=str(_resolve_path(ref["path"], Path(objective_ref["path"]).parent)),
+                    objective_path=Path(objective_ref["path"]))
+                if parsed is not None and _candidate_sort_key(parsed) < _candidate_sort_key(candidate):
+                    candidate = {**parsed, "quality": quality, "artifact": {**parsed["artifact"], **artifact}}
+            candidates.append(candidate)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, StopIteration, RuntimeError):
+            if matches:
+                _record_rejection(rejected, str(path), "batch_artifact_invalid", "batch_item")
+    return candidates
+
+
+def _read_batch_record(ref: Mapping[str, Any], base: Path) -> tuple[dict, bytes]:
+    path = _resolve_path(ref["path"], base)
+    data = path.read_bytes()
+    if len(data) != ref["size_bytes"] or hashlib.sha256(data).hexdigest() != ref["sha256"]:
+        raise ValueError("batch_artifact_hash_or_size_mismatch")
+    return {**ref, "path": str(path)}, data
 
 
 def _response(
