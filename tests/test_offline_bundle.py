@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import errno
 import io
 import json
 from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -47,6 +49,9 @@ class OfflineBundleTests(unittest.TestCase):
             result = offline.copy_models(root, config_path, bundle)
             self.assertEqual(4, len(result["models"]))
             self.assertFalse(list((bundle / "models").rglob("download.tmp")))
+            relative = Path("modelscope/Qwen/ASR/weights.bin")
+            original, saved = model_root / relative, bundle / "models" / relative
+            self.assertTrue(original.samefile(saved))
             self.assertEqual(offline.compare_models(root, config_path, bundle)[
                 "model_files_verified"], 4)
             for platform in ("windows", "linux"):
@@ -63,9 +68,37 @@ class OfflineBundleTests(unittest.TestCase):
                 "model_files_restored"], 4)
             self.assertEqual(offline.restore_models(restored_root, bundle)[
                 "model_files_restored"], 0)
-            (bundle / "models" / "modelscope" / "Qwen" / "ASR" / "weights.bin").write_bytes(b"bad")
+            restored = restored_root / "models" / relative
+            self.assertTrue(saved.samefile(restored))
+            original.unlink()
+            self.assertEqual(saved.read_bytes(), b"modelscope/Qwen/ASR")
+            restored.unlink()
+            restored.write_bytes(b"different")
+            with self.assertRaisesRegex(ValueError, "refusing overwrite"):
+                offline.restore_models(restored_root, bundle)
+            saved.write_bytes(b"bad")
             with self.assertRaisesRegex(ValueError, "mismatch"):
                 offline.verify(bundle)
+
+    def test_materialize_copies_for_unavailable_links_and_propagates_io_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.bin"
+            source.write_bytes(b"model")
+            for code in (errno.EXDEV, errno.EOPNOTSUPP):
+                with self.subTest(errno=code):
+                    destination = Path(tmp) / str(code) / "model.bin"
+                    with mock.patch.object(offline.os, "link", side_effect=OSError(code, "link")):
+                        offline.materialize_model(source, destination)
+                    self.assertEqual(destination.read_bytes(), b"model")
+                    self.assertFalse(source.samefile(destination))
+            for code in (errno.EACCES, errno.ENOSPC):
+                with self.subTest(errno=code), mock.patch.object(
+                        offline.os, "link", side_effect=OSError(code, "link")):
+                    destination = Path(tmp) / str(code) / "model.bin"
+                    with self.assertRaises(OSError) as raised:
+                        offline.materialize_model(source, destination)
+                    self.assertEqual(raised.exception.errno, code)
+                    self.assertFalse(destination.exists())
 
     def test_restore_pinned_firered_source_archive(self):
         with tempfile.TemporaryDirectory() as tmp:

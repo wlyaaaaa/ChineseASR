@@ -7,8 +7,10 @@ excluded.  This module does not fetch packages or alter the installed models.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -118,6 +120,18 @@ def inventory(runtime_root: Path, config_path: Path) -> dict[str, Any]:
             "firered_source": str(firered_source) if firered_source else ""}
 
 
+def materialize_model(source: Path, destination: Path) -> None:
+    """Share model bytes when possible; copy only if hard links are unavailable."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination)
+    except OSError as exc:
+        if (exc.errno not in {errno.EXDEV, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}
+                and getattr(exc, "winerror", None) not in {1, 50}):
+            raise
+        shutil.copy2(source, destination)
+
+
 def copy_models(runtime_root: Path, config_path: Path, bundle: Path) -> dict[str, Any]:
     import yaml
 
@@ -132,8 +146,7 @@ def copy_models(runtime_root: Path, config_path: Path, bundle: Path) -> dict[str
         source = runtime_root / "models" / entry["path"]
         for path in payload_files(source):
             destination = target_root / entry["path"] / path.relative_to(source)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
+            materialize_model(path, destination)
             copied += 1
             total += path.stat().st_size
     source_commit = ""
@@ -246,8 +259,7 @@ def restore_models(runtime_root: Path, bundle: Path) -> dict[str, Any]:
             if destination.stat().st_size != row["bytes"] or sha256(destination) != row["sha256"]:
                 raise ValueError(f"installed model differs; refusing overwrite: {relative}")
             continue
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+        materialize_model(source, destination)
         if destination.stat().st_size != row["bytes"] or sha256(destination) != row["sha256"]:
             raise ValueError(f"restored model hash differs: {relative}")
         restored += 1
