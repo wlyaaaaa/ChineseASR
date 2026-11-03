@@ -29,6 +29,7 @@ _DEFAULT_CLOUD_RESULTS_ROOT = Path("outputs") / "cloud-jobs"
 _CLOUD_RESULT_PURPOSES = {
     "chineseasr.qwen-audio3-important-result.v1": ("important_evidence", True),
     "chineseasr.qwen-audio3-quality-review-result.v1": ("quality_review", False),
+    "chineseasr.qwen-audio3-transcription-result.v1": ("transcription", False),
 }
 
 

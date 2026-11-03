@@ -13,6 +13,8 @@ param(
 
     [switch] $AutomaticReview,
 
+    [switch] $CloudFirst,
+
     [string] $ResumeJobId = '',
 
     [string] $ModelProfile = '',
@@ -53,6 +55,7 @@ $python = Join-Path $PSScriptRoot '..\.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { $python = 'python' }
 $importantResultSchema = 'chineseasr.qwen-audio3-important-result.v1'
 $qualityReviewResultSchema = 'chineseasr.qwen-audio3-quality-review-result.v1'
+$transcriptionResultSchema = 'chineseasr.qwen-audio3-transcription-result.v1'
 $canonicalRequestRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\outputs\cloud-jobs'))
 if ([string]::IsNullOrWhiteSpace($RequestRoot)) { $RequestRoot = $canonicalRequestRoot }
 
@@ -164,11 +167,20 @@ elseif ($QualityReview -and -not $Important) {
     $selectedPurpose = 'quality_review'
     $selectedResultSchema = $qualityReviewResultSchema
 }
+elseif ($CloudFirst -and -not $Important) {
+    $selectedPurpose = 'transcription'
+    $selectedResultSchema = $transcriptionResultSchema
+}
+
+if ($CloudFirst -and $QualityReview) {
+    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'cloud_use_purpose_ambiguous' -ExitCode 2
+}
+if ($CloudFirst) { $AutomaticReview = $true }
 
 if ($Important -and $QualityReview) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'cloud_use_purpose_ambiguous' -ExitCode 2
 }
-if (-not $Important -and -not $QualityReview) {
+if (-not $Important -and -not $QualityReview -and -not $CloudFirst) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'cloud_use_purpose_required' -ExitCode 2
 }
 if (-not $CloudUploadAuthorized -and -not $AutomaticReview) {
@@ -177,7 +189,7 @@ if (-not $CloudUploadAuthorized -and -not $AutomaticReview) {
         -ErrorCode 'cloud_upload_authorization_required' `
         -ExitCode 2
 }
-if ($AutomaticReview -and -not $LocalOutDir) {
+if ($AutomaticReview -and -not $CloudFirst -and -not $LocalOutDir) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'local_review_required' -ExitCode 2
 }
 if ($OverlapSec -ge $ChunkSec) {
@@ -229,6 +241,7 @@ if ($Important) {
     $intent['importance'] = 'important'
 }
 $intent['automatic_review'] = [bool]$AutomaticReview
+if ($CloudFirst) { $intent['cloud_first'] = $true }
 $intent['speaker_diarization'] = [bool]$SpeakerDiarization
 $intent['keep_dialect'] = [bool]$KeepDialect
 $intent['hotwords'] = $Hotwords

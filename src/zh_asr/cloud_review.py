@@ -349,6 +349,7 @@ TRANSPORT_SCHEMA = "passwordcenter.vendor-request.v1"
 PROVIDER_SCHEMA = "zh_asr.dashscope_transport_result.v1"
 IMPORTANT_RESULT_SCHEMA = "chineseasr.qwen-audio3-important-result.v1"
 QUALITY_RESULT_SCHEMA = "chineseasr.qwen-audio3-quality-review-result.v1"
+TRANSCRIPTION_RESULT_SCHEMA = "chineseasr.qwen-audio3-transcription-result.v1"
 
 
 def _file_hash(path: Path) -> str:
@@ -372,11 +373,16 @@ def _bounded_intent(path: Path, root: Path, *, require_audio: bool = True) -> di
         if intent.get("cloud_upload_authorized") is not True:
             raise ValueError("cloud authorization missing")
         purpose = intent.get("purpose")
-        if purpose not in {"important_evidence", "quality_review"}:
+        cloud_first = intent.get("cloud_first") is True
+        if purpose not in {"important_evidence", "quality_review", "transcription"}:
             raise ValueError("intent purpose")
+        if cloud_first and (intent.get("automatic_review") is not True or purpose == "quality_review"):
+            raise ValueError("cloud first requires automatic transcription")
+        if purpose == "transcription" and not cloud_first:
+            raise ValueError("transcription requires cloud first")
         if purpose == "important_evidence" and intent.get("importance") != "important":
             raise ValueError("importance missing")
-        if purpose == "quality_review" and "importance" in intent:
+        if purpose != "important_evidence" and "importance" in intent:
             raise ValueError("quality purpose conflict")
         audio = Path(str(intent["audio_path"]))
         if not audio.is_absolute() or (require_audio and not audio.is_file()):
@@ -384,7 +390,7 @@ def _bounded_intent(path: Path, root: Path, *, require_audio: bool = True) -> di
         local = intent.get("local_out_dir")
         if local and (not Path(str(local)).is_absolute() or not Path(str(local)).is_dir()):
             raise ValueError("local review missing")
-        if intent.get("automatic_review") and not local:
+        if intent.get("automatic_review") and not cloud_first and not local:
             raise ValueError("automatic review needs local result")
         intent["job_id"] = job_id
         intent["audio_path"] = str(audio.resolve())
@@ -464,13 +470,14 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
     intent = _bounded_intent(intent_path, root)
     config = load_cloud_config(config_path)
     automatic = intent.get("automatic_review") is True
+    cloud_first = intent.get("cloud_first") is True
     local = intent.get("local_out_dir")
     reasons, _ = local_review_signals(Path(local),
         evidence_status=str(intent.get("evidence_status") or ""),
         important=intent["purpose"] == "important_evidence",
         dialect=bool(intent.get("keep_dialect"))) if local else (
             (["important_recording"] if intent["purpose"] == "important_evidence" else []), "")
-    if automatic and not reasons:
+    if automatic and not cloud_first and not reasons:
         return {"status": "blocked", "error_code": "not_a_difficult_recording"}
     state = auto_cloud_status(state_path or root / "auto-cloud-state.json", config, now=now)
     if automatic and state["status"] == "paused":
@@ -551,6 +558,8 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
         "purpose": intent["purpose"], "selected_channel": intent.get("channel_index"),
         "automatic_review": automatic,
         "send_before_utc": model["free_until"] if automatic else None}
+    if cloud_first:
+        matching["cloud_first"] = True
     resumed = _resume_request(root, intent, matching, resume_job_id, billing_warning)
     if resumed:
         # Only this call's newly generated staging is discarded.
@@ -573,6 +582,8 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
         "billing_warning": billing_warning,
         "send_before_utc": model["free_until"] if automatic else None,
         "created_utc": datetime.now(timezone.utc).isoformat()}
+    if cloud_first:
+        request["cloud_first"] = True
     # Audio preparation and DashScope request construction belong here. The
     # Password Center worker receives generic HTTP bodies / WebSocket frames.
     request.update(vendor="qwen", mode="invoke",
@@ -792,8 +803,10 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
     config = load_cloud_config(config_path or root.parents[1] / "configs" / "models.yaml")
     job_id = intent["job_id"]
     result_path = root / (job_id + ".result.json")
-    final: dict[str, Any] = {"schema": IMPORTANT_RESULT_SCHEMA if intent["purpose"] == "important_evidence"
-        else QUALITY_RESULT_SCHEMA, "job_id": job_id, "purpose": intent["purpose"],
+    result_schema = {"important_evidence": IMPORTANT_RESULT_SCHEMA,
+        "quality_review": QUALITY_RESULT_SCHEMA, "transcription": TRANSCRIPTION_RESULT_SCHEMA}
+    final: dict[str, Any] = {"schema": result_schema[intent["purpose"]],
+        "job_id": job_id, "purpose": intent["purpose"],
         "important_only": intent["purpose"] == "important_evidence",
         "status": "failed", "error_code": broker_error or "cloud_worker_result_missing",
         "credential_result": "Provider-Unavailable", "cloud_upload_performed": False,

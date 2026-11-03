@@ -13,7 +13,8 @@ import wave
 import yaml
 
 from zh_asr.cloud_review import (auto_cloud_status, finalize_cloud_result,
-    prepare_cloud_request, CloudReviewError, _split_prepared_wav)
+    prepare_cloud_request, CloudReviewError, _split_prepared_wav,
+    load_cloud_config, pause_cloud)
 from zh_asr.transcript_readback import _inspect_cloud_result_candidate
 
 
@@ -71,6 +72,74 @@ class CloudPipelineTests(unittest.TestCase):
         self.assertTrue(all(Path(item["path"]).resolve().is_relative_to(self.root.resolve())
                             for item in request["chunks"]))
         self.assertEqual(1, len(request["chunks"]))
+
+    def test_cloud_first_transcribes_without_local_job_and_reads_back(self) -> None:
+        intent = self.intent(purpose="transcription", cloud_first=True,
+                             local_out_dir=None, model_profile="short")
+        ready = prepare_cloud_request(intent, self.root, CONFIG)
+        request = json.loads(Path(ready["request_path"]).read_text(encoding="utf-8"))
+        self.assertEqual("transcription", request["purpose"])
+        self.assertFalse(request["important_only"])
+        self.assertTrue(request["automatic_review"])
+        self.assertTrue(request["cloud_first"])
+        self.assertEqual("2026-12-21T00:00:00+08:00", request["send_before_utc"])
+        binding = request["chunks"][0]
+        provider = self.root / (ready["job_id"] + ".provider.json")
+        provider.write_text(json.dumps({"schema": "zh_asr.dashscope_transport_result.v1",
+            "job_id": ready["job_id"], "status": "succeeded", "model": request["model"],
+            "protocol": request["protocol"], "credential_result": "Success",
+            "cloud_upload_performed": True, "source_audio_sha256": request["source_audio_sha256"],
+            "chunks": [{**binding, "provider_request_id": "fixture-request",
+                "raw_response": {"output": {"text": "直接转写"}}}]}), encoding="utf-8")
+        final = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
+        self.assertEqual("chineseasr.qwen-audio3-transcription-result.v1", final["schema"])
+        self.assertEqual("直接转写", final["text"])
+        self.assertEqual("", final["local_text"])
+        candidate, matched, rejected = _inspect_cloud_result_candidate(
+            Path(final["result_path"]), request["source_audio_sha256"])
+        self.assertTrue(matched)
+        self.assertEqual("", rejected)
+        self.assertEqual("transcription", candidate["artifact"]["mode"])
+
+    def test_cloud_first_respects_expiry_manual_and_provider_stops(self) -> None:
+        config = load_cloud_config(CONFIG)
+        for reason in ("free_period_expired", "manual_pause", "free_quota_exhausted"):
+            with self.subTest(reason=reason):
+                state = self.root / (reason + ".state.json")
+                if reason != "free_period_expired":
+                    pause_cloud(state, config, reason=reason, provider_error=reason, model="fixture")
+                intent = self.intent(purpose="transcription", cloud_first=True, local_out_dir=None)
+                now = datetime.fromisoformat("2026-12-21T00:00:00+08:00" if
+                    reason == "free_period_expired" else "2026-11-03T09:00:00+08:00")
+                result = prepare_cloud_request(intent, self.root, CONFIG, state_path=state, now=now)
+                self.assertEqual("skipped", result["status"])
+                self.assertEqual(reason, result["pause_reason"])
+                self.assertFalse(result["cloud_upload_performed"])
+                self.assertFalse(list(self.root.glob("*.pending.json")))
+
+    def test_cloud_first_important_keeps_evidence_purpose_without_local_result(self) -> None:
+        intent = self.intent(purpose="important_evidence", importance="important",
+                             cloud_first=True, local_out_dir=None)
+        self.assertEqual("ready", prepare_cloud_request(intent, self.root, CONFIG)["status"])
+        final = finalize_cloud_result(intent, self.root, broker_error="fixture", config_path=CONFIG)
+        self.assertEqual("chineseasr.qwen-audio3-important-result.v1", final["schema"])
+        self.assertTrue(final["important_only"])
+        legacy = self.intent(purpose="important_evidence", importance="important")
+        self.assertEqual("ready", prepare_cloud_request(legacy, self.root, CONFIG)["status"])
+        with self.assertRaises(CloudReviewError):
+            prepare_cloud_request(self.intent(local_out_dir=None), self.root, CONFIG)
+
+    def test_cloud_first_script_accepts_no_local_result_and_rejects_quality_purpose(self) -> None:
+        script = ROOT / "scripts" / "asr-professional-cloud.ps1"
+        for flags, expected in ((["-CloudFirst"], "audio_file_missing"),
+                (["-CloudFirst", "-Important"], "audio_file_missing"),
+                (["-CloudFirst", "-QualityReview"], "cloud_use_purpose_ambiguous")):
+            result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File",
+                str(script), "-Audio", str(self.base / "missing.wav"), *flags, "-Json"],
+                capture_output=True, text=True, encoding="utf-8", timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+            self.assertEqual(expected, json.loads(result.stdout)["error_code"])
 
     def test_automatic_expiry_skips_and_writes_plain_reason(self) -> None:
         intent = self.intent()
