@@ -712,10 +712,13 @@ def project_vendor_result(provider: dict[str, Any], intent: dict[str, Any]) -> d
     if not isinstance(results, list) or len(results) > len(expected):
         raise CloudReviewError("provider_result_binding_invalid")
     chunks = []
+    single_transport = ({key: provider[key] for key in
+        ("http_status", "provider_request_id", "transport_diagnostic", "first_failure")
+        if key in provider} if len(expected) == 1 else {})
     for raw, binding in zip(results, expected):
         if raw.get("id") != str(binding["index"]):
             raise CloudReviewError("provider_result_binding_invalid")
-        chunks.append({**raw, **binding})
+        chunks.append({**single_transport, **raw, **binding})
     # The generic worker can stop before appending a failed operation. Only
     # NO_WORDS identifies that next chunk as silent; later chunks stay missing.
     if provider.get("status") == "failed" and _no_words(provider) and len(chunks) < len(expected):
@@ -842,11 +845,15 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
                     for key in ("index", "start_ms", "end_ms", "audio_sha256"))):
                 raise CloudReviewError("provider_result_binding_invalid")
         chunks = []
+        single_provider = provider if len(expected_chunks) == 1 else {}
         for raw in raw_chunks:
             text = _provider_chunk_text(raw, str(provider.get("protocol")))
             chunks.append({"index": raw["index"], "start_ms": raw["start_ms"],
                 "end_ms": raw["end_ms"], "audio_sha256": raw["audio_sha256"],
-                "provider_request_id": raw.get("provider_request_id"),
+                "provider_request_id": raw.get("provider_request_id", single_provider.get("provider_request_id")),
+                "http_status": raw.get("http_status", single_provider.get("http_status")),
+                "transport_diagnostic": raw.get("transport_diagnostic", single_provider.get("transport_diagnostic")),
+                "first_failure": raw.get("first_failure", single_provider.get("first_failure")),
                 "status": "succeeded" if text else ("no_speech" if
                     provider.get("status") == "succeeded" or _chunk_completed(raw) else "failed"),
                 "provider_error_code": raw.get("provider_error_code"),
@@ -855,6 +862,7 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
                 "raw_response": raw.get("raw_response"),
                 "raw_events": raw.get("raw_events")})
         texts = [chunk["text"] for chunk in chunks if chunk["text"]]
+        single_chunk = chunks[0] if len(expected_chunks) == len(chunks) == 1 else {}
         status = provider.get("status")
         error_code = str(provider.get("error_code") or "")
         if status == "succeeded" and not texts:
@@ -868,8 +876,12 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
             cloud_upload_performed=provider.get("cloud_upload_performed") is True,
             provider_error_code=provider.get("provider_error_code"),
             provider_error_message=provider.get("provider_error_message"),
-            http_status=provider.get("http_status"),
-            provider_request_id=provider.get("provider_request_id"),
+            http_status=(single_provider.get("http_status") if single_provider.get("http_status") is not None
+                         else single_chunk.get("http_status")),
+            provider_request_id=(single_provider.get("provider_request_id") if single_provider.get("provider_request_id") is not None
+                                 else single_chunk.get("provider_request_id")),
+            transport_diagnostic=provider.get("transport_diagnostic"),
+            first_failure=provider.get("first_failure"),
             provider_result_path=str(provider_path),
             chunks=chunks, text="\n".join(texts),
             usage=_job_usage(chunks, len(expected_chunks)),

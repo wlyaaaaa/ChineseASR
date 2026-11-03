@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -232,7 +231,6 @@ class CloudPipelineTests(unittest.TestCase):
         _wav(self.audio, frames=16000 * 14)
         intent = self.intent(chunk_sec=8, overlap_sec=1)
         ready = prepare_cloud_request(intent, self.root, CONFIG)
-        request = json.loads(Path(ready["request_path"]).read_text(encoding="utf-8"))
         document = json.loads(intent.read_text(encoding="utf-8"))
         provider = self.root / (ready["job_id"] + ".provider.json")
         body = {"schema": "passwordcenter.vendor-result.v1", "vendor": "qwen",
@@ -307,12 +305,16 @@ class CloudPipelineTests(unittest.TestCase):
             "chunks": [{"index": 1, "start_ms": item["start_ms"],
                 "end_ms": item["end_ms"], "audio_sha256": item["audio_sha256"],
                 "provider_request_id": "fixture-request",
+                "http_status": 200,
                 "raw_response": {"output": {"text": "省高院"}},
                 "usage": {"total_tokens": 7}}]}, ensure_ascii=False), encoding="utf-8")
         result = finalize_cloud_result(intent, self.root, provider_path=provider,
                                        config_path=CONFIG)
         self.assertEqual("succeeded", result["status"])
         self.assertEqual("省高院", result["text"])
+        self.assertEqual(200, result["http_status"])
+        self.assertEqual(200, result["chunks"][0]["http_status"])
+        self.assertEqual("fixture-request", result["provider_request_id"])
         self.assertEqual(7, result["chunks"][0]["usage"]["total_tokens"])
         self.assertTrue(result["disagreement"])
         self.assertTrue((self.local / "cloud.review.json").is_file())
@@ -321,6 +323,57 @@ class CloudPipelineTests(unittest.TestCase):
         self.assertTrue(matched)
         self.assertEqual("", rejected)
         self.assertEqual(request["model"], candidate["engine"])
+
+    def test_generic_single_chunk_preserves_real_http_receipt(self) -> None:
+        intent = self.intent()
+        ready = prepare_cloud_request(intent, self.root, CONFIG)
+        document = json.loads(intent.read_text(encoding="utf-8"))
+        provider = self.root / (ready["job_id"] + ".provider.json")
+        provider.write_text(json.dumps({"schema": "passwordcenter.vendor-result.v1",
+            "vendor": "qwen", "request_sha256": document["vendor_request_sha256"],
+            "status": "succeeded", "credential_result": "Success", "new_requests": 1,
+            "results": [{"id": "1", "http_status": 200, "provider_request_id": "actual-request",
+                         "raw_response": {"output": {"text": "正文"}}}]}), encoding="utf-8")
+        result = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
+        self.assertEqual(200, result["http_status"])
+        self.assertEqual("actual-request", result["provider_request_id"])
+        self.assertEqual(200, result["chunks"][0]["http_status"])
+        self.assertEqual("actual-request", result["chunks"][0]["provider_request_id"])
+
+    def test_multi_chunk_diagnostics_do_not_invent_job_transport_scalars(self) -> None:
+        _wav(self.audio, frames=16000 * 12)
+        intent = self.intent(chunk_sec=6, overlap_sec=0)
+        ready = prepare_cloud_request(intent, self.root, CONFIG)
+        document = json.loads(intent.read_text(encoding="utf-8"))
+        diagnostic = {"phase": "http_read", "exception_class": "TimeoutError",
+                      "reason_class": None, "errno": None, "winerror": None,
+                      "elapsed_seconds": 2.5}
+        first = {"error_code": "network_failure", "credential_result": "Network-Failure",
+                 "transport_diagnostic": diagnostic}
+        provider = self.root / (ready["job_id"] + ".provider.json")
+        for second_status in (500, None):
+            chunks = [{"id": "1", "http_status": 200, "provider_request_id": "first-id",
+                       "raw_response": {"output": {"text": "第一段"}}},
+                      {"id": "2", "provider_request_id": "second-id",
+                       "transport_diagnostic": diagnostic, "first_failure": first}]
+            if second_status is not None:
+                chunks[1]["http_status"] = second_status
+            provider.write_text(json.dumps({"schema": "passwordcenter.vendor-result.v1",
+                "vendor": "qwen", "request_sha256": document["vendor_request_sha256"],
+                "status": "failed", "error_code": "previous_outcome_unknown",
+                "http_status": 200, "provider_request_id": "not-a-job-id",
+                "transport_diagnostic": diagnostic, "first_failure": first,
+                "results": chunks}), encoding="utf-8")
+            result = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
+            self.assertIsNone(result["http_status"])
+            self.assertIsNone(result["provider_request_id"])
+            self.assertEqual([200, second_status], [chunk["http_status"] for chunk in result["chunks"]])
+            self.assertEqual(["first-id", "second-id"], [c["provider_request_id"] for c in result["chunks"]])
+            self.assertEqual(first, result["first_failure"])
+            self.assertEqual(diagnostic, result["transport_diagnostic"])
+            self.assertIsNone(result["chunks"][0]["first_failure"])
+            self.assertEqual(first, result["chunks"][1]["first_failure"])
+            self.assertEqual(diagnostic, result["chunks"][1]["transport_diagnostic"])
 
     def test_finalizer_fails_when_all_provider_chunks_lack_text(self) -> None:
         _wav(self.audio, frames=16000 * 12)
