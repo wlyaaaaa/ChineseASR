@@ -21,6 +21,10 @@ class DictationWorkerCancelled(RuntimeError):
     """The parent requested shutdown while a model operation was pending."""
 
 
+class DictationWorkerNotReady(DictationWorkerFailure):
+    """A ready-only request cannot start or reload a model."""
+
+
 def _engine_main(connection, settings) -> None:
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w")
@@ -100,6 +104,11 @@ class ProcessDictationEngine:
     def worker_pid(self):
         return self._process.pid if self._process is not None else None
 
+    @property
+    def is_ready(self):
+        return (self._loaded and self._process is not None
+                and self._process.is_alive() and self._connection is not None)
+
     def _start(self):
         if self.cancel_event.is_set():
             raise DictationWorkerCancelled("Dictation is shutting down")
@@ -121,7 +130,8 @@ class ProcessDictationEngine:
         self._connection, self._process = parent, process
         LOG.info("dictation model process started pid=%s", process.pid)
 
-    def _stop(self):
+    def _stop(self, *, timeout=8.0):
+        deadline = time.monotonic() + timeout
         process, connection = self._process, self._connection
         self._process = self._connection = None
         self._loaded = False
@@ -130,24 +140,31 @@ class ProcessDictationEngine:
         if process is not None:
             if process.is_alive():
                 process.terminate()
-            process.join(timeout=5)
+            process.join(timeout=min(5, timeout * 0.75))
             if process.is_alive():
                 process.kill()
-                process.join(timeout=3)
+                process.join(timeout=max(0, deadline - time.monotonic()))
             if process.is_alive():
                 self._process = process
                 raise DictationWorkerFailure("The previous model process has not exited")
             process.close()
 
-    def _call(self, operation, argument=None, *, timeout=None):
-        self._start()
+    def _call(self, operation, argument=None, *, timeout=None, allow_start=True):
+        reap_timeout = 8.0 if allow_start else min(0.25, max(0, timeout or 0))
+        if allow_start:
+            self._start()
+        elif not self.is_ready:
+            self._stop(timeout=reap_timeout)
+            raise DictationWorkerNotReady("not_ready: explicit prepare required")
+        if timeout is not None and timeout <= 0:
+            raise DictationWorkerFailure(f"Model operation budget exhausted: {operation}")
         process, connection = self._process, self._connection
         started = time.monotonic()
         deadline = started + (self.operation_timeout if timeout is None else timeout)
         try:
             connection.send((operation, argument))
             while True:
-                if connection.poll(0.1):
+                if connection.poll(min(0.1, max(0, deadline - time.monotonic()))):
                     response = connection.recv()
                     if "load_stage" not in response:
                         break
@@ -160,7 +177,7 @@ class ProcessDictationEngine:
                 if time.monotonic() >= deadline:
                     raise DictationWorkerFailure(f"Model operation timed out: {operation}")
         except (EOFError, BrokenPipeError, OSError, DictationWorkerFailure, DictationWorkerCancelled) as error:
-            self._stop()
+            self._stop(timeout=reap_timeout)
             if isinstance(error, DictationWorkerCancelled):
                 raise
             raise DictationWorkerFailure(f"{operation}: {error}") from error
@@ -169,10 +186,23 @@ class ProcessDictationEngine:
                 raise GpuBrokerConflict(response["message"], owner=response["owner"], reason=response["reason"])
             message = f"{operation}: {response.get('kind')}: {response.get('message')}"
             # A native/runtime failure must not poison every subsequent session.
-            self._stop()
+            self._stop(timeout=reap_timeout)
             raise DictationWorkerFailure(message)
         LOG.info("dictation model operation=%s seconds=%.3f", operation, time.monotonic() - started)
         return response.get("value")
+
+    def activate_ready(self, *, timeout):
+        return self._call("activate", timeout=timeout, allow_start=False)
+
+    def transcribe_ready(self, audio, *, timeout):
+        return self._call("transcribe", audio, timeout=timeout, allow_start=False)
+
+    def park_ready(self, *, timeout):
+        return self._call("park", timeout=timeout, allow_start=False)
+
+    def abort(self, *, timeout=0.25):
+        """Reap this worker without waiting on a failed native operation."""
+        self._stop(timeout=timeout)
 
     def load(self):
         result = self._call("load", timeout=self.load_timeout)

@@ -46,6 +46,10 @@
 
 AI 文件转写通过 [唯一云入口](#重要录音与存疑质量复核云入口) 的 `-CloudFirst` 执行 [项目规则](AGENTS.md) 所定顺序；它直接检查配置免费期和已有停用状态，不需要先启动本地作业。Win+H 桌面听写继续使用独立的本地单模型。
 
+### 所选 WAV 的热识别会话
+
+`python -m zh_asr.realtime` 通过标准输入/输出 JSONL 连续处理所选 WAV，不开端口、不写录音或文字日志。启动先冷加载一次、GPU 预热并回 CPU/RAM；收到 `event=ready` 后才接消息，回执含 `coldLoad`、`warmup`、`park` 耗时和实际 `workerPID`。逐行发送 `{"action":"transcribe","path":"E:/selected.wav","request_id":"opaque","budget_seconds":10}`，同一 worker 按听写配置的 `max_chunk_sec` 连续覆盖最多 60 秒全文；源文件只读，结果绑定 SHA-256、时长、每段起止与真实耗时。请求共享最多 10 秒预算，失败或超时不返回成功；`partial`/`empty` 不表示无语音或已完整理解。`status` 核验模型已准备且 child 仍活；未就绪不自动重载，只有显式 `prepare` 或重新启动才能准备。`close` 或 stdin EOF 清理 worker。此入口不接答案、热词或润色。运行需要既有环境及模型缓存；独立 worktree 应复用原项目 `models` 目录联接，不复制权重。
+
 ## 文件转写质量与模型维护
 
 文件转写支持 `--profile high_quality` / `-Profile high_quality`，选择 FireRedASR2-LLM 主引擎和 Qwen3-ASR-1.7B 校验；`baseline` 保留 Qwen + SenseVoice。选择配置不改变全局默认，也不影响桌面听写。短文件、长文件和文件夹使用同一时长约束，长录音自动切分；VAD 优先寻找停顿，而不是删除未被识别为语音的区域。
