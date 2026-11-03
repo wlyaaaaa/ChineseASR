@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -23,12 +24,12 @@ def _write_wav(path: Path) -> None:
 
 class ProfessionalCloudScriptTests(unittest.TestCase):
     def test_json_stdout_contains_only_final_receipt_and_broker_receipts_are_logged(self) -> None:
-        self._assert_cloud_receipt(relative_paths=False)
+        self._assert_cloud_receipt(relative_paths=False, first_failure=True)
 
     def test_relative_paths_follow_powershell_location(self) -> None:
         self._assert_cloud_receipt(relative_paths=True)
 
-    def _assert_cloud_receipt(self, *, relative_paths: bool) -> None:
+    def _assert_cloud_receipt(self, *, relative_paths: bool, first_failure: bool = False) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scripts = root / "scripts"
@@ -49,7 +50,13 @@ if ($Action -eq 'AgentSecretRef') {
         [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"error","error":"runtime_rebind_required"}')
         exit 3
     }
-    [IO.File]::WriteAllText((Join-Path $root ($Query + '.provider.json')), '{}')
+    $provider = Join-Path $root ($Query + '.provider.json')
+    $body = '{}'
+    if (Test-Path (Join-Path $root 'network.marker')) {
+        $code = if (Test-Path -LiteralPath $provider) { 'previous_outcome_unknown' } else { 'network_failure' }
+        $body = @{ status = 'failed'; error_code = $code } | ConvertTo-Json -Compress
+    }
+    [IO.File]::WriteAllText($provider, $body)
     [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"ok","action":"AgentSecretRef"}')
     exit 0
 }
@@ -81,6 +88,9 @@ else:
               'text': 'fixture transcript'}
     if '--broker-error' in sys.argv:
         result.update(status='failed', error_code=sys.argv[sys.argv.index('--broker-error') + 1])
+    elif (root / 'network.marker').exists():
+        result.update(status='failed', credential_result='Network-Failure',
+                      error_code=json.loads((root / (job_id + '.provider.json')).read_text())['error_code'])
     (root / (job_id + '.result.json')).write_text(json.dumps(result), encoding='utf-8')
     print(json.dumps({'status': 'succeeded'}))
 """, encoding="utf-8")
@@ -106,15 +116,18 @@ else:
                 invocation = ["-Command", command]
             else:
                 invocation = ["-File", *arguments]
+            if first_failure:
+                request_root.mkdir(parents=True)
+                (request_root / "network.marker").touch()
             result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", *invocation],
                 cwd=root, capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=60,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertEqual(3 if first_failure else 0, result.returncode, result.stdout + result.stderr)
             decoder = json.JSONDecoder()
             receipt, end = decoder.raw_decode(result.stdout.strip())
             self.assertEqual(len(result.stdout.strip()), end)
-            self.assertEqual("succeeded", receipt["status"])
+            self.assertEqual("failed" if first_failure else "succeeded", receipt["status"])
             log_path = Path(receipt["broker_log_path"])
             self.assertTrue(log_path.is_file())
             self.assertEqual(request_root, log_path.parent)
@@ -127,13 +140,43 @@ else:
             self.assertEqual("ReportCredentialResult",
                 log["credential_result_report_receipt"]["action"])
             if not relative_paths:
-                (request_root / 'deny.marker').touch()
+                self.assertEqual("network_failure", receipt["error_code"])
+                attempts = request_root / (receipt["job_id"] + ".attempts")
+                self.assertFalse(attempts.exists())
+                previous = {kind: (request_root / (receipt["job_id"] + f".{kind}.json")).read_bytes()
+                            for kind in ("provider", "broker", "result")}
                 retry = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File",
                     *arguments, "-ResumeJobId", receipt["job_id"]], cwd=root,
                     capture_output=True, text=True, encoding="utf-8", timeout=60,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 self.assertEqual(3, retry.returncode, retry.stdout + retry.stderr)
-                self.assertEqual("runtime_rebind_required", json.loads(retry.stdout)["error_code"])
+                retry_receipt, end = decoder.raw_decode(retry.stdout.strip())
+                self.assertEqual(len(retry.stdout.strip()), end)
+                self.assertEqual("previous_outcome_unknown", retry_receipt["error_code"])
+                self.assertEqual(1, len(list(attempts.iterdir())))
+                index_path = Path(retry_receipt["previous_attempt_path"])
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+                self.assertEqual(index_path.parent.name, index["attempt_id"])
+                self.assertEqual(receipt["job_id"], index["job_id"])
+                self.assertEqual(3, len(index["receipts"]))
+                for entry in index["receipts"]:
+                    kind = Path(entry["source_path"]).name.split(".")[-2]
+                    self.assertEqual(previous[kind], Path(entry["path"]).read_bytes())
+                    self.assertEqual(hashlib.sha256(previous[kind]).hexdigest(), entry["sha256"])
+                archived = json.loads((index_path.parent / (receipt["job_id"] + ".provider.json")).read_text())
+                self.assertEqual("network_failure", archived["error_code"])
+                (request_root / 'deny.marker').touch()
+                denied = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File",
+                    *arguments, "-ResumeJobId", receipt["job_id"]], cwd=root,
+                    capture_output=True, text=True, encoding="utf-8", timeout=60,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self.assertEqual(3, denied.returncode, denied.stdout + denied.stderr)
+                denied_receipt = json.loads(denied.stdout)
+                self.assertEqual("runtime_rebind_required", denied_receipt["error_code"])
+                self.assertEqual(2, len(list(attempts.iterdir())))
+                blocked_archive = Path(denied_receipt["previous_attempt_path"]).parent
+                blocked = json.loads((blocked_archive / (receipt["job_id"] + ".provider.json")).read_text())
+                self.assertEqual("previous_outcome_unknown", blocked["error_code"])
 
     def test_relocated_script_uses_its_own_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

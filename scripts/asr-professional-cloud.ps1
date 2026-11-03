@@ -128,6 +128,35 @@ function Write-BrokerReceiptLog {
     [IO.File]::WriteAllText($Path, ($log | ConvertTo-Json -Depth 30), $utf8NoBom)
 }
 
+function Save-PreviousCloudAttempt {
+    param([string] $Root, [string] $JobId)
+    $existing = @('provider', 'broker', 'result') | ForEach-Object {
+        $path = Join-Path $Root ($JobId + '.' + $_ + '.json')
+        if (Test-Path -LiteralPath $path -PathType Leaf) { $path }
+    }
+    if (-not $existing) { return '' }
+    $attemptId = [Guid]::NewGuid().ToString()
+    $directory = Join-Path $Root ($JobId + '.attempts/' + $attemptId)
+    $null = New-Item -ItemType Directory -Path $directory -Force
+    $receipts = @(foreach ($path in $existing) {
+        $snapshot = Join-Path $directory ([IO.Path]::GetFileName($path))
+        Copy-Item -LiteralPath $path -Destination $snapshot
+        [ordered]@{
+            source_path = $path
+            path = $snapshot
+            sha256 = (Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    })
+    $indexPath = Join-Path $directory 'index.json'
+    $index = [ordered]@{
+        schema = 'zh_asr.cloud_attempt_receipts.v1'; job_id = $JobId
+        attempt_id = $attemptId; archived_utc = [DateTimeOffset]::UtcNow.ToString('o')
+        receipts = $receipts
+    }
+    [IO.File]::WriteAllText($indexPath, ($index | ConvertTo-Json -Depth 8), $utf8NoBom)
+    return $indexPath
+}
+
 function Get-CloudFailureAdvice {
     param(
         [AllowEmptyString()][string] $Status,
@@ -285,6 +314,7 @@ $credentialRef = [string]$prepared.credential_ref
 if (-not $brokerTarget -or -not $credentialRef) {
     Write-BoundedReceipt -Status 'failed' -ErrorCode 'cloud_credential_route_missing' -ExitCode 3
 }
+$previousAttemptPath = Save-PreviousCloudAttempt -Root $resolvedRequestRoot -JobId $jobId
 
 $brokerOutput = ''
 $brokerExitCode = 1
@@ -390,6 +420,9 @@ Write-BrokerReceiptLog -Path $brokerLogPath -JobId $jobId `
 
 $result | Add-Member -NotePropertyName result_path -NotePropertyValue $resultPath -Force
 $result | Add-Member -NotePropertyName broker_log_path -NotePropertyValue $brokerLogPath -Force
+if ($previousAttemptPath) {
+    $result | Add-Member -NotePropertyName previous_attempt_path -NotePropertyValue $previousAttemptPath -Force
+}
 $result | Add-Member `
     -NotePropertyName credential_report_status `
     -NotePropertyValue $credentialReportStatus `
