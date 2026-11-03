@@ -13,13 +13,19 @@ from typing import Any, Callable, Mapping, Sequence
 import wave
 
 from zh_asr.config import EngineSpec
-from zh_asr.process_control import PROCESS_TOKEN_ENV, terminate_wsl_processes
+from zh_asr.process_control import (
+    PROCESS_TOKEN_ENV,
+    managed_popen_kwargs,
+    terminate_process_tree,
+    terminate_wsl_processes,
+)
 from zh_asr.text_normalizer import to_simplified
 
 
 REQUEST_SCHEMA = "zh_asr.firered_worker.request.v1"
 RESPONSE_SCHEMA = "zh_asr.firered_worker.response.v1"
 FIRERED_OFFICIAL_MAX_AUDIO_SEC = 40.0
+WSL_READINESS_TIMEOUT_SEC = 10.0
 
 
 class InvalidFireRedAudio(ValueError):
@@ -121,6 +127,10 @@ class FireRedWorkerAdapter:
         model_dir = _resolve_model_dir(spec, cache_dir, model_aliases, path_style)
         source_dir = _resolve_optional_worker_path(options.get("source_dir"), path_style)
         timeout_sec = _positive_float(options.get("timeout_sec", 600), "timeout_sec")
+        readiness_timeout_sec = _positive_float(
+            options.get("wsl_readiness_timeout_sec", WSL_READINESS_TIMEOUT_SEC),
+            "wsl_readiness_timeout_sec",
+        )
         max_audio_sec = _effective_max_audio_sec(
             _positive_float(
                 options.get("max_audio_sec", FIRERED_OFFICIAL_MAX_AUDIO_SEC),
@@ -148,6 +158,7 @@ class FireRedWorkerAdapter:
             source_dir=source_dir,
             device=device,
             timeout_sec=timeout_sec,
+            readiness_timeout_sec=readiness_timeout_sec,
             max_audio_sec=max_audio_sec,
             path_style=path_style,
             inference_options=inference_options,
@@ -163,6 +174,7 @@ class FireRedWorkerModel:
         source_dir: str | None,
         device: str,
         timeout_sec: float,
+        readiness_timeout_sec: float,
         max_audio_sec: float,
         path_style: str,
         inference_options: dict[str, Any],
@@ -173,6 +185,7 @@ class FireRedWorkerModel:
         self.source_dir = source_dir
         self.device = device
         self.timeout_sec = timeout_sec
+        self.readiness_timeout_sec = readiness_timeout_sec
         self.max_audio_sec = max_audio_sec
         self.path_style = path_style
         self.inference_options = dict(inference_options)
@@ -222,6 +235,11 @@ class FireRedWorkerModel:
         env.setdefault("PYTHONUTF8", "1")
         if self.path_style == "wsl":
             env.setdefault("WSL_UTF8", "1")
+            _check_wsl_ready(
+                self.command,
+                env,
+                timeout_sec=min(self.readiness_timeout_sec, self.timeout_sec),
+            )
         kwargs: dict[str, Any] = {
             "input": json.dumps(request, ensure_ascii=False),
             "text": True,
@@ -274,6 +292,57 @@ class FireRedWorkerModel:
                 detail = str(error or "Unknown FireRed worker error")
             raise FireRedWorkerError(f"FireRed worker reported failure: {detail}")
         return _normalize_worker_result(response.get("result"))
+
+
+def _check_wsl_ready(
+    command: Sequence[str],
+    env: Mapping[str, str],
+    *,
+    timeout_sec: float,
+) -> None:
+    """Separate an unavailable WSL runtime from slow model loading."""
+
+    distribution = _wsl_distribution(command)
+    if not distribution:
+        return
+    probe = [command[0], "-d", distribution, "--exec", "/bin/true"]
+    try:
+        process = subprocess.Popen(
+            probe,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=dict(env),
+            **managed_popen_kwargs(),
+        )
+    except OSError as exc:
+        raise FireRedWorkerError(
+            f"FireRed WSL runtime unavailable for {distribution}: "
+            f"could not start readiness probe: {type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_sec)
+    except subprocess.TimeoutExpired as exc:
+        # Only the probe's Windows launcher tree is ours. Do not restart WSL
+        # or signal other Linux work to recover a failed readiness check.
+        terminate_process_tree(process)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        raise FireRedWorkerTimeout(
+            f"FireRed WSL runtime unavailable: {distribution} did not execute "
+            f"/bin/true within {timeout_sec:g}s; model loading was not started."
+        ) from exc
+    if process.returncode != 0:
+        detail = _diagnostic_excerpt(stderr or stdout)
+        raise FireRedWorkerError(
+            f"FireRed WSL runtime unavailable for {distribution}: readiness "
+            f"probe exited with code {process.returncode}"
+            f"{': ' + detail if detail else '.'}"
+        )
 
 
 def _cleanup_timed_out_worker(

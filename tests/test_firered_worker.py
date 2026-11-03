@@ -11,7 +11,7 @@ import unittest
 import wave
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 def _write_wav(
@@ -318,10 +318,13 @@ class FireRedAdapterTests(unittest.TestCase):
                 path_style="wsl",
             )
 
-            with patch(
-                "zh_asr.adapters.firered_worker.subprocess.run",
-                return_value=completed,
-            ) as run:
+            with (
+                patch("zh_asr.adapters.firered_worker._check_wsl_ready") as ready,
+                patch(
+                    "zh_asr.adapters.firered_worker.subprocess.run",
+                    return_value=completed,
+                ) as run,
+            ):
                 wrapper = FireRedWorkerAdapter().build_model(spec, "cuda:0", root / "cache", {})
                 wrapper.generate(input=str(audio))
 
@@ -333,6 +336,7 @@ class FireRedAdapterTests(unittest.TestCase):
         self.assertTrue(request["audio_path"].startswith("/mnt/"))
         self.assertTrue(request["model_dir"].startswith("/mnt/"))
         self.assertEqual(run.call_args.kwargs["env"]["WSL_UTF8"], "1")
+        self.assertEqual(ready.call_args.kwargs["timeout_sec"], 10.0)
 
     def test_registry_wsl_shorthand_builds_isolated_command(self):
         from zh_asr.adapters.firered_worker import FireRedWorkerAdapter
@@ -365,6 +369,8 @@ class FireRedAdapterTests(unittest.TestCase):
             ],
         )
         self.assertEqual(wrapper.path_style, "wsl")
+        self.assertEqual(wrapper.readiness_timeout_sec, 10.0)
+        self.assertEqual(wrapper.timeout_sec, 12.0)
         self.assertTrue(wrapper.source_dir.startswith("/mnt/"))
 
     def test_timeout_and_worker_failure_are_actionable(self):
@@ -427,6 +433,7 @@ class FireRedAdapterTests(unittest.TestCase):
                 {},
             )
             with (
+                patch("zh_asr.adapters.firered_worker._check_wsl_ready"),
                 patch.dict(os.environ, {PROCESS_TOKEN_ENV: "chineseasr-timeout-test"}),
                 patch(
                     "zh_asr.adapters.firered_worker.subprocess.run",
@@ -440,6 +447,50 @@ class FireRedAdapterTests(unittest.TestCase):
                     wrapper.generate(input=str(audio))
 
         cleanup.assert_called_once_with(("Ubuntu-22.04",), "chineseasr-timeout-test")
+
+    def test_wsl_readiness_timeout_cleans_only_its_probe_before_model_start(self):
+        from zh_asr.adapters.firered_worker import FireRedWorkerAdapter, FireRedWorkerTimeout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "model"
+            model_dir.mkdir()
+            audio = root / "sample.wav"
+            _write_wav(audio)
+            wrapper = FireRedWorkerAdapter().build_model(
+                _engine_spec(
+                    model_dir,
+                    runtime="wsl",
+                    timeout_sec=900,
+                    worker_command=["wsl.exe", "-d", "Ubuntu", "--", "python3"],
+                ),
+                "cuda:0", root / "cache", {},
+            )
+            process = Mock()
+            process.communicate.side_effect = subprocess.TimeoutExpired("wsl.exe", 10)
+            with (
+                patch("zh_asr.adapters.firered_worker.subprocess.Popen", return_value=process) as launch,
+                patch("zh_asr.adapters.firered_worker.subprocess.run") as inference,
+                patch("zh_asr.adapters.firered_worker.terminate_process_tree") as cleanup,
+                patch("zh_asr.adapters.firered_worker.terminate_wsl_processes") as linux_cleanup,
+            ):
+                with self.assertRaisesRegex(FireRedWorkerTimeout, "WSL runtime unavailable.*10s.*not started"):
+                    wrapper.generate(input=str(audio))
+
+        self.assertEqual(launch.call_args.args[0], ["wsl.exe", "-d", "Ubuntu", "--exec", "/bin/true"])
+        inference.assert_not_called()
+        cleanup.assert_called_once_with(process)
+        linux_cleanup.assert_not_called()
+
+    def test_wsl_readiness_reports_runtime_failure_and_keeps_model_timeout_separate(self):
+        from zh_asr.adapters.firered_worker import FireRedWorkerError, _check_wsl_ready
+
+        process = Mock(returncode=1)
+        process.communicate.return_value = ("", "The distribution is unavailable")
+        with patch("zh_asr.adapters.firered_worker.subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(FireRedWorkerError, "readiness probe exited with code 1.*unavailable"):
+                _check_wsl_ready(["wsl.exe", "-d", "Ubuntu", "--", "python3"], {}, timeout_sec=10)
+        process.communicate.assert_called_once_with(timeout=10)
 
     def test_generate_many_uses_one_worker_process_for_multiple_batch_one_inputs(self):
         from zh_asr.adapters.firered_worker import FireRedWorkerAdapter
