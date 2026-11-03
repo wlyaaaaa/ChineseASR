@@ -1,10 +1,10 @@
 # ChineseASR
 
-本地中文录音转写与桌面听写工具。普通转写常会漏字、在静音处凭空出字，却不标出哪里可能错；这里用两路模型转写录音文件并保留两路的分歧，输出正文和疑点清单，争议片段可在本地回听页面复核，需要时还能输出逐句时间和匿名说话人。桌面听写用单模型，把识别结果直接输入当前文本框。
+中文录音转写与桌面听写工具。录音来源、AI 会话的云优先顺序及费用边界统一见 [项目规则](AGENTS.md)；云入口见下文。需要本地回退或交叉核对时，两路模型保留分歧并输出正文和疑点清单，争议片段可在本地回听页面复核，需要时还能输出逐句时间和匿名说话人。桌面听写用单模型，把识别结果直接输入当前文本框。
 
-一次文件转写：录音 → `Qwen3-ASR-1.7B` 主转写、`SenseVoiceSmall` 对照 → 标出两路不一致、静音出字、异常重复等疑点 → 回听复核。最短入口见下文「一分钟使用」：通过本地接口提交任务、先返回任务状态，调用方不会被长时间卡住。
+本地回退或交叉核对路线：录音 → `Qwen3-ASR-1.7B` 主转写、`SenseVoiceSmall` 对照 → 标出两路不一致、静音出字、异常重复等疑点 → 回听复核。对应入口见下文「一分钟使用」：通过本地接口提交任务、先返回任务状态，调用方不会被长时间卡住。
 
-`ChineseASR` 是一个本地优先的中文语音转文字项目，目标是把中文录音转成可审计、低幻觉、可复现的文本。它面向 Windows + CUDA 工作站，默认 quick 使用 `SenseVoiceSmall`，strict 使用 `Qwen3-ASR-1.7B + SenseVoiceSmall`。可选的 `FireRedASR2-LLM` 是 `high_quality` 路线的词汇主引擎，不会自动取代默认 strict 组合。
+`ChineseASR` 的目标是把中文录音转成可审计、低幻觉、可复现的文本。本地引擎面向 Windows + CUDA 工作站，quick 使用 `SenseVoiceSmall`，strict 使用 `Qwen3-ASR-1.7B + SenseVoiceSmall`。可选的 `FireRedASR2-LLM` 是 `high_quality` 路线的词汇主引擎，不会自动取代本地 strict 组合。
 
 项目同时提供录音转写和 Windows 桌面语音输入。本文是使用入口；项目执行规则见 `AGENTS.md`，机器状态以 PCConfig 和 Windows 现场为准。
 
@@ -44,7 +44,7 @@
 - **低幻觉和可复核**：双模型分歧、静音出字、模板废话、异常重复、繁体残留、超长无标点等都会进入 audit / metrics / review。
 - **适合 AI Agent 调用**：`scripts\asr-smart.ps1` 通过本地 API 提交任务，快速返回 job 状态，避免长时间卡住命令行或上层 Agent。
 
-它以本地转写为主。疑难录音在配置的免费期内自动加跑阿里云百炼复核，无需逐次授权；余额为零仍可能产生后付费欠费，当前不开「免费额度用完即停」、本地不计算用量（决定：功能原话补录 FY03；9/26 疑难录音自动云复核的费用边界）。自动路径只看疑难信号、模型免费期日期及已有的云端停用状态；过期写明「免费期已到期，云端未跑」。云端若报额度、欠费、余额、权限或模型下线错误，记录原因并停止后续自动上传；临时网络等错误只记本次。显式授权的单次上传过期仍可执行，结果注明可能计费。本地正文先保存，云结果另外保存并标出分歧；普通清楚录音和桌面听写不上传。
+AI 文件转写通过 [唯一云入口](#重要录音与存疑质量复核云入口) 的 `-CloudFirst` 执行 [项目规则](AGENTS.md) 所定顺序；它直接检查配置免费期和已有停用状态，不需要先启动本地作业。Win+H 桌面听写继续使用独立的本地单模型。
 
 ## 文件转写质量与模型维护
 
@@ -79,7 +79,6 @@ CI 在干净 Windows 运行器上安装 FFmpeg 和无 GPU 测试依赖，仍使�
 ## 不适合场景
 
 - 不愿意本地安装模型权重和 Python 环境。
-- 希望普通清楚录音或整个文件夹无筛选地上传云端；自动云复核仅处理本地质量信号标出的疑难录音。
 - 需要英文、多语种或字幕生产工具链作为主目标。
 
 ## 默认模型策略
@@ -92,7 +91,7 @@ CI 在干净 Windows 运行器上安装 FFmpeg 和无 GPU 测试依赖，仍使�
 | `strict` 对照引擎 | `sensevoice` | 快速中文声学锚点，用于发现分歧和疑似幻觉 |
 | `quick` | `sensevoice` | 单模型快速转写 |
 | 可选证据级词汇主引擎 | `fireredasr2-llm` | 隔离在 WSL 中运行；仅在显式选择时作为 strict 主引擎 |
-| 疑难录音云复核 | `qwen-audio-3.1-asr-flash` / `qwen-audio-3.1-asr-flash-message` | 短录音、方言、说话人分离用 Flash；热词及较长录音用 Message 分段实时流。模型与路由见 `configs/models.yaml` |
+| 文件云转写与复核 | `qwen-audio-3.1-asr-flash` / `qwen-audio-3.1-asr-flash-message` | 短录音、方言、说话人分离用 Flash；热词及较长录音用 Message 分段实时流。模型与路由见 `configs/models.yaml` |
 | 显式时间线/匿名说话人 baseline | `paraformer` | 固定 `speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4`，输出逐句 `sentence_info` 时间和 CAM++ 匿名聚类；已知两方通话的调用方可传 `--preset-spk-num 2`，省略时自动聚类；不改变 quick/strict 默认 |
 
 **Paraformer 逐句时间先核实再截证据**：`sentence_info` 的时间只用来定位。时间不可靠时（与回听、云端分段时间或另一路结果对不上，或出现只有标点的空句），截取证据前先用 ffmpeg 按候选时间截出该段（前后各留几秒），单独放进一个文件夹用 `scripts\transcribe-folder.ps1`（strict）重新听写，确认片段里就是要截的那几句，再按核实过的时间截取。
@@ -188,14 +187,21 @@ cd <repo-root>
 
 `scripts\asr-professional-cloud.ps1` 是唯一的云上传入口。3.1 Flash 用 HTTPS Base64，按配置每段最多 120 秒；3.1 Flash-Message 用 WebSocket，把本地录音切成最多 30 秒的单声道 PCM 段逐段送入。Message 是实时接口，不能直接提交长文件。录音原件及声道来源不改动；需要说话人分离时选 Flash，返回的说话人编号只在单段内有效。Filetrans 虽能处理长录音，但要求公网可访问 URL，本项目不使用。
 
-入口在创建任务和读取音频前要求一个且仅一个用途开关，以及下列一种上传依据：
+AI 处理当前选定的录音时直接使用下面的入口，不需要已有本地作业或本地质量结果；重要证据在命令中加 `-Important`，普通录音不加。`-CloudFirst` 沿用配置免费期与停用检查，失败或过期时保留回执，按 [项目规则](AGENTS.md) 本地兜底。
+
+```powershell
+.\scripts\asr-professional-cloud.ps1 -Audio '<原录音绝对路径>' -CloudFirst -Json
+.\scripts\asr-professional-cloud.ps1 -Audio '<重要原录音绝对路径>' -CloudFirst -Important -Json
+```
+
+用途与上传依据分开校验：
 
 1. `-Important`：当前录音已被明确归类为重要或专业录音。请求仍写入 `importance=important`，回执仍为 `important_only=true`；
-2. `-QualityReview`：仅用于已授权、当前选定的普通存疑本地转写质量复核。请求写入独立的 `purpose=quality_review`，没有 `importance` 字段，回执为 `important_only=false`；
-3. `-CloudUploadAuthorized`：调用方确认这次可以上传；或 `-AutomaticReview -LocalOutDir <本地结果目录>`：只在目录内已有疑难证据时，沿自动复核许可执行（决定：功能原话补录 FY03；9/26 疑难录音自动云复核的费用边界）；
+2. `-CloudFirst` 不加 `-Important` 时是普通录音转写，`purpose=transcription`；不能和 `-QualityReview` 同时使用。`-QualityReview` 仍用于当前选定的本地存疑转写复核，`purpose=quality_review`、`important_only=false`；
+3. `-CloudFirst` 自带免费期内的自动上传依据，无需 `-CloudUploadAuthorized` 或 `-LocalOutDir`。既有 `-AutomaticReview -LocalOutDir <本地结果目录>` 保留为本地疑难结果的补跑路线；`-CloudUploadAuthorized` 仍表示调用方已取得本次明确上传授权；
 4. Password Center 对配置的受管目标及 worker 哈希的完整性验证通过。当前配置仍指向已有 `qwen-audio3-asr-important-once`；厂商一把 Key 的最终登记形式由 PCConfig 相关调查确定，本项目不绕过既有固定哈希。
 
-两个用途开关不能同时使用。普通质量复核不会自动启动 FireRed、Qwen 或其它本地双引擎；只有结果与上下文仍有影响理解的分歧时，才按实际需要回核原音和本地结果。重要证据录音仍适用下文的本地证据链与人工核听要求。
+`-Important` 和 `-QualityReview` 不能同时使用。云入口不会自动启动 FireRed、Qwen 或其它本地双引擎；是否补本地证据链及如何回核分歧，按 [项目规则](AGENTS.md) 和当次证据用途决定。
 
 持钥传输由密码中心 `vendor_api_worker.py` 负责（受管目标 `qwen-audio3-asr-important-once`，PCConfig 安装并固定哈希），本项目只准备请求。
 
@@ -203,9 +209,9 @@ cd <repo-root>
 
 3.1 Flash-Message 的 WebSocket `result-generated.payload.usage` 是该段任务截至当前事件的**累计**用量，`task-finished.payload.usage` 是最终累计用量（[官方服务端事件说明](https://help.aliyun.com/zh/model-studio/qwen-asr-message-server-events)）。结果投影每段优先取最后一个非空 `task-finished` 用量；若完成事件没有用量，取最后一个非空 `result-generated` 用量，不把递增快照相加。作业级 `usage` 只在所有音频段均有相同的数值字段时逐字段相加；任何一段缺失或字段不一致则保留 `null`，不把未知当作零。这里的 `duration` 是供应商逐段报告的累计音频秒数之和，不是去重后的源音时长，也不用于本地额度计算。
 
-免费期截止日写在 `configs/models.yaml` 的每个云模型 `free_until` 中，按北京时间的带时区时刻作不含截止点的比较。3.1 两款按本人转述的 2026-12-21 暂取当日 00:00 早停，不是控制台实时核验的到期时刻。自动模式过期不上传并写 `cloud.review.json`；换成新模型或更新确有新免费期的日期后恢复。显式 `-CloudUploadAuthorized` 不受日期阻断，但过期结果标「可能计费」。这只比日期，不算用量。
+免费期截止只读 `configs/models.yaml` 中每个云模型的 `free_until`，按北京时间的带时区时刻作不含截止点的比较；日期的来历与精确性以配置登记为准，不是控制台实时核验。到期、停用、费用及续免费提醒统一按 [项目规则](AGENTS.md) 执行，命令不计算剩余额度。
 
-百炼返回免费额度用尽、欠费、余额不足、无权限或模型下线类错误时，`outputs\cloud-jobs\auto-cloud-state.json` 记录停用原因，后续疑难作业保留本地转写并在 `cloud.review.json` 写明云端未跑及原因。`python scripts/cloud-review-state.py status` 回执含 `enabled`、`free_until`、各自动路由模型的 `model_free_until`、`reason` 和 `failure_reason`，供驾驶舱读取。要主动停用时运行 `python scripts/cloud-review-state.py pause --reason "暂停原因"`；手动暂停不会因模型或免费期配置变化自动解除。本人说恢复时运行 `python scripts/cloud-review-state.py resume`；配置新增或替换模型 ID、更新免费期日期，或 `credit_cycle` 更新为实际新额度时，只解除旧供应商停用。恢复操作仍受免费期限制。网络抖动、超时、限流与服务端 5xx 只记本次失败，不触发持久停用。百炼的「免费额度用完即停」保持不启用，此入口不以该开关为条件（决定：9/26 疑难录音自动云复核的费用边界）。
+`outputs\cloud-jobs\auto-cloud-state.json` 保存停用状态。`python scripts/cloud-review-state.py status` 回执含 `enabled`、`free_until`、各自动路由模型的 `model_free_until`、`reason` 和 `failure_reason`；只读状态不查询账号额度。主动停用使用 `python scripts/cloud-review-state.py pause --reason "暂停原因"`，本人说恢复时用 `python scripts/cloud-review-state.py resume`；状态恢复与错误分类的规则归 [项目规则](AGENTS.md)。
 
 本地转写的 `quality.review.json` 标 `needs_review`、两引擎分歧、`[疑似]`、`provisional` 或作业的 `-Important` 标记会触发自动复核。本地 API 服务只在 `cloud.review.json` 标记 `pending_ai_session`，并把状态放入 `asr-smart.ps1 -Json` 的 `cloud_review` 字段；服务自身不上传。`asr-smart` 若先返回运行中，AI 应按 `next_status_command` 查询终态，再读取 `cloud_review`。处理该录音的 AI 会话读到待补跑状态后，在自己的进程链中执行侧车给出的 `asr-professional-cloud.ps1 -Audio <原音> -QualityReview`（重要录音改用 `-Important`）`-AutomaticReview -LocalOutDir <结果目录> -EvidenceStatus <本地状态> -Json`。密码中心自己认出实际调用方（Codex 桌面版、Claude 会话及它们派出的子代理），不用传调用方参数。停用或所选模型免费期到期时，本地只记录原因，不安排上传。
 
@@ -215,7 +221,7 @@ cd <repo-root>
 明确返回失败原因，不会静默冒充本地结果。运行时重绑缺失时不上传，重绑后可按原用途重试；网络、
 限流、超时或供应商 5xx 只影响本次，不盲目自动重发同一段音频；需要时以原音和已留结果检查后再试。其它云失败明确建议改用本地
 `asr-smart`，并保持云结果与本地证据链分开。对于法律、投诉、雇佣等证据录音，云结果是能力优先的
-专业候选，同时仍应运行 FireRed + Qwen 本地证据链并人工核听，不能把云转写本身当作证据认证。
+专业候选，本地证据链按当次证据用途和真实分歧需要补做，不能把云转写本身当作证据认证。
 
 `asr-professional-cloud.ps1 -Json` 的标准输出只给最终转写回执，密钥代理的两份原始回执保存在回执所列 `outputs\cloud-jobs\<job>.broker.json`；批量补跑会先按原音哈希、用途和声道复用已成功的云结果，修正误记的失败侧车，再决定是否上传。
 
