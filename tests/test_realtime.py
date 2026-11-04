@@ -124,16 +124,66 @@ class RealtimeTests(unittest.TestCase):
         self.assertFalse(engine.is_ready)
 
     def test_shared_deadline_cannot_return_partial_success_or_reload(self):
-        engine = FakeEngine(("甲", "乙"), delay=0.04)
-        session = self.session(engine)
-        session.prepare()
-        result = session.transcribe({"path": self.wav(40), "budget_seconds": 0.02})
-        self.assertEqual(result["state"], "failed")
-        self.assertEqual(result["text"], "")
-        self.assertGreater(result["timings"]["total"], 0.02)
-        self.assertFalse(engine.is_ready)
-        self.assertEqual(session.transcribe({"path": "ignored.wav"})["state"], "not_ready")
-        self.assertEqual(engine.loads, 1)
+        path = self.wav(40)
+        # Binary fractions keep every deadline and elapsed-time assertion exact.
+        for stage, preparation, delays, infer_timeouts, covered in (
+            ("prepare", 0.375, (), [], 0),
+            ("first_chunk", 0.0625, (0.25,), [0.1875], 0),
+            ("later_chunk", 0.0625, (0.125, 0.125), [0.1875, 0.0625], 1),
+        ):
+            with self.subTest(stage=stage):
+                clock = SimpleNamespace(now=0.0)
+                calls = {name: [] for name in ("activate", "infer", "park", "abort")}
+
+                class TimedEngine(FakeEngine):
+                    def activate_ready(self, *, timeout):
+                        calls["activate"].append(timeout)
+                        super().activate_ready(timeout=timeout)
+
+                    def transcribe_ready(self, audio, *, timeout):
+                        calls["infer"].append(timeout)
+                        self.sizes.append(len(audio))
+                        clock.now += delays[len(calls["infer"]) - 1]
+                        return next(self.texts)
+
+                    def park_ready(self, *, timeout):
+                        calls["park"].append(timeout)
+                        super().park_ready(timeout=timeout)
+
+                    def abort(self, *, timeout):
+                        calls["abort"].append(timeout)
+                        super().abort(timeout=timeout)
+
+                def prepare_audio(audio, source_rate, target_rate):
+                    clock.now += preparation
+                    return audio
+
+                engine = TimedEngine(("甲", "乙"))
+                session = self.session(engine)
+                with patch("zh_asr.realtime.time", SimpleNamespace(monotonic=lambda: clock.now)), \
+                     patch("zh_asr.dictation.resample_audio", side_effect=prepare_audio):
+                    session.prepare()
+                    result = session.transcribe({"path": path, "budget_seconds": 0.5})
+                    self.assertEqual(result["state"], "failed")
+                    self.assertEqual(result["error_type"], "TimeoutError")
+                    self.assertEqual(result["text"], "")
+                    self.assertEqual(result["timings"]["prepare"], preparation)
+                    self.assertEqual(result["timings"]["infer"], sum(delays))
+                    self.assertEqual(result["timings"]["total"], preparation + sum(delays))
+                    self.assertEqual(calls["activate"], [] if stage == "prepare" else [0.1875])
+                    self.assertEqual(calls["infer"], infer_timeouts)
+                    self.assertEqual(engine.sizes, [320000] * len(infer_timeouts))
+                    self.assertEqual(calls["park"], [])
+                    self.assertEqual(calls["abort"], [0.5 - clock.now])
+                    self.assertEqual(result["coverage"]["status"], "partial" if covered else "unknown")
+                    self.assertEqual(result["coverage"]["segments"], [
+                        {"start_seconds": 0, "end_seconds": 20, "text": "甲",
+                         "state": "text", "infer_seconds": 0.125}
+                    ] if covered else [])
+                    self.assertFalse(engine.is_ready)
+                    self.assertIsNone(result["workerPID_after"])
+                    self.assertEqual(session.transcribe({"path": "ignored.wav"})["state"], "not_ready")
+                    self.assertEqual(engine.loads, 1)
 
     def test_eof_close_and_empty_result_cleanup(self):
         for request in ("", '{"action":"close"}\n'):
