@@ -185,6 +185,55 @@ class RealtimeTests(unittest.TestCase):
                     self.assertEqual(session.transcribe({"path": "ignored.wav"})["state"], "not_ready")
                     self.assertEqual(engine.loads, 1)
 
+    def _served(self, engine, requests, idle_park_seconds):
+        class Events(list):
+            def write(self, text):
+                if text.strip():
+                    self.append(json.loads(text))
+                    engine.calls.append(self[-1]["event"])
+
+            def flush(self):
+                pass
+
+        def stream():
+            for request, pause in requests:
+                yield json.dumps(request) + "\n"
+                time.sleep(pause)
+
+        events = Events()
+        serve(self.session(engine), stream(), events, idle_park_seconds=idle_park_seconds)
+        return events
+
+    class RecordingEngine(FakeEngine):
+        def __init__(self, texts=("正文",)):
+            super().__init__(texts)
+            self.calls = []
+
+        def activate_ready(self, *, timeout):
+            self.calls.append("activate")
+
+        def park_ready(self, *, timeout):
+            self.calls.append("park")
+
+    def test_result_arrives_before_park_and_consecutive_voices_stay_on_gpu(self):
+        engine = self.RecordingEngine(("甲", "乙"))
+        request = {"action": "transcribe", "path": self.wav(1)}
+        events = self._served(engine, [(request, 0), (request, 0.4)], idle_park_seconds=0.1)
+        self.assertEqual([event["text"] for event in events if event["event"] == "result"], ["甲", "乙"])
+        self.assertEqual(engine.calls, ["ready", "activate", "result", "activate", "result", "park", "closed"])
+
+    def test_idle_park_failure_reaps_worker_and_later_voice_is_not_ready(self):
+        class FailingPark(self.RecordingEngine):
+            def park_ready(self, *, timeout):
+                raise RuntimeError("park failed")
+
+        engine = FailingPark()
+        request = {"action": "transcribe", "path": self.wav(1)}
+        events = self._served(engine, [(request, 0.4), (request, 0)], idle_park_seconds=0.1)
+        states = [event["state"] for event in events if event["event"] == "result"]
+        self.assertEqual(states, ["completed", "not_ready"])
+        self.assertEqual(engine.loads, 1)
+
     def test_eof_close_and_empty_result_cleanup(self):
         for request in ("", '{"action":"close"}\n'):
             engine = FakeEngine()

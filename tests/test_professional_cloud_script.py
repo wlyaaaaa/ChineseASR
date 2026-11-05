@@ -178,6 +178,78 @@ else:
                 blocked = json.loads((blocked_archive / (receipt["job_id"] + ".provider.json")).read_text())
                 self.assertEqual("previous_outcome_unknown", blocked["error_code"])
 
+    def test_success_report_is_skipped_only_while_credential_is_known_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            audio = root / "voice.wav"
+            _write_wav(audio)
+            request_root = root / "outputs" / "cloud-jobs"
+            broker = scripts / "fake-broker.ps1"
+            broker.write_text("""param([string]$Action, [string]$Query,
+    [string]$ResultCode, [string]$OperationId, [string]$SecretRefRequestPath, [switch]$Json)
+$root = '%s'
+if ($Action -eq 'AgentSecretRef') {
+    [IO.File]::WriteAllText((Join-Path $root ($Query + '.provider.json')), '{}')
+    [Console]::Out.WriteLine('{"status":"ok","action":"AgentSecretRef"}')
+    exit 0
+}
+Add-Content -LiteralPath (Join-Path $root 'reports.log') -Value $ResultCode
+[Console]::Out.WriteLine('{"status":"pass","credential_update_required":false}')
+""" % str(request_root).replace("'", "''"), encoding="utf-8")
+            (scripts / "cloud-review-pipeline.py").write_text("""import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[sys.argv.index('--root') + 1])
+intent_path = sys.argv[sys.argv.index('--intent') + 1]
+job_id = json.loads(Path(intent_path).read_text(encoding='utf-8'))['job_id']
+if sys.argv[1] == 'prepare':
+    (root / (job_id + '.pending.json')).write_text('{}', encoding='utf-8')
+    print(json.dumps({'status': 'ready', 'secret_ref_target': job_id, 'job_id': job_id,
+                      'intent_path': intent_path, 'request_path': str(root / (job_id + '.pending.json')),
+                      'credential_ref': 'fixture'}))
+else:
+    failing = (root / 'fail.marker').exists()
+    (root / (job_id + '.result.json')).write_text(json.dumps({
+        'schema': 'chineseasr.qwen-audio3-transcription-result.v1', 'job_id': job_id,
+        'purpose': 'transcription', 'important_only': False,
+        'status': 'failed' if failing else 'succeeded', 'error_code': '',
+        'credential_result': 'Network-Failure' if failing else 'Success',
+        'cloud_upload_performed': True, 'text': 'fixture'}), encoding='utf-8')
+    print('{}')
+""", encoding="utf-8")
+            source = SCRIPT.read_text(encoding="utf-8")
+            original = "$brokerPath = 'C:\\ProgramData\\PCConfig\\AuthorityHost\\tools\\Invoke-SecretBroker.ps1'"
+            relocated = scripts / SCRIPT.name
+            relocated.write_text(source.replace(original,
+                "$brokerPath = '" + str(broker).replace("'", "''") + "'"), encoding="utf-8")
+
+            def run() -> str:
+                result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(relocated),
+                    "-Audio", str(audio), "-CloudFirst", "-Json"], cwd=root, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", timeout=60,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                return json.loads(result.stdout)["credential_report_status"]
+
+            reports = request_root / "reports.log"
+            self.assertEqual("reported", run())
+            self.assertEqual("skipped_no_state_change", run())
+            self.assertEqual(["Success"], reports.read_text().split())
+
+            (request_root / "fail.marker").touch()
+            self.assertEqual("reported", run())
+            (request_root / "fail.marker").unlink()
+            self.assertEqual("reported", run())
+            self.assertEqual(["Success", "Network-Failure", "Success"], reports.read_text().split())
+
+            health = request_root / "credential-health.json"
+            state = json.loads(health.read_text(encoding="utf-8"))
+            state["verified_utc"] = "2020-01-01T00:00:00+00:00"
+            health.write_text(json.dumps(state), encoding="utf-8")
+            self.assertEqual("reported", run())
+
     def test_relocated_script_uses_its_own_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

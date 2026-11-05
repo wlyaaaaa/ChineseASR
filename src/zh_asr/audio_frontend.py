@@ -57,6 +57,7 @@ def prepare_pcm16_mono(
     ffmpeg: str | None = None,
     timeout_sec: float = DEFAULT_CONVERSION_TIMEOUT_SEC,
     materialize_owner: bool = False,
+    in_process_wav: bool = False,
 ) -> PreparedAudio:
     source = source_path.resolve()
     if not source.exists():
@@ -118,15 +119,23 @@ def prepare_pcm16_mono(
         validate_prepared_audio_owner(prepared, derived_root)
         return prepared
 
-    executable = ffmpeg or shutil.which("ffmpeg")
-    if not executable:
+    # Starting the 200+ MB ffmpeg build costs seconds; plain mono PCM needs only
+    # a resampler. Channel mixing and every other format stay with ffmpeg.
+    resample_in_process = (
+        in_process_wav
+        and materialize_owner
+        and source_format is not None
+        and source_format[1:3] == (1, 2)
+    )
+    executable = None if resample_in_process else ffmpeg or shutil.which("ffmpeg")
+    if not resample_in_process and not executable:
         raise RuntimeError(
             "ffmpeg is required to convert this audio to 16 kHz, 16-bit, mono PCM WAV."
         )
     if not materialize_owner:
         derived_root.mkdir(parents=True, exist_ok=True)
 
-    command = (
+    command = ("soxr", "HQ", str(sample_rate)) if resample_in_process else (
         str(executable),
         "-nostdin",
         "-hide_banner",
@@ -165,15 +174,18 @@ def prepare_pcm16_mono(
 
     try:
         try:
-            subprocess.run(
-                list(command),
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=conversion_timeout,
-            )
+            if resample_in_process:
+                _resample_pcm16_mono_wav(source, partial, sample_rate)
+            else:
+                subprocess.run(
+                    list(command),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=conversion_timeout,
+                )
         except subprocess.TimeoutExpired as exc:
             raise AudioConversionTimeout(
                 f"ffmpeg audio conversion timed out after {conversion_timeout:g}s: {source}"
@@ -203,12 +215,27 @@ def prepare_pcm16_mono(
         channels=converted_format[1],
         sample_width_bytes=converted_format[2],
         duration_sec=converted_format[3],
-        ffmpeg_version=_ffmpeg_version(executable),
+        ffmpeg_version="" if resample_in_process else _ffmpeg_version(executable),
         conversion_command=command,
     )
     if materialize_owner:
         validate_prepared_audio_owner(prepared, derived_root)
     return prepared
+
+
+def _resample_pcm16_mono_wav(source: Path, destination: Path, sample_rate: int) -> None:
+    import numpy as np
+    import soxr
+
+    with wave.open(str(source), "rb") as reader:
+        source_rate = reader.getframerate()
+        samples = np.frombuffer(reader.readframes(reader.getnframes()), dtype="<i2")
+    resampled = soxr.resample(samples, source_rate, sample_rate, quality="HQ")
+    with wave.open(str(destination), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(resampled.astype("<i2").tobytes())
 
 
 def validate_prepared_audio_owner(

@@ -157,6 +157,28 @@ function Save-PreviousCloudAttempt {
     return $indexPath
 }
 
+function Test-CredentialRecentlyHealthy {
+    param([string] $Path, [string] $CredentialRef)
+    try {
+        $health = Get-Content -LiteralPath $Path -Raw -Encoding utf8 -ErrorAction Stop | ConvertFrom-Json
+        $age = [DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse([string]$health.verified_utc)
+        return [string]$health.credential_ref -ceq $CredentialRef -and
+            $age -ge [TimeSpan]::Zero -and $age -lt [TimeSpan]::FromHours(24)
+    }
+    catch { return $false }
+}
+
+function Save-CredentialHealth {
+    param([string] $Path, [string] $CredentialRef, [AllowEmptyString()][string] $ReportRaw)
+    try { $receipt = $ReportRaw | ConvertFrom-Json -Depth 20 }
+    catch { return }
+    if ([string]$receipt.status -cne 'pass' -or $receipt.credential_update_required -ne $false) { return }
+    $temporary = $Path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    $health = [ordered]@{ credential_ref = $CredentialRef; verified_utc = [DateTimeOffset]::UtcNow.ToString('o') }
+    [IO.File]::WriteAllText($temporary, ($health | ConvertTo-Json), $utf8NoBom)
+    Move-Item -LiteralPath $temporary -Destination $Path -Force
+}
+
 function Get-CloudFailureAdvice {
     param(
         [AllowEmptyString()][string] $Status,
@@ -233,7 +255,10 @@ $audioPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPS
 if (-not (Test-Path -LiteralPath $audioPath -PathType Leaf)) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'audio_file_missing' -ExitCode 2
 }
-$cloudMutex = [Threading.Mutex]::new($false, 'Global\ChineseASRCloudUploadOnce')
+# Per audio content: identical bytes resume one job and must take turns even under
+# two paths, while different voice messages no longer queue behind each other.
+$audioContentHash = (Get-FileHash -LiteralPath $audioPath -Algorithm SHA256).Hash
+$cloudMutex = [Threading.Mutex]::new($false, 'Global\ChineseASRCloudUploadOnce-' + $audioContentHash)
 $mutexHeld = $false
 try {
     try { $mutexHeld = $cloudMutex.WaitOne([TimeSpan]::FromHours(24)) }
@@ -396,7 +421,16 @@ $allowedCredentialResults = @(
 $credentialResult = [string]$result.credential_result
 $credentialReportStatus = 'not-reported'
 $reportOutput = ''
-if ($credentialResult -cin $allowedCredentialResults) {
+$credentialHealthPath = Join-Path $resolvedRequestRoot 'credential-health.json'
+if ($credentialResult -cne 'Success') {
+    Remove-Item -LiteralPath $credentialHealthPath -Force -ErrorAction SilentlyContinue
+}
+if ($credentialResult -ceq 'Success' -and (Test-CredentialRecentlyHealthy -Path $credentialHealthPath -CredentialRef $credentialRef)) {
+    # A success report only clears update_required; with that already known to be
+    # false the broker changes nothing, so the seconds it costs buy nothing.
+    $credentialReportStatus = 'skipped_no_state_change'
+}
+elseif ($credentialResult -cin $allowedCredentialResults) {
     try {
         $reportOutput = & pwsh -NoProfile -NonInteractive -File $brokerPath `
             -Action ReportCredentialResult `
@@ -406,6 +440,9 @@ if ($credentialResult -cin $allowedCredentialResults) {
             -Json 2>&1 | Out-String
         if ($LASTEXITCODE -eq 0) {
             $credentialReportStatus = 'reported'
+            if ($credentialResult -ceq 'Success') {
+                Save-CredentialHealth -Path $credentialHealthPath -CredentialRef $credentialRef -ReportRaw $reportOutput
+            }
         }
         else {
             $credentialReportStatus = 'report-failed'

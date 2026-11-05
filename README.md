@@ -48,7 +48,7 @@ AI 文件转写通过 [唯一云入口](#重要录音与存疑质量复核云入
 
 ### 所选 WAV 的热识别会话
 
-`python -m zh_asr.realtime` 通过标准输入/输出 JSONL 连续处理所选 WAV，不开端口、不写录音或文字日志。启动先冷加载一次、GPU 预热并回 CPU/RAM；收到 `event=ready` 后才接消息，回执含 `coldLoad`、`warmup`、`park` 耗时和实际 `workerPID`。逐行发送 `{"action":"transcribe","path":"E:/selected.wav","request_id":"opaque","budget_seconds":10}`，同一 worker 按听写配置的 `max_chunk_sec` 连续覆盖最多 60 秒全文；源文件只读，结果绑定 SHA-256、时长、每段起止与真实耗时。请求共享最多 10 秒预算，失败或超时不返回成功；`partial`/`empty` 不表示无语音或已完整理解。`status` 核验模型已准备且 child 仍活；未就绪不自动重载，只有显式 `prepare` 或重新启动才能准备。`close` 或 stdin EOF 清理 worker。此入口不接答案、热词或润色。运行需要既有环境及模型缓存；独立 worktree 应复用原项目 `models` 目录联接，不复制权重。
+`python -m zh_asr.realtime` 通过标准输入/输出 JSONL 连续处理所选 WAV，不开端口、不写录音或文字日志。启动先冷加载一次、GPU 预热并回 CPU/RAM；收到 `event=ready` 后才接消息，回执含 `coldLoad`、`warmup`、`park` 耗时和实际 `workerPID`。逐行发送 `{"action":"transcribe","path":"E:/selected.wav","request_id":"opaque","budget_seconds":10}`，同一 worker 按听写配置的 `max_chunk_sec` 连续覆盖最多 60 秒全文；源文件只读，结果绑定 SHA-256、时长、每段起止与真实耗时。结果一出就返回，连续 3 秒没有新请求才把模型放回 CPU/RAM 并释放 GPU 租约，所以连续几条语音不用来回搬模型；放回失败会清理 worker，下一条返回 `not_ready`。请求共享最多 10 秒预算，失败或超时不返回成功；`partial`/`empty` 不表示无语音或已完整理解。`status` 核验模型已准备且 child 仍活；未就绪不自动重载，只有显式 `prepare` 或重新启动才能准备。`close` 或 stdin EOF 清理 worker。此入口不接答案、热词或润色。运行需要既有环境及模型缓存；独立 worktree 应复用原项目 `models` 目录联接，不复制权重。
 
 ## 文件转写质量与模型维护
 
@@ -191,7 +191,7 @@ cd <repo-root>
 
 `scripts\asr-professional-cloud.ps1` 是唯一的云上传入口。3.1 Flash 用 HTTPS Base64，按配置每段最多 120 秒；3.1 Flash-Message 用 WebSocket，把本地录音切成最多 30 秒的单声道 PCM 段逐段送入。Message 是实时接口，不能直接提交长文件。录音原件及声道来源不改动；需要说话人分离时选 Flash，返回的说话人编号只在单段内有效。Filetrans 虽能处理长录音，但要求公网可访问 URL，本项目不使用。
 
-AI 处理当前选定的录音时直接使用下面的入口，不需要已有本地作业或本地质量结果；重要证据在命令中加 `-Important`，普通录音不加。`-CloudFirst` 沿用配置免费期与停用检查，失败或过期时保留回执，按 [项目规则](AGENTS.md) 本地兜底。
+AI 处理当前选定的录音时直接使用下面的入口，不需要已有本地作业或本地质量结果；重要证据在命令中加 `-Important`，普通录音不加。`-CloudFirst` 沿用配置免费期与停用检查，失败或过期时保留回执，按 [项目规则](AGENTS.md) 本地兜底。不同内容的音频可以同时上传（实测 6 条同时全部成功），内容相同的轮流。单声道 16 位 WAV 在程序内转采样，不启动 ffmpeg。成功结果向密码中心的上报只会清除“凭据需要更新”标记，所以 24 小时内确认过状态正常、之后又没有失败时跳过（回执 `credential_report_status=skipped_no_state_change`，状态记在 `outputs/cloud-jobs/credential-health.json`，删除它下次就照常上报）；任何失败都当场上报。
 
 ```powershell
 .\scripts\asr-professional-cloud.ps1 -Audio '<原录音绝对路径>' -CloudFirst -Json

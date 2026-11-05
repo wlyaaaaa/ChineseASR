@@ -495,7 +495,8 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
     if intent.get("channel_index") is not None:
         selected, _ = extract_channel(source, int(intent["channel_index"]),
                                       work / "selected-channel")
-    prepared = prepare_pcm16_mono(selected, work / "prepared", materialize_owner=True)
+    prepared = prepare_pcm16_mono(selected, work / "prepared", materialize_owner=True,
+                                  in_process_wav=True)
     duration_sec = prepared.duration_sec
     profile = str(intent.get("model_profile") or select_model(config,
         duration_sec=duration_sec, hotwords=intent.get("hotwords") or {},
@@ -619,8 +620,14 @@ def _resume_request(root: Path, intent: dict[str, Any], matching: dict[str, Any]
         except ValueError as exc:
             raise CloudReviewError("resume_job_invalid") from exc
     else:
-        candidates = sorted(root.glob("*.intent.json"), key=lambda path: path.stat().st_mtime_ns,
-                            reverse=True)
+        def modified(path: Path) -> int:
+            # A concurrent job for another recording can discard its own staging.
+            try:
+                return path.stat().st_mtime_ns
+            except OSError:
+                return 0
+
+        candidates = sorted(root.glob("*.intent.json"), key=modified, reverse=True)
     for path in candidates:
         old = _read_json(path)
         if not old or any(old.get(key, default) != intent.get(key, default)

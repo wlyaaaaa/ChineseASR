@@ -8,10 +8,17 @@ import io
 import json
 import math
 from pathlib import Path
+import queue
 import sys
+import threading
 import time
 
 from .dictation_worker import DictationWorkerNotReady, ProcessDictationEngine, _engine_main
+
+# Consecutive voices skip the weight transfers, without holding the GPU lease
+# long enough to stand in the way of dictation or other same-family work.
+IDLE_PARK_SECONDS = 3.0
+PARK_TIMEOUT_SECONDS = 20.0
 
 
 def _worker(connection, settings):
@@ -25,6 +32,7 @@ class RealtimeSession:
         self.settings = settings
         self.engine = engine or ProcessDictationEngine(settings, worker_target=_worker)
         self._prepared = False
+        self.parked = True
 
     def status(self):
         return {"event": "status", "state": "ready" if self._prepared and self.engine.is_ready else "not_ready",
@@ -32,6 +40,9 @@ class RealtimeSession:
 
     def prepare(self):
         self._prepared = False
+        # The first voice should not pay for imports the prepared session can make now.
+        import scipy.signal  # noqa: F401
+        import soundfile  # noqa: F401
         timings = {}
         for name, operation in (("coldLoad", self.engine.load), ("warmup", self.engine.warmup),
                                 ("park", self.engine.park)):
@@ -41,11 +52,12 @@ class RealtimeSession:
         if not self.engine.is_ready:
             raise DictationWorkerNotReady("Worker exited during prepare")
         self._prepared = True
+        self.parked = True
         return dict(self.status(), event="ready", timings=timings)
 
     def transcribe(self, request):
         started = time.monotonic()
-        timings = dict.fromkeys(("prepare", "activate", "infer", "park"), 0.0)
+        timings = dict.fromkeys(("prepare", "activate", "infer"), 0.0)
         result = {"event": "result", "request_id": request.get("request_id"),
                   "state": "failed", "text": "", "model": self.settings.engine,
                   "workerPID": self.engine.worker_pid, "timings": timings,
@@ -86,6 +98,7 @@ class RealtimeSession:
                                        source.samplerate, self.settings.sample_rate)
             timings[stage] = time.monotonic() - stage_started
             stage, stage_started = "activate", time.monotonic()
+            self.parked = False
             self.engine.activate_ready(timeout=remaining())
             timings[stage] = time.monotonic() - stage_started
             stage, stage_started = "infer", time.monotonic()
@@ -101,10 +114,6 @@ class RealtimeSession:
                                  "text": text, "state": "text" if text else "empty",
                                  "infer_seconds": time.monotonic() - before})
             timings[stage] = time.monotonic() - stage_started
-            stage, stage_started = "park", time.monotonic()
-            self.engine.park_ready(timeout=remaining())
-            remaining()
-            timings[stage] = time.monotonic() - stage_started
             result["text"] = "".join(segment["text"] for segment in segments)
             result["coverage"]["status"] = "complete"
             result["state"] = ("empty" if not result["text"] else
@@ -117,6 +126,7 @@ class RealtimeSession:
             # Input rejection preserves the hot worker; model failures reap it.
             if stage != "prepare" or not self.engine.is_ready:
                 self._prepared = False
+                self.parked = True
                 cleanup_started = time.monotonic()
                 try:
                     self.engine.abort(timeout=min(0.25, max(0, deadline - cleanup_started)))
@@ -127,6 +137,18 @@ class RealtimeSession:
         result["workerPID_after"] = self.engine.worker_pid
         return result
 
+    def park_idle(self):
+        """Release the GPU once results are out; a failed park reaps the worker."""
+        self.parked = True
+        try:
+            self.engine.park_ready(timeout=PARK_TIMEOUT_SECONDS)
+        except Exception:
+            self._prepared = False
+            try:
+                self.engine.abort(timeout=0.25)
+            except Exception:
+                pass
+
     def close(self):
         previous = self.engine.worker_pid
         self.engine.dispose()
@@ -134,13 +156,28 @@ class RealtimeSession:
                 "workerPID": self.engine.worker_pid}
 
 
-def serve(session, input_stream, output_stream):
+def serve(session, input_stream, output_stream, idle_park_seconds=IDLE_PARK_SECONDS):
     def emit(value):
         print(json.dumps(value, ensure_ascii=False), file=output_stream, flush=True)
 
+    lines = queue.SimpleQueue()
+
+    def read():
+        for line in input_stream:
+            lines.put(line)
+        lines.put(None)
+
     try:
         emit(session.prepare())
-        for line in input_stream:
+        threading.Thread(target=read, daemon=True).start()
+        while True:
+            try:
+                line = lines.get(timeout=None if session.parked else idle_park_seconds)
+            except queue.Empty:
+                session.park_idle()
+                continue
+            if line is None:
+                break
             try:
                 request = json.loads(line)
                 action = request.get("action")

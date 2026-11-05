@@ -202,6 +202,46 @@ class AudioFrontendTests(unittest.TestCase):
             self.assertEqual(sentinel.read_bytes(), sentinel_bytes)
             self.assertTrue(partial.is_symlink())
 
+    def test_mono_pcm_resamples_in_process_without_starting_ffmpeg(self):
+        from zh_asr.audio_frontend import prepare_pcm16_mono
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "voice.wav"
+            self._write_wav(source, sample_rate=24000, frames=24000)
+            with patch("zh_asr.audio_frontend.subprocess.run",
+                       side_effect=AssertionError("ffmpeg started")):
+                prepared = prepare_pcm16_mono(source, root / "derived",
+                                              materialize_owner=True, in_process_wav=True)
+            self.assertTrue(prepared.converted)
+            self.assertEqual(prepared.ffmpeg_version, "")
+            self.assertEqual(prepared.sample_rate, 16000)
+            self.assertEqual(prepared.channels, 1)
+            self.assertAlmostEqual(prepared.duration_sec, 1.0, places=3)
+            self.assertEqual(prepared.conversion_command[0], "soxr")
+
+    def test_channel_mixing_stays_with_ffmpeg(self):
+        from zh_asr.audio_frontend import prepare_pcm16_mono
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "call.wav"
+            self._write_wav(source, channels=2, sample_rate=24000, frames=2400)
+
+            def fake_run(command, **kwargs):
+                self._write_wav(Path(command[-1]))
+                return type("Completed", (), {"stdout": "", "stderr": ""})()
+
+            with (
+                patch("zh_asr.audio_frontend.shutil.which", return_value="ffmpeg"),
+                patch("zh_asr.audio_frontend._ffmpeg_version", return_value="ffmpeg test"),
+                patch("zh_asr.audio_frontend.subprocess.run", side_effect=fake_run) as run,
+            ):
+                prepared = prepare_pcm16_mono(source, root / "derived",
+                                              materialize_owner=True, in_process_wav=True)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(prepared.ffmpeg_version, "ffmpeg test")
+
     def test_noncompliant_input_uses_deterministic_ffmpeg_derivative(self):
         from zh_asr.audio_frontend import prepare_pcm16_mono
 
