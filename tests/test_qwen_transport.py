@@ -1,4 +1,5 @@
 import hashlib
+from http.client import BadStatusLine
 import io
 import json
 from pathlib import Path
@@ -88,8 +89,42 @@ class DirectTests(unittest.TestCase):
         sender = mock.Mock(side_effect=[direct.provider_error("InvalidApiKey", "", 401),
             direct.CloudSendError("network_failure", uncertain=True)])
         self.assertEqual(self.run_part(sender)[0], "cloud_key_refresh_network_failure")
-        self.assertEqual(self.run_part(sender)[0], "previous_outcome_unknown")
+        again, retained = self.run_part(sender)
+        self.assertEqual((again, retained["new_requests"], retained["outcome_unknown"]), ("previous_outcome_unknown", 0, True))
         self.assertEqual((sender.call_count, self.store.syncs, self.store.ciphertext), (2, 1, b"old ciphertext"))
+
+    def test_unclassified_candidate_response_is_unknown_and_never_retried(self):
+        sender = mock.Mock(side_effect=[direct.provider_error("InvalidApiKey", "", 401), BadStatusLine("old-fake-key new-fake-key")])
+        error, result = self.run_part(sender)
+        self.assertEqual(error, "cloud_key_refresh_cloud_transport_failed")
+        self.assertTrue(result["outcome_unknown"])
+        self.assertTrue(result["first_failure"]["outcome_unknown"])
+        marker = json.loads(next(self.root.glob("*.checkpoints/1.json")).read_text())
+        self.assertEqual(marker["status"], "outcome_unknown")
+        again, retained = self.run_part(sender)
+        self.assertEqual((again, retained["new_requests"], retained["outcome_unknown"]), ("previous_outcome_unknown", 0, True))
+        self.assertEqual((sender.call_count, self.store.syncs, self.store.ciphertext), (2, 1, b"old ciphertext"))
+        self.assertNotIn("fake-key", json.dumps(result))
+
+    def test_local_copy_errors_keep_closed_reasons_without_revealing_exception_text(self):
+        class KeyCopyError(RuntimeError):
+            def __init__(self, code): super().__init__("old-fake-key"); self.code = code
+        self.store.KeyCopyError = KeyCopyError
+        sender = mock.Mock(side_effect=AssertionError("key unavailable cannot send"))
+        for code in ("key_copy_missing", "key_copy_unreadable", "key_copy_decryption_failed", "key_copy_value_invalid"):
+            self.store.load_key = mock.Mock(side_effect=KeyCopyError(code))
+            error, result = self.run_part(sender)
+            self.assertEqual(error, "cloud_" + code)
+            self.assertNotIn("fake-key", json.dumps(result))
+        class LegacyKeyCopyError(RuntimeError): pass
+        self.store.KeyCopyError = LegacyKeyCopyError
+        self.store.load_key = mock.Mock(side_effect=LegacyKeyCopyError("key_copy_missing"))
+        self.assertEqual(self.run_part(sender)[0], "cloud_key_copy_missing")
+        for error in (RuntimeError("old-fake-key"), KeyCopyError("old-fake-key")):
+            self.store.load_key = mock.Mock(side_effect=error)
+            self.assertEqual(self.run_part(sender)[0], "cloud_key_unavailable")
+        sender.assert_not_called()
+        self.assertEqual(self.store.syncs, 0)
 
     def test_unknown_network_outcome_never_refreshes_or_repeats(self):
         sender = mock.Mock(side_effect=direct.CloudSendError("network_failure", uncertain=True))

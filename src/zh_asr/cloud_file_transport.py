@@ -30,18 +30,21 @@ def _send(request_path: Path, root: Path) -> str:
         cached = cached or {}
         if cached:
             if cached.get("identity") != identity: raise CloudSendError("checkpoint_request_changed")
-            if cached.get("status") in {"in_flight", "outcome_unknown"}: raise CloudSendError("previous_outcome_unknown")
+            if cached.get("status") in {"in_flight", "outcome_unknown"}: raise CloudSendError("previous_outcome_unknown", uncertain=True)
             if cached.get("status") == "succeeded":
                 if request_digest(cached["result"]) != cached.get("result_sha256"): raise CloudSendError("checkpoint_corrupt")
                 result.update(status="succeeded", credential_result="Success", results=[cached["result"]], reused_requests=1)
                 _write_state(path, result)
                 return ""
+        store = None
         try:
             store = key_copy()
             keys.append(store.load_key("qwen"))
         except Exception as exc:
-            code = getattr(exc, "code", "unavailable")
-            raise CloudSendError("cloud_key_" + code if isinstance(code, str) and code.replace("_", "").isalnum() else "cloud_key_unavailable") from None
+            code = getattr(exc, "code", None)
+            if code is None and store and isinstance(exc, getattr(store, "KeyCopyError", ())): code = str(exc)
+            allowed = {"key_copy_missing", "key_copy_unreadable", "key_copy_decryption_failed", "key_copy_value_invalid"}
+            raise CloudSendError("cloud_" + code if isinstance(code, str) and code in allowed else "cloud_key_unavailable") from None
         marker = dict(identity=identity, status="in_flight")
         if isinstance(cached.get("first_failure"), dict): marker["first_failure"] = cached["first_failure"]
         _write_state(checkpoint, marker)
@@ -119,7 +122,7 @@ def transmit_cloud_chunks(request_path: Path, intent_path: Path, root: Path, *,
         else:
             checkpoint = _read_json(provider_path.with_name(provider_path.name + ".checkpoints") / (ident + ".json")) or {}
             if checkpoint.get("status") in {"in_flight", "outcome_unknown"}:
-                result.update(status="blocked", error_code="previous_outcome_unknown")
+                result.update(status="blocked", error_code="previous_outcome_unknown", outcome_unknown=True)
                 progress("failed")
                 return result
             _write_state(part_path, part)
@@ -137,7 +140,7 @@ def transmit_cloud_chunks(request_path: Path, intent_path: Path, root: Path, *,
             if (provider.get("status") != "succeeded" or len(provider.get("results", [])) != 1
                     or provider["results"][0].get("id") != ident or not _chunk_completed(provider["results"][0])):
                 result.update({key: provider[key] for key in ("status", "error_code", "credential_result",
-                    "provider_error_code", "provider_error_message", "first_failure", "transport_diagnostic") if key in provider})
+                    "provider_error_code", "provider_error_message", "first_failure", "transport_diagnostic", "outcome_unknown") if key in provider})
                 result["error_code"] = result["error_code"] or error or "cloud_chunk_incomplete"
                 progress("failed")
                 return result

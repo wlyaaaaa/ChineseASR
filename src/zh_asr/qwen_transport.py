@@ -22,6 +22,7 @@ class CloudSendError(RuntimeError):
         self.code, self.uncertain = code, uncertain
         self.fields = dict(error_code=code, credential_result=credential_result,
                            provider_error_code=provider_code, provider_error_message=provider_message)
+        if uncertain: self.fields["outcome_unknown"] = True
 
     @property
     def invalid_key(self):
@@ -182,6 +183,7 @@ def transmit(operation, root, cutoff, store, keys):
             if "ASR_RESPONSE_HAVE_NO_WORDS" in (exc.fields["provider_error_code"], exc.fields["provider_error_message"]):
                 return dict(no_speech=True, **exc.fields)
             raise
+        except Exception: raise CloudSendError("cloud_transport_failed", uncertain=True, credential_result="Network-Failure") from None
     try: return once(keys[-1])
     except CloudSendError as exc:
         if exc.uncertain or not exc.invalid_key: raise
@@ -191,7 +193,7 @@ def transmit(operation, root, cutoff, store, keys):
         try: response.append(once(candidate)); return True
         except CloudSendError as exc: failed.append(exc); return False
     try: state = store.sync_key("qwen", validate=validate)
-    except Exception: raise CloudSendError("cloud_key_sync_failed") from None
+    except Exception: state = {"status": "failed", "reason": "failed"}
     if response:
         return dict(response[0], key_copy_sync={k: state[k] for k in ("status", "reason") if k in state})
     if state.get("status") != "ok":

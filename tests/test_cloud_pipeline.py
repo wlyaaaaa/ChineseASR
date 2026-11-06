@@ -334,11 +334,27 @@ class CloudPipelineTests(unittest.TestCase):
             "status": "succeeded", "credential_result": "Success", "new_requests": 1,
             "results": [{"id": "1", "http_status": 200, "provider_request_id": "actual-request",
                          "raw_response": {"output": {"text": "正文"}}}]}), encoding="utf-8")
+        def assert_current_completion(result, before):
+            completed = datetime.fromisoformat(result["completed_utc"])
+            self.assertIsNotNone(completed.utcoffset())
+            self.assertGreaterEqual(completed, before)
+            self.assertLessEqual(completed, datetime.now().astimezone())
+        before = datetime.now().astimezone()
         result = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
         self.assertEqual(200, result["http_status"])
         self.assertEqual("actual-request", result["provider_request_id"])
         self.assertEqual(200, result["chunks"][0]["http_status"])
         self.assertEqual("actual-request", result["chunks"][0]["provider_request_id"])
+        self.assertFalse(result["outcome_unknown"])
+        assert_current_completion(result, before)
+        body = json.loads(provider.read_text("utf-8"))
+        for completed in (None, "", "2026-11-06T10:11:12+00:00"):
+            body["completed_utc"] = completed
+            provider.write_text(json.dumps(body), encoding="utf-8")
+            before = datetime.now().astimezone()
+            result = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
+            if completed: self.assertEqual(result["completed_utc"], completed)
+            else: assert_current_completion(result, before)
 
     def test_multi_chunk_diagnostics_do_not_invent_job_transport_scalars(self) -> None:
         _wav(self.audio, frames=16000 * 12)
@@ -360,13 +376,14 @@ class CloudPipelineTests(unittest.TestCase):
                 chunks[1]["http_status"] = second_status
             provider.write_text(json.dumps({"schema": "passwordcenter.vendor-result.v1",
                 "vendor": "qwen", "request_sha256": document["vendor_request_sha256"],
-                "status": "failed", "error_code": "previous_outcome_unknown",
+                "status": "failed", "error_code": "previous_outcome_unknown", "outcome_unknown": True,
                 "http_status": 200, "provider_request_id": "not-a-job-id",
                 "transport_diagnostic": diagnostic, "first_failure": first,
                 "results": chunks}), encoding="utf-8")
             result = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
             self.assertIsNone(result["http_status"])
             self.assertIsNone(result["provider_request_id"])
+            self.assertTrue(result["outcome_unknown"])
             self.assertEqual([200, second_status], [chunk["http_status"] for chunk in result["chunks"]])
             self.assertEqual(["first-id", "second-id"], [c["provider_request_id"] for c in result["chunks"]])
             self.assertEqual(first, result["first_failure"])
@@ -577,7 +594,10 @@ class CloudPipelineTests(unittest.TestCase):
     def test_cli_handoff_marks_broker_failure_without_secret_or_upload(self) -> None:
         intent = self.intent()
         script = ROOT / "scripts" / "cloud-review-pipeline.py"
-        prepare = subprocess.run([sys.executable, str(script), "prepare", "--root",
+        bootstrap = ("import runpy,sys;from zh_asr import file_job;"
+                     "file_job._access_open=lambda:True;"
+                     "sys.argv=sys.argv[1:];runpy.run_path(sys.argv[0],run_name='__main__')")
+        prepare = subprocess.run([sys.executable, "-c", bootstrap, str(script), "prepare", "--root",
             str(self.root), "--intent", str(intent), "--config", str(CONFIG)],
             cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(0, prepare.returncode, prepare.stderr)
