@@ -13,6 +13,8 @@ from unittest import mock
 from zh_asr import file_job as jobs
 
 REAL_POPEN = subprocess.Popen
+REAL_SPAWN = jobs._spawn_worker
+REAL_JSON_PROCESS = jobs._json_process
 
 
 class FileJobTests(unittest.TestCase):
@@ -26,8 +28,8 @@ class FileJobTests(unittest.TestCase):
         self.gpu = self.enterContext(mock.patch.object(jobs, "_gpu_wait_reason", return_value=""))
         self.process = self.enterContext(mock.patch.object(jobs, "_json_process"))
         self.http = self.enterContext(mock.patch.object(jobs, "_http"))
-        self.spawn = self.enterContext(mock.patch.object(jobs.subprocess, "Popen"))
-        self.spawn.return_value.pid = 1234
+        self.spawn = self.enterContext(mock.patch.object(jobs, "_spawn_worker", return_value=1234))
+        self.enterContext(mock.patch.object(jobs, "_cloud_budget", return_value=600))
         self.enterContext(mock.patch.object(jobs, "_alive", return_value=True))
 
     def _artifact(self):
@@ -63,7 +65,7 @@ class FileJobTests(unittest.TestCase):
         self.assertEqual(jobs.file_job(self.audio, root=self.root)["status"], "queued")
         self.assertEqual(jobs.file_job(self.audio, root=self.root)["status"], "queued")
         self.spawn.assert_called_once()
-        self.assertIn("--audio", self.spawn.call_args.args[0])
+        self.spawn.assert_called_once_with(self.audio.resolve(), self.root)
         self.process.assert_not_called()
 
     def test_cloud_success_without_sentence_times_does_not_run_local(self):
@@ -204,3 +206,140 @@ class FileJobTests(unittest.TestCase):
                 if child.poll() is None:
                     child.kill()
                     child.wait(timeout=5)
+
+    def _state(self, **updates):
+        path = self.root / "outputs/api/file-jobs" / (self.digest + ".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = dict(status="running", route="local", local_job_id="old", cloud_attempted=True,
+                     source_audio_sha256=self.digest)
+        state.update(updates)
+        path.write_text(json.dumps(state), encoding="utf-8")
+        return path
+
+    def test_api_disappears_reuses_finished_artifact_before_any_network_or_restart(self):
+        self._state()
+        _, artifact = self._artifact()
+        self.reuse.return_value = dict(status="succeeded", route="local", timestamps="available", artifact=artifact)
+        self.assertEqual(jobs.file_job(self.audio, root=self.root)["status"], "succeeded")
+        self.http.assert_not_called(); self.spawn.assert_not_called(); self.process.assert_not_called()
+
+    def test_written_bundle_is_recovered_when_api_never_persisted_terminal_status(self):
+        from zh_asr.result_writer import write_transcript_bundle
+        self._state()
+        directory = self.root / "outputs/api/old"
+        write_transcript_bundle(self.audio, [{"text": "完整合成稿"}], directory, "paraformer")
+        snapshot = dict(jobs=[dict(job_id="old", status="running", out_dir=str(directory),
+            request=dict(mode="quick", engine="paraformer", audio=str(self.audio), audio_sha256=self.digest), outputs={})])
+        (self.root / "outputs/api/jobs.json").write_text(json.dumps(snapshot), encoding="utf-8")
+        completed = jobs.file_job(self.audio, root=self.root)
+        self.assertEqual((completed["status"], completed["reason"]),
+                         ("succeeded", "reused_interrupted_local_bundle"))
+        self.http.assert_not_called(); self.spawn.assert_not_called(); self.process.assert_not_called()
+
+    def test_partial_markdown_cannot_turn_interrupted_job_into_success(self):
+        from zh_asr.result_writer import write_transcript_bundle
+        self._state()
+        directory = self.root / "outputs/api/old"
+        bundle = write_transcript_bundle(self.audio, [{"text": "完整合成稿"}], directory, "paraformer")
+        Path(bundle["markdown"]).write_text("partial", encoding="utf-8")
+        (self.root / "outputs/api/jobs.json").write_text(json.dumps(dict(jobs=[dict(job_id="old", status="running",
+            out_dir=str(directory), request=dict(mode="quick", engine="paraformer", audio=str(self.audio),
+                audio_sha256=self.digest), outputs={})])), encoding="utf-8")
+        self.http.side_effect = OSError("API stopped")
+        result = jobs.file_job(self.audio, root=self.root)
+        self.assertEqual((result["status"], result["reason"]), ("queued", "local_api_recovering"))
+        self.spawn.assert_called_once()
+
+    def test_api_exit_and_snapshot_pending_restart_once_without_cloud_reupload(self):
+        self._state()
+        self.http.side_effect = OSError("synthetic API stopped")
+        first = jobs.file_job(self.audio, root=self.root)
+        self.assertEqual((first["status"], first["reason"], first["error"]),
+                         ("queued", "local_api_recovering", "local_status_unavailable"))
+        self.assertNotIn("local_job_id", first)
+        jobs.file_job(self.audio, root=self.root); self.spawn.assert_called_once()
+        self.http.side_effect = None
+        self.http.return_value = {"job": dict(status="running", job_id="recovered")}
+        self.process.return_value = dict(status="queued", job_id="recovered")
+        recovered = jobs.file_job(self.audio, worker=True, root=self.root)
+        self.assertEqual((recovered["status"], recovered["local_job_id"]), ("running", "recovered"))
+        self.assertIn("asr-smart.ps1", self.process.call_args.args[0][4])
+        self.assertNotIn("-CloudFirst", self.process.call_args.args[0])
+
+    def test_old_running_snapshot_without_file_job_record_also_recovers_offline(self):
+        self.reuse.return_value = dict(status="running", route="local", local_job_id="old")
+        self.http.side_effect = OSError("offline")
+        result = jobs.file_job(self.audio, root=self.root)
+        self.assertEqual((result["status"], result["reason"]), ("queued", "local_api_recovering"))
+        self.spawn.assert_called_once(); self.assertTrue(result["cloud_attempted"])
+
+    def test_overdue_local_job_is_failed_canceled_and_retryable(self):
+        self._state(local_started_at=time.time() - jobs.LOCAL_TIMEOUT_SECONDS - 1)
+        self.http.return_value = {"job": dict(status="running", job_id="old", request={"audio_sha256": self.digest})}
+        result = jobs.file_job(self.audio, root=self.root)
+        self.assertEqual((result["status"], result["error"], result["retryable"]),
+                         ("failed", "local_job_timeout", True))
+        self.assertNotIn("local_job_id", result)
+        self.assertTrue(any(call.kwargs.get("method") == "POST" and call.args[0].endswith("/cancel")
+                            for call in self.http.call_args_list))
+
+    def test_timeout_recovery_never_cancels_a_job_bound_to_different_audio(self):
+        self._state(local_started_at=time.time() - jobs.LOCAL_TIMEOUT_SECONDS - 1)
+        self.http.return_value = {"job": dict(status="running", job_id="old", request={"audio_sha256": "0" * 64})}
+        result = jobs.file_job(self.audio, root=self.root)
+        self.assertEqual((result["status"], result["error"]), ("failed", "local_job_binding_invalid"))
+        self.http.assert_called_once()
+
+    def test_cloud_pause_after_chunk_resumes_same_job_only_after_unlock(self):
+        self.process.return_value = dict(status="blocked", error_code="personal_access_protection_required", job_id="cloud-one")
+        paused = jobs.file_job(self.audio, worker=True, root=self.root)
+        self.assertEqual((paused["status"], paused["reason"], paused["route"]),
+                         ("queued", "personal_access_required", "cloud"))
+        self.assertTrue(paused["cloud_resume_pending"])
+        self.access.return_value = False
+        self.assertEqual(jobs.file_job(self.audio, root=self.root)["reason"], "personal_access_required")
+        self.process.assert_called_once()
+        self.access.return_value = True
+        self.process.return_value = dict(status="succeeded", source_audio_sha256=self.digest, text="fixture", job_id="cloud-one")
+        self.reuse.return_value = dict(status="succeeded", timestamps="unavailable")
+        self.assertEqual(jobs.file_job(self.audio, worker=True, root=self.root)["status"], "succeeded")
+        arguments = self.process.call_args.args[0]
+        self.assertEqual(arguments[arguments.index("-ResumeJobId") + 1], "cloud-one")
+        self.assertIn("-PersonalDataGuard", arguments)
+
+    def test_cloud_timeout_falls_back_but_does_not_resend_unknown_cloud(self):
+        self.process.side_effect = [subprocess.TimeoutExpired("fixture", 600), dict(status="queued", job_id="local")]
+        self.http.return_value = {"job": dict(status="running", job_id="local")}
+        result = jobs.file_job(self.audio, worker=True, root=self.root)
+        self.assertEqual((result["route"], result["fallback_reason"]), ("local", "cloud_entry_TimeoutExpired"))
+        jobs.file_job(self.audio, root=self.root)
+        self.assertEqual(sum("-CloudFirst" in c.args[0] for c in self.process.call_args_list), 1)
+
+    def test_stale_pid_from_reboot_is_not_a_permanent_queued_job(self):
+        self._state(status="queued", local_job_id=None, worker_pid=1234, worker_started_at=time.time() - 121)
+        jobs.file_job(self.audio, root=self.root)
+        self.spawn.assert_called_once()
+
+    @unittest.skipUnless(jobs.os.name == "nt", "Windows detached startup")
+    def test_detached_worker_uses_fixed_script_via_wmi_and_only_audio_argument(self):
+        with mock.patch.object(jobs.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b'{"pid":4321}')) as run:
+            self.assertEqual(REAL_SPAWN(self.audio, self.root), 4321)
+        payload = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(payload["cwd"], str(self.root))
+        self.assertIn("asr-file-job-worker.py", payload["command"])
+        self.assertIn(str(self.audio), payload["command"])
+        self.assertIn("Win32_Process", run.call_args.args[0][-1])
+        self.assertNotIn("ProcessStartupInformation", run.call_args.args[0][-1])
+        self.assertIn("pythonw.exe", payload["command"])
+
+    def test_cloud_idle_supervisor_terminates_only_its_owned_process_tree(self):
+        fake = mock.Mock()
+        fake.communicate.side_effect = subprocess.TimeoutExpired("fixture", 2)
+        with mock.patch.object(jobs.subprocess, "Popen", return_value=fake), \
+                mock.patch.object(jobs, "terminate_process_tree") as terminate, \
+                mock.patch.object(jobs.time, "time", side_effect=[0, jobs.CLOUD_IDLE_SECONDS + 1]), \
+                mock.patch.object(jobs.time, "monotonic", side_effect=[0, 1]):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                REAL_JSON_PROCESS(["fixture"], self.root, timeout=600,
+                                  progress_path=self.root / "progress.json")
+            terminate.assert_called_once_with(fake)

@@ -12,13 +12,15 @@ import urllib.request
 
 from .config import project_root
 from .model_lifecycle import write_json_atomic
-from .process_control import managed_popen_kwargs
+from .process_control import managed_popen_kwargs, terminate_process_tree
 from .result_writer import file_sha256
 from .transcript_readback import read_transcript_readback
 
 ACCESS_CHECK = Path(r"C:\ProgramData\PCConfig\AuthorityHost\tools\personal_data_access.py")
 API = "http://127.0.0.1:18666"
 BROKER = "http://127.0.0.1:32100/_gpu_broker/status"
+CLOUD_IDLE_SECONDS = 300
+LOCAL_TIMEOUT_SECONDS = 3600
 
 
 def _read(path: Path) -> dict:
@@ -29,11 +31,69 @@ def _read(path: Path) -> dict:
         return {}
 
 
-def _json_process(command: list[str], root: Path, timeout: int = 120) -> dict:
-    done = subprocess.run(command, cwd=root, capture_output=True, text=True,
-                          encoding="utf-8-sig", timeout=timeout,
-                          **managed_popen_kwargs())
-    return json.loads(done.stdout)
+def _json_process(command: list[str], root: Path, timeout: int = 120, *, progress_path=None) -> dict:
+    if progress_path is None:
+        done = subprocess.run(command, cwd=root, capture_output=True, text=True,
+                              encoding="utf-8-sig", timeout=timeout, **managed_popen_kwargs())
+        return json.loads(done.stdout)
+    started = time.monotonic()
+    last_progress = time.time()
+    process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               **managed_popen_kwargs())
+    try:
+        while True:
+            try:
+                stdout, _ = process.communicate(timeout=2)
+                return json.loads(stdout.decode("utf-8-sig"))
+            except subprocess.TimeoutExpired:
+                last_progress = max(last_progress, float(_read(progress_path).get("updated_at", 0)))
+                if time.monotonic() - started > timeout or time.time() - last_progress > CLOUD_IDLE_SECONDS:
+                    raise subprocess.TimeoutExpired(command, timeout)
+    except BaseException:
+        terminate_process_tree(process)
+        raise
+
+
+def _cloud_budget(audio: Path) -> int:
+    from .audio_quality import probe_duration_ms
+    try:
+        duration = probe_duration_ms(audio) / 1000
+    except (OSError, ValueError, RuntimeError):
+        duration = 300
+    return int(min(6 * 3600, max(600, 2 * duration + 300)))
+
+
+def _spawn_worker(audio: Path, root: Path) -> int:
+    arguments = [sys.executable, "-B", str(root / "scripts/asr-file-job-worker.py"), str(audio)]
+    if os.name != "nt":
+        return subprocess.Popen(arguments, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, **managed_popen_kwargs()).pid
+    # WMI is outside the submitting task's Windows Job, including its 25-minute kill limit.
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    if not pythonw.is_file():
+        raise OSError("pythonw_runtime_unavailable")
+    arguments[0] = str(pythonw)
+    script = """[Console]::InputEncoding=[Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$d=[Console]::In.ReadToEnd() | ConvertFrom-Json
+$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$d.command;CurrentDirectory=$d.cwd}
+if ($r.ReturnValue -ne 0) { throw 'file_worker_start_failed' }
+@{pid=[int]$r.ProcessId} | ConvertTo-Json -Compress
+"""
+    done = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        input=json.dumps(dict(command=subprocess.list2cmdline(arguments), cwd=str(root))).encode("utf-8"),
+        capture_output=True, timeout=20, **managed_popen_kwargs())
+    if done.returncode:
+        raise OSError("file_worker_start_failed")
+    return int(json.loads(done.stdout)["pid"])
+
+
+def _schedule_worker(state: dict, audio: Path, root: Path) -> dict:
+    try:
+        state.update(worker_pid=_spawn_worker(audio, root), worker_started_at=time.time())
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
+        state.update(status="failed", error="worker_start_" + type(exc).__name__, retryable=True)
+    return state
 
 
 def _access_open() -> bool:
@@ -100,8 +160,9 @@ def _alive(pid: int) -> bool:
         kernel.CloseHandle(handle)
 
 
-def _http(url: str) -> dict:
-    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url, timeout=5) as response:
+def _http(url: str, *, method="GET") -> dict:
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+            urllib.request.Request(url, method=method), timeout=5) as response:
         return json.load(response)
 
 
@@ -154,14 +215,76 @@ def _saved_success(state: dict) -> bool:
         return False
 
 
+def _completed_local_bundle(state: dict, root: Path) -> dict:
+    """Recover a fully written quick bundle even if API terminal persistence was interrupted."""
+    from .result_writer import extract_text
+    from .transcript_readback import _inspect_candidate
+    try:
+        record = next(row for row in _read(root / "outputs/api/jobs.json").get("jobs", [])
+                      if row.get("job_id") == state.get("local_job_id"))
+        request = record["request"]
+        if request.get("mode") != "quick" or request.get("audio_sha256") != state["source_audio_sha256"]:
+            return {}
+        engine = request.get("resolved_engine") or request.get("engine")
+        if engine != "paraformer":
+            return {}
+        directory = Path(record["out_dir"]).resolve()
+        if not directory.is_relative_to((root / "outputs/api").resolve()):
+            return {}
+        prefix = Path(request["audio"]).stem + ".paraformer"
+        raw, objective, transcript = (directory / (prefix + suffix)
+                                     for suffix in (".raw.json", ".objective-result.json", ".md"))
+        if not transcript.is_file():
+            return {}
+        candidate, _ = _inspect_candidate(job=record, request_hash=state["source_audio_sha256"],
+            output_key="raw_json", raw_value=str(raw), objective_path=objective)
+        if candidate is None:
+            return {}
+        text = extract_text(json.loads(raw.read_text("utf-8"))) or "_No speech text returned._"
+        if text not in transcript.read_text("utf-8"):
+            return {}
+        artifact = {**candidate["artifact"], "transcript": {"path": str(transcript),
+                    "size_bytes": transcript.stat().st_size, "sha256": file_sha256(transcript)}}
+        return dict(status="succeeded", route="local", job_id=record["job_id"], out_dir=str(directory),
+                    artifact=artifact, evidence_status=candidate["evidence_status"],
+                    timestamps="available" if candidate["timed_segments"] else "unavailable",
+                    reason="reused_interrupted_local_bundle", error="")
+    except (OSError, ValueError, TypeError, KeyError, StopIteration):
+        return {}
+
+
 def _local_status(state: dict, root: Path) -> dict:
+    reused = _reuse(state["source_audio_sha256"], root)
+    if reused.get("status") == "succeeded":
+        return {**state, **reused, "error": ""}
+    recovered = _completed_local_bundle(state, root)
+    if recovered:
+        return {**state, **recovered}
     try:
         job = _http(API + "/jobs/" + state["local_job_id"])["job"]
     except (OSError, ValueError, KeyError):
-        # A stopped API does not authorize submitting the same audio again.
-        return {**state, "status": "queued", "error": "local_status_unavailable"}
+        state.pop("local_job_id", None)
+        return {**state, "status": "queued", "route": "local", "cloud_attempted": True,
+                "reason": "local_api_recovering", "error": "local_status_unavailable", "recover_local": True}
+    request = job.get("request") or {}
+    if (job.get("job_id") != state["local_job_id"] or
+            request.get("audio_sha256", state["source_audio_sha256"]) != state["source_audio_sha256"]):
+        state.pop("local_job_id", None)
+        return {**state, "status": "failed", "error": "local_job_binding_invalid", "retryable": True}
     state.update(job_id=job["job_id"], out_dir=job.get("out_dir"), outputs=job.get("outputs", {}))
     status = job["status"]
+    if status not in {"queued", "running", "blocked", "succeeded", "failed", "canceled"}:
+        state.pop("local_job_id", None)
+        return {**state, "status": "failed", "error": "local_status_invalid", "retryable": True}
+    state.setdefault("local_started_at", job.get("created_at", time.time()))
+    if status in {"queued", "running"} and time.time() - state["local_started_at"] > LOCAL_TIMEOUT_SECONDS:
+        try:
+            if request.get("audio_sha256") == state["source_audio_sha256"]:
+                _http(API + "/jobs/" + state["local_job_id"] + "/cancel", method="POST")
+        except (OSError, ValueError, KeyError):
+            pass
+        state.pop("local_job_id", None)
+        return {**state, "status": "failed", "error": "local_job_timeout", "retryable": True}
     if status == "blocked":
         state.pop("local_job_id", None)
         return {**state, "status": "waiting_gpu", "error": job.get("message", "gpu_broker_conflict")}
@@ -183,17 +306,25 @@ def _local_status(state: dict, root: Path) -> dict:
 
 
 def _work(audio: Path, state: dict, root: Path, path: Path) -> dict:
-    if not state.get("cloud_attempted"):
+    if not state.get("cloud_attempted") or state.get("cloud_resume_pending"):
         # Persist before sending: even an interrupted worker must not upload again.
+        resuming = state.pop("cloud_resume_pending", False)
         state.update(status="running", route="cloud", cloud_attempted=True,
                      reason="cloud_attempt_started")
         write_json_atomic(path, state)
-        try:
-            cloud = _json_process(["pwsh", "-NoProfile", "-NonInteractive", "-File",
+        progress_path = path.with_suffix(".progress.json")
+        args = ["pwsh", "-NoProfile", "-NonInteractive", "-File",
                 str(root / "scripts/asr-professional-cloud.ps1"), "-Audio", str(audio),
-                "-CloudFirst", "-Json"], root, 86400)
+                "-CloudFirst", "-PersonalDataGuard", "-ProgressPath", str(progress_path), "-Json"]
+        if resuming and state.get("cloud_job_id"):
+            args.extend(["-ResumeJobId", state["cloud_job_id"]])
+        try:
+            cloud = _json_process(args, root, _cloud_budget(audio), progress_path=progress_path)
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             cloud = {"error_code": "cloud_entry_" + type(exc).__name__}
+        if cloud.get("error_code") == "personal_access_protection_required":
+            return {**state, "status": "queued", "route": "cloud", "cloud_resume_pending": True,
+                    "cloud_job_id": cloud.get("job_id"), "reason": "personal_access_required", "error": ""}
         if (cloud.get("status") == "succeeded" and cloud.get("text", "").strip()
                 and cloud.get("source_audio_sha256") == state["source_audio_sha256"]):
             state.update(cloud_completed=True, job_id=cloud.get("job_id"),
@@ -222,7 +353,8 @@ def _work(audio: Path, state: dict, root: Path, path: Path) -> dict:
             str(root / "scripts/asr-smart.ps1"), "-Audio", str(audio), "-Mode", "quick",
             "-Engine", "paraformer", "-WaitSec", "0", "-StartupTimeoutSec", "120", "-Json"], root, 150)
         state.update(local_job_id=local["job_id"], job_id=local["job_id"],
-                     status=local["status"], out_dir=local.get("out_dir"), outputs=local.get("outputs", {}))
+                     status=local["status"], out_dir=local.get("out_dir"), outputs=local.get("outputs", {}),
+                     local_started_at=time.time())
         return _local_status(state, root)
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
         return {**state, "status": "failed", "error": "local_entry_" + type(exc).__name__}
@@ -245,7 +377,12 @@ def file_job(audio: Path, *, worker: bool = False, root: Path | None = None) -> 
     with _claim(path.with_suffix(".lock"), wait=worker) as claimed:
         state = {**base, **_read(path), "source_audio_sha256": digest}
         if not claimed:
-            return state
+            progress = _read(path.with_suffix(".progress.json"))
+            since = progress.get("updated_at") or state.get("worker_started_at") or time.time()
+            if state.get("route") == "cloud" and time.time() - since > CLOUD_IDLE_SECONDS + 60:
+                return {**state, "status": "failed", "error": "cloud_worker_stalled", "retryable": True}
+            return {**state, "progress_at": progress.get("updated_at"),
+                    "completed_chunks": progress.get("completed_chunks", 0)}
         if state["status"] == "succeeded" and _saved_success(state):
             return state
         if state["status"] == "succeeded" or state.get("cloud_completed") or state.get("transcript_completed"):
@@ -264,21 +401,22 @@ def file_job(audio: Path, *, worker: bool = False, root: Path | None = None) -> 
                 state.update(status="failed", error="file_worker_" + type(exc).__name__)
         elif state.get("local_job_id"):
             state = _local_status(state, root)
-        elif state.get("worker_pid") and state["status"] == "queued" and _alive(state["worker_pid"]):
+            if state.pop("recover_local", False):
+                state = _schedule_worker(state, audio, root)
+        elif (state.get("worker_pid") and state["status"] == "queued"
+                and time.time() - state.get("worker_started_at", 0) < 120 and _alive(state["worker_pid"])):
             return state
         else:
             existing = _reuse(digest, root)
             if existing.get("status") in {"succeeded", "running"}:
                 state.update(existing)
+                if state.get("local_job_id"):
+                    state = _local_status(state, root)
+                    if state.pop("recover_local", False):
+                        state = _schedule_worker(state, audio, root)
             else:
                 state.update(status="queued", error="")
                 write_json_atomic(path, state)
-                try:
-                    process = subprocess.Popen([sys.executable, "-B", "-m", "zh_asr", "file-job",
-                        "--audio", str(audio), "--worker"], cwd=root, stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **managed_popen_kwargs())
-                    state["worker_pid"] = process.pid
-                except OSError as exc:
-                    state.update(status="failed", error="worker_start_" + type(exc).__name__)
+                state = _schedule_worker(state, audio, root)
         write_json_atomic(path, state)
         return state

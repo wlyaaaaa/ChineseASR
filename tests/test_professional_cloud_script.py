@@ -29,7 +29,11 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
     def test_relative_paths_follow_powershell_location(self) -> None:
         self._assert_cloud_receipt(relative_paths=True)
 
-    def _assert_cloud_receipt(self, *, relative_paths: bool, first_failure: bool = False) -> None:
+    def test_background_credential_report_denial_keeps_success_and_never_retries_upload(self) -> None:
+        self._assert_cloud_receipt(relative_paths=True, report_denied=True)
+
+    def _assert_cloud_receipt(self, *, relative_paths: bool, first_failure: bool = False,
+                              report_denied: bool = False) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scripts = root / "scripts"
@@ -59,6 +63,10 @@ if ($Action -eq 'AgentSecretRef') {
     [IO.File]::WriteAllText($provider, $body)
     [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"ok","action":"AgentSecretRef"}')
     exit 0
+}
+if (Test-Path (Join-Path $root 'report-denied.marker')) {
+    [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"error","error":"trusted_desktop_ancestor_required","action":"ReportCredentialResult"}')
+    exit 3
 }
 [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"ok","action":"ReportCredentialResult"}')
 exit 0
@@ -119,6 +127,9 @@ else:
             if first_failure:
                 request_root.mkdir(parents=True)
                 (request_root / "network.marker").touch()
+            if report_denied:
+                request_root.mkdir(parents=True, exist_ok=True)
+                (request_root / "report-denied.marker").touch()
             result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", *invocation],
                 cwd=root, capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=60,
@@ -139,6 +150,11 @@ else:
             self.assertEqual("AgentSecretRef", log["agent_secret_ref_receipt"]["action"])
             self.assertEqual("ReportCredentialResult",
                 log["credential_result_report_receipt"]["action"])
+            if report_denied:
+                self.assertEqual("report-failed", receipt["credential_report_status"])
+                self.assertEqual("trusted_desktop_ancestor_required", log["credential_result_report_receipt"]["error"])
+                self.assertEqual("not_needed", receipt["cloud_retry_policy"])
+                self.assertEqual("none", receipt["local_fallback_recommendation"])
             if not relative_paths:
                 self.assertEqual("network_failure", receipt["error_code"])
                 attempts = request_root / (receipt["job_id"] + ".attempts")

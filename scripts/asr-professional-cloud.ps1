@@ -40,6 +40,10 @@ param(
 
     [string] $RequestRoot = '',
 
+    [switch] $PersonalDataGuard,
+
+    [string] $ProgressPath = '',
+
     [switch] $Json
 )
 
@@ -261,7 +265,7 @@ $audioContentHash = (Get-FileHash -LiteralPath $audioPath -Algorithm SHA256).Has
 $cloudMutex = [Threading.Mutex]::new($false, 'Global\ChineseASRCloudUploadOnce-' + $audioContentHash)
 $mutexHeld = $false
 try {
-    try { $mutexHeld = $cloudMutex.WaitOne([TimeSpan]::FromHours(24)) }
+    try { $mutexHeld = $cloudMutex.WaitOne([TimeSpan]::FromSeconds(5)) }
     catch [Threading.AbandonedMutexException] { $mutexHeld = $true }
 }
 catch {
@@ -347,7 +351,14 @@ $providerBefore = if (Test-Path -LiteralPath $providerPath -PathType Leaf) {
     (Get-Item -LiteralPath $providerPath).LastWriteTimeUtc.Ticks
 } else { 0 }
 try {
-    if (Test-Path -LiteralPath $brokerPath -PathType Leaf) {
+    if ($PersonalDataGuard) {
+        $transmitArguments = @($pipelineScript, 'transmit', '--root', $resolvedRequestRoot,
+            '--intent', $intentPath, '--request', $requestPath, '--broker', $brokerPath, '--target', $brokerTarget)
+        if ($ProgressPath) { $transmitArguments += @('--progress', $ProgressPath) }
+        $brokerOutput = & $python @transmitArguments 2>&1 | Out-String
+        $brokerExitCode = $LASTEXITCODE
+    }
+    elseif (Test-Path -LiteralPath $brokerPath -PathType Leaf) {
         # The broker writes directly to Console.Out; a child process makes that
         # output capturable instead of leaking it into this entry's JSON stdout.
         $brokerOutput = & pwsh -NoProfile -NonInteractive -File $brokerPath `

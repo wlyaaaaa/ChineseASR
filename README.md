@@ -114,7 +114,11 @@ strict 模式即使一路模型失败，也会保留可用输出并生成审计�
 
 首次调用隐藏启动一个一次性文件 worker，立即返回 JSON；随后用同一命令查询。状态为 `queued`、`running`、`waiting_gpu`、`succeeded` 或 `failed`，同时返回 `route=cloud|local`、`reason`、`error`、`timestamps=available|unavailable`，已有任务还带 `job_id`、`out_dir` 和结果路径。入口与 worker 都先检查个人资料期，锁住时返回 `queued/reason=personal_access_required`，下次调用再补，不自动解锁。
 
+Windows 的一次性 worker 由固定脚本经 WMI 隐藏启动，脱离提交方计划任务的进程组；不会新建计划任务或常驻调度器。本地 API 消失时先查已完成稿件，再由下一次查询安排原入口恢复，返回 `queued/reason=local_api_recovering`，不会永久等待旧作业编号。旧本地作业超过一小时会取消并标记可重试失败，不挡住其他录音。
+
 入口按实际原音 SHA-256 复用已有成功稿件；云调用复用现有 `asr-professional-cloud.ps1 -CloudFirst`，由它检查配置免费期和停用/暂停状态。云不适用或失败时保留 `fallback_reason`，本地使用现有 Paraformer 完整转写与句级时间；GPU 被同类或 Ollama 活动占用时返回 `waiting_gpu`，不启动本地推理，下次调用再试。不会新建计划任务或常驻轮询器。
+
+文件入口按块交给原 worker 持钥发送，调用方不取得凭据；每块前重查资料期，锁定后暂停，解锁复用同一云作业和已知成功分块，只发未发送的块。每块调用最多四分钟，超过五分钟没有块进度会终止本次自有进程树并留下失败原因；整段另有按原音时长计算的上限。未知请求不重传。`ReportCredentialResult` 上报失败只记在回执中，不会把成功稿件改成失败或触发再上传。
 
 云产物仍在 `outputs/cloud-jobs`，本地产物仍由现有 API 作业管理；单文件进度在 `outputs/api/file-jobs/<原音SHA256>.json`。`transcript-readback` 也会按 SHA 直接读取这一份已完成产物引用并复用原解析与哈希校验，API 裁剪到最近 200 个终态后仍可回读。成功须通过现有 `transcript-readback` 校验；只有全文、缺句级时间时仍成功并返回 `timestamps=unavailable`，云分块范围不冒充句级时间，不为补时间再次识别全文。云成功但产物暂时不可回读时保留失败原因，后续只重读产物。云已发送、结果未知或身份被拒绝时不会自动重传、换身份或改凭据绑定；本地失败后的再次调用可重试本地，成功稿件不重复转写。
 

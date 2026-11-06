@@ -14,19 +14,30 @@ from zh_asr.cloud_review import (CloudReviewError, finalize_cloud_result,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("prepare", "finalize"))
+    parser.add_argument("action", choices=("prepare", "finalize", "transmit"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--intent", type=Path, required=True)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--provider", type=Path)
     parser.add_argument("--broker-error", default="")
     parser.add_argument("--resume-job-id", default="")
+    parser.add_argument("--request", type=Path)
+    parser.add_argument("--broker", type=Path)
+    parser.add_argument("--target", default="")
+    parser.add_argument("--progress", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.action == "prepare":
             value = prepare_cloud_request(args.intent, args.root,
                 args.config or ROOT / "configs" / "models.yaml", resume_job_id=args.resume_job_id)
             code = 0 if value["status"] == "ready" else 2
+        elif args.action == "transmit":
+            from zh_asr.cloud_file_transport import transmit_cloud_chunks
+            provider = transmit_cloud_chunks(args.request, args.intent, args.root, args.broker,
+                                              target=args.target, progress_path=args.progress)
+            value = {"schema": "zh_asr.chunk-transmission.v1", "secret_returned": False,
+                     **{key: provider.get(key) for key in ("status", "error_code", "new_requests", "reused_requests")}}
+            code = 0
         else:
             value = finalize_cloud_result(args.intent, args.root,
                 provider_path=args.provider, broker_error=args.broker_error,
