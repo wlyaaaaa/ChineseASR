@@ -116,7 +116,9 @@ strict 模式即使一路模型失败，也会保留可用输出并生成审计�
 
 Windows 的一次性 worker 由固定脚本经 WMI 隐藏启动，脱离提交方计划任务的进程组；不会新建计划任务或常驻调度器。本地 API 消失时先查已完成稿件，再由下一次查询安排原入口恢复，返回 `queued/reason=local_api_recovering`，不会永久等待旧作业编号。旧本地作业超过一小时会取消并标记可重试失败，不挡住其他录音。
 
-入口按实际原音 SHA-256 复用已有成功稿件；云调用复用现有 `asr-professional-cloud.ps1 -CloudFirst`，由它检查配置免费期和停用/暂停状态。云不适用或失败时保留 `fallback_reason`，本地使用现有 Paraformer 完整转写与句级时间；GPU 被同类或 Ollama 活动占用时返回 `waiting_gpu`，不启动本地推理，下次调用再试。不会新建计划任务或常驻轮询器。
+入口按实际原音 SHA-256 复用已有成功稿件；云调用复用现有 `asr-professional-cloud.ps1 -CloudFirst`，由它检查配置免费期和停用/暂停状态。云不适用或失败时保留 `fallback_reason`，本地使用现有 Paraformer 完整转写与句级时间；GPU 被同类或 Ollama 活动占用时返回 `waiting_gpu`，不启动本地推理，下次调用再试。`fallback_reason` 在本地成功、恢复和重复读取后仍保留，当前 `reason` 可另说明本地状态；调用方可展示云回退原因，不因此把本地成功记作失败。不会新建计划任务或常驻轮询器。
+
+直接调用云脚本时，同原音并发仍最多等 24 小时；统一 `file-job` 显式传 `-ConcurrentWaitSec 5`，后台只短等同一云请求。需要调整直接脚本的等待时可显式指定此参数。
 
 文件入口按块交给原 worker 持钥发送，调用方不取得凭据；每块前重查资料期，锁定后暂停，解锁复用同一云作业和已知成功分块，只发未发送的块。每块调用最多四分钟，超过五分钟没有块进度会终止本次自有进程树并留下失败原因；整段另有按原音时长计算的上限。未知请求不重传。`ReportCredentialResult` 上报失败只记在回执中，不会把成功稿件改成失败或触发再上传。
 
@@ -651,8 +653,10 @@ LocalGpuBroker 不可用、同族 ChineseASR 已在运行、Ollama 重型请求/
 
 云端 Key 的产品登记属于密码中心，机器路径/哈希由 PCConfig 安装合成。ASR 沿用
 `qwen-default` 和 `qwen-audio3-asr-important-once`；`cloud_review.py` 先准备 HTTP body
-或 WebSocket 帧，再通过 `-SecretRefRequestPath` 提交精确请求。换模型、切段、声道和
-用途判断都不进入持钥程序，也不产生新凭据登记。
+或 WebSocket 帧，再通过 `-SecretRefRequestPath` 提交精确请求。切段、声道和业务用途判断
+由 ASR 负责，不产生新凭据登记。密码中心的无桌面用途门只校验协议、路径、方法及区分
+大小写的 Qwen 转写模型家族（模型名以 `qwen` 开头且含 `asr`），不校验音频内容或消息结构。
+换到其他请求路径或不属于该家族的模型时，要同步改密码中心用途门，否则后台会退回本地。
 
 一次调用保留 `<job_id>.intent.json`、`<job_id>.unclaimed.json`、`.provider.json` 和检查点。
 再次运行同样的云入口命令时，会按音频 SHA-256、用途、声道、模型及请求参数接续未完成作业，

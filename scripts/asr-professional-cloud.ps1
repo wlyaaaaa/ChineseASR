@@ -44,6 +44,9 @@ param(
 
     [string] $ProgressPath = '',
 
+    [ValidateRange(0, 86400)]
+    [int] $ConcurrentWaitSec = 86400,
+
     [switch] $Json
 )
 
@@ -265,7 +268,7 @@ $audioContentHash = (Get-FileHash -LiteralPath $audioPath -Algorithm SHA256).Has
 $cloudMutex = [Threading.Mutex]::new($false, 'Global\ChineseASRCloudUploadOnce-' + $audioContentHash)
 $mutexHeld = $false
 try {
-    try { $mutexHeld = $cloudMutex.WaitOne([TimeSpan]::FromSeconds(5)) }
+    try { $mutexHeld = $cloudMutex.WaitOne([TimeSpan]::FromSeconds($ConcurrentWaitSec)) }
     catch [Threading.AbandonedMutexException] { $mutexHeld = $true }
 }
 catch {

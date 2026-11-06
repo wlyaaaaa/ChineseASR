@@ -315,7 +315,8 @@ def _work(audio: Path, state: dict, root: Path, path: Path) -> dict:
         progress_path = path.with_suffix(".progress.json")
         args = ["pwsh", "-NoProfile", "-NonInteractive", "-File",
                 str(root / "scripts/asr-professional-cloud.ps1"), "-Audio", str(audio),
-                "-CloudFirst", "-PersonalDataGuard", "-ProgressPath", str(progress_path), "-Json"]
+                "-CloudFirst", "-PersonalDataGuard", "-ConcurrentWaitSec", "5",
+                "-ProgressPath", str(progress_path), "-Json"]
         if resuming and state.get("cloud_job_id"):
             args.extend(["-ResumeJobId", state["cloud_job_id"]])
         try:
@@ -409,7 +410,7 @@ def file_job(audio: Path, *, worker: bool = False, root: Path | None = None) -> 
         else:
             existing = _reuse(digest, root)
             if existing.get("status") in {"succeeded", "running"}:
-                state.update(existing)
+                state.update(existing, error="")
                 if state.get("local_job_id"):
                     state = _local_status(state, root)
                     if state.pop("recover_local", False):

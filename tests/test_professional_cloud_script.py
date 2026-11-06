@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 import uuid
 import wave
@@ -23,6 +25,65 @@ def _write_wav(path: Path) -> None:
 
 
 class ProfessionalCloudScriptTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows named mutex")
+    def test_direct_call_waits_past_five_seconds_but_explicit_short_wait_is_bounded(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel.CreateMutexW.restype = wintypes.HANDLE
+        kernel.ReleaseMutex.argtypes = kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            audio, marker = root / "voice.wav", root / "at-mutex"
+            _write_wav(audio)
+            prefix = "Global\\ChineseASRCloudWaitTest" + uuid.uuid4().hex
+            source = SCRIPT.read_text(encoding="utf-8").replace("Global\\ChineseASRCloudUploadOnce", prefix)
+            source = source.replace("$mutexHeld = $false", "$mutexHeld = $false\n[IO.File]::WriteAllText('" +
+                                    str(marker).replace("'", "''") + "', '')")
+            relocated = scripts / SCRIPT.name
+            relocated.write_text(source, encoding="utf-8")
+            metadata = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                "$t=$null;$e=$null;$a=[Management.Automation.Language.Parser]::ParseFile('" +
+                str(relocated).replace("'", "''") + "',[ref]$t,[ref]$e); "
+                "($a.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -ceq 'ConcurrentWaitSec' }).DefaultValue.SafeGetValue()"],
+                capture_output=True, text=True, encoding="utf-8", timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.assertEqual(metadata.returncode, 0, metadata.stderr)
+            self.assertEqual(int(metadata.stdout.strip()), 24 * 3600)
+            (scripts / "cloud-review-pipeline.py").write_text(
+                'print(\'{"status":"blocked","error_code":"fixture_prepare_reached"}\')', encoding="utf-8")
+            handle = kernel.CreateMutexW(None, True, prefix + "-" + hashlib.sha256(audio.read_bytes()).hexdigest().upper())
+            self.assertTrue(handle)
+            held, process = True, None
+            command = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(relocated),
+                       "-Audio", str(audio), "-CloudFirst", "-Json"]
+            try:
+                short = subprocess.run([*command, "-ConcurrentWaitSec", "0"], cwd=root,
+                    capture_output=True, text=True, encoding="utf-8", timeout=15,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self.assertEqual(json.loads(short.stdout)["error_code"], "cloud_upload_busy")
+                self.assertFalse((root / "outputs").exists())
+                marker.unlink()
+                process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                deadline = time.monotonic() + 10
+                while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.05)
+                self.assertTrue(marker.exists())
+                time.sleep(5.3)
+                self.assertIsNone(process.poll(), "direct caller stopped waiting after five seconds")
+                self.assertTrue(kernel.ReleaseMutex(handle)); held = False
+                stdout, stderr = process.communicate(timeout=15)
+                self.assertEqual(json.loads(stdout)["error_code"], "fixture_prepare_reached", stderr)
+            finally:
+                if held: kernel.ReleaseMutex(handle)
+                if process is not None and process.poll() is None:
+                    process.kill(); process.communicate(timeout=5)
+                kernel.CloseHandle(handle)
+
     def test_json_stdout_contains_only_final_receipt_and_broker_receipts_are_logged(self) -> None:
         self._assert_cloud_receipt(relative_paths=False, first_failure=True)
 

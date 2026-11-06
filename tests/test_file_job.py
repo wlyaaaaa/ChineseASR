@@ -77,8 +77,35 @@ class FileJobTests(unittest.TestCase):
                          ("succeeded", "cloud", "unavailable"))
         self.process.assert_called_once()
         self.assertIn("-CloudFirst", self.process.call_args.args[0])
+        arguments = self.process.call_args.args[0]
+        self.assertEqual(arguments[arguments.index("-ConcurrentWaitSec") + 1], "5")
         self.gpu.assert_not_called()
         self.http.assert_not_called()
+
+    def test_cloud_denial_reason_survives_local_success_reuse_and_api_recovery(self):
+        reason = "background_asr_owner_state_unsettled"
+        self.process.side_effect = [dict(status="blocked", error_code=reason),
+                                    dict(status="queued", job_id="local")]
+        self.http.return_value = {"job": dict(status="running", job_id="local")}
+        first = jobs.file_job(self.audio, worker=True, root=self.root)
+        self.assertEqual((first["status"], first["route"], first["fallback_reason"]),
+                         ("running", "local", reason))
+        self.http.side_effect = OSError("API offline")
+        recovering = jobs.file_job(self.audio, root=self.root)
+        self.assertEqual((recovering["reason"], recovering["fallback_reason"]),
+                         ("local_api_recovering", reason))
+        self.spawn.assert_called_once()
+        _, artifact = self._artifact()
+        self.reuse.return_value = dict(status="succeeded", route="local", timestamps="available",
+                                       reason="reused_existing_transcript", artifact=artifact)
+        with mock.patch.object(jobs, "_alive", return_value=False):
+            completed = jobs.file_job(self.audio, root=self.root)
+        repeated = jobs.file_job(self.audio, root=self.root)
+        for result in (completed, repeated):
+            self.assertEqual((result["status"], result["route"], result["reason"], result["fallback_reason"]),
+                             ("succeeded", "local", "reused_existing_transcript", reason))
+            self.assertEqual(result["error"], "")
+        self.assertEqual(sum("-CloudFirst" in call.args[0] for call in self.process.call_args_list), 1)
 
     def test_unknown_cloud_falls_back_once_and_polls_existing_local_job(self):
         self.process.side_effect = [dict(status="failed", error_code="previous_outcome_unknown"),
