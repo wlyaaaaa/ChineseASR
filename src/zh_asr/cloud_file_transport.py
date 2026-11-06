@@ -1,14 +1,13 @@
-"""Send a prepared file job at chunk boundaries; credentials stay in the broker."""
+"""Send prepared file jobs directly, preserving resumable chunk checkpoints."""
 from __future__ import annotations
 
 import hashlib
 import json
 from pathlib import Path
-import subprocess
 import time
 
 from .cloud_review import CloudReviewError, _chunk_completed, _read_json, _write_state
-from .process_control import managed_popen_kwargs, terminate_process_tree
+from .qwen_transport import CloudSendError, ORIGINS, key_copy, scrub, transmit
 
 
 def request_digest(request: dict) -> str:
@@ -16,29 +15,63 @@ def request_digest(request: dict) -> str:
         ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
-def _broker(request_path: Path, target: str, broker: Path) -> str:
-    process = subprocess.Popen(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(broker),
-        "-Action", "AgentSecretRef", "-Query", target, "-SecretRefRequestPath", str(request_path), "-Json"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, **managed_popen_kwargs())
+def _send(request_path: Path, root: Path) -> str:
+    request = _read_json(request_path)
+    operation = request["operations"][0]
+    path, keys, marker = Path(request["result_path"]), [], None
+    checkpoint = path.with_name(path.name + ".checkpoints") / (operation["id"] + ".json")
+    result = dict(schema="passwordcenter.vendor-result.v1", vendor="qwen", request_sha256=request_digest(request),
+        status="failed", error_code="", credential_result="Scope-Error", results=[], new_requests=0, reused_requests=0,
+        secret_returned=False)
     try:
-        raw, _ = process.communicate(timeout=240)
-    except subprocess.TimeoutExpired:
-        terminate_process_tree(process)
-        return "cloud_chunk_timeout"
-    try:
-        receipt = json.loads(raw.decode("utf-8-sig"))
-        return str(receipt.get("error") or "") if process.returncode else ""
-    except (ValueError, UnicodeError):
-        return "cloud_broker_receipt_invalid" if process.returncode else ""
+        identity = request_digest(dict(vendor="qwen", origin=ORIGINS[operation["protocol"]] + operation["path"], operation=operation))
+        cached = _read_json(checkpoint)
+        if checkpoint.exists() and not cached: raise CloudSendError("checkpoint_corrupt")
+        cached = cached or {}
+        if cached:
+            if cached.get("identity") != identity: raise CloudSendError("checkpoint_request_changed")
+            if cached.get("status") in {"in_flight", "outcome_unknown"}: raise CloudSendError("previous_outcome_unknown")
+            if cached.get("status") == "succeeded":
+                if request_digest(cached["result"]) != cached.get("result_sha256"): raise CloudSendError("checkpoint_corrupt")
+                result.update(status="succeeded", credential_result="Success", results=[cached["result"]], reused_requests=1)
+                _write_state(path, result)
+                return ""
+        try:
+            store = key_copy()
+            keys.append(store.load_key("qwen"))
+        except Exception as exc:
+            code = getattr(exc, "code", "unavailable")
+            raise CloudSendError("cloud_key_" + code if isinstance(code, str) and code.replace("_", "").isalnum() else "cloud_key_unavailable") from None
+        marker = dict(identity=identity, status="in_flight")
+        if isinstance(cached.get("first_failure"), dict): marker["first_failure"] = cached["first_failure"]
+        _write_state(checkpoint, marker)
+        result["new_requests"] = 1
+        try:
+            record = scrub(dict(id=operation["id"], **transmit(operation, root, request.get("send_before_utc"), store, keys)), keys)
+        except Exception as exc:
+            failure = exc.fields if isinstance(exc, CloudSendError) else dict(error_code="cloud_transport_failed", credential_result="Scope-Error")
+            marker.setdefault("first_failure", failure)
+            marker["status"] = "outcome_unknown" if not isinstance(exc, CloudSendError) or exc.uncertain else "failed"
+            _write_state(checkpoint, scrub(marker, keys))
+            result["first_failure"] = marker["first_failure"]
+            raise
+        marker.update(status="succeeded", result=record, result_sha256=request_digest(record))
+        _write_state(checkpoint, scrub(marker, keys))
+        result.update(status="succeeded", credential_result="Success", results=[record])
+    except CloudSendError as exc:
+        result.update(exc.fields)
+        result["status"] = "blocked" if exc.code.startswith(("checkpoint", "previous_", "request_")) else "failed"
+    except Exception:
+        result["error_code"] = "cloud_transport_failed"
+    _write_state(path, scrub(result, keys))
+    return result["error_code"]
 
 
-def transmit_cloud_chunks(request_path: Path, intent_path: Path, root: Path, broker: Path, *,
-                          target: str, progress_path: Path | None = None, access=None, send=None) -> dict:
+def transmit_cloud_chunks(request_path: Path, intent_path: Path, root: Path, *,
+                          progress_path: Path | None = None, access=None, send=None) -> dict:
     """Reuse completed operations; never repeat an uncertain operation automatically."""
     from .file_job import _access_open
-    access, send = access or _access_open, send or _broker
-    if not isinstance(target, str) or not target:
-        raise CloudReviewError("cloud_credential_route_missing")
+    access, send = access or _access_open, send or _send
     root = root.resolve()
     request_path, intent_path = request_path.resolve(), intent_path.resolve()
     if not request_path.is_relative_to(root) or not intent_path.is_relative_to(root):
@@ -91,8 +124,8 @@ def transmit_cloud_chunks(request_path: Path, intent_path: Path, root: Path, bro
                 return result
             _write_state(part_path, part)
             try:
-                error = send(part_path, target, broker)
-            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                error = send(part_path, root)
+            except (OSError, ValueError) as exc:
                 error = "cloud_chunk_" + type(exc).__name__
             provider = _read_json(provider_path) or {}
             if provider.get("request_sha256") != part_digest or provider.get("vendor") != "qwen":

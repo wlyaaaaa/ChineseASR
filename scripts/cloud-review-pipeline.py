@@ -1,4 +1,4 @@
-"""Unprivileged cloud preparation and result projection; never reads an API key."""
+"""Cloud preparation, direct transmission and result projection."""
 from __future__ import annotations
 
 import argparse
@@ -22,8 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--broker-error", default="")
     parser.add_argument("--resume-job-id", default="")
     parser.add_argument("--request", type=Path)
-    parser.add_argument("--broker", type=Path)
-    parser.add_argument("--target", default="")
+    parser.add_argument("--personal-data-guard", action="store_true")
     parser.add_argument("--progress", type=Path)
     args = parser.parse_args(argv)
     try:
@@ -33,8 +32,8 @@ def main(argv: list[str] | None = None) -> int:
             code = 0 if value["status"] == "ready" else 2
         elif args.action == "transmit":
             from zh_asr.cloud_file_transport import transmit_cloud_chunks
-            provider = transmit_cloud_chunks(args.request, args.intent, args.root, args.broker,
-                                              target=args.target, progress_path=args.progress)
+            provider = transmit_cloud_chunks(args.request, args.intent, args.root,
+                progress_path=args.progress, access=None if args.personal_data_guard else lambda: True)
             value = {"schema": "zh_asr.chunk-transmission.v1", "secret_returned": False,
                      **{key: provider.get(key) for key in ("status", "error_code", "new_requests", "reused_requests")}}
             code = 0

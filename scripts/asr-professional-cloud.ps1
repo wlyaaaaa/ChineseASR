@@ -56,7 +56,6 @@ $utf8NoBom = [Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = $utf8NoBom
 $OutputEncoding = $utf8NoBom
 
-$brokerPath = 'C:\ProgramData\PCConfig\AuthorityHost\tools\Invoke-SecretBroker.ps1'
 $pipelineScript = Join-Path $PSScriptRoot 'cloud-review-pipeline.py'
 $python = Join-Path $PSScriptRoot '..\.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { $python = 'python' }
@@ -98,43 +97,6 @@ function Write-BoundedReceipt {
     exit $ExitCode
 }
 
-function Get-SafeBrokerErrorCode {
-    param([AllowEmptyString()][string] $Raw)
-    if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
-    try { $value = $Raw | ConvertFrom-Json -Depth 20 }
-    catch { return $null }
-    if (
-        [string]$value.schema -cne 'pcconfig.secret-broker-result.v1' -or
-        [string]$value.status -cne 'error'
-    ) { return $null }
-    $code = [string]$value.error
-    if ($code -cmatch '^[a-z][a-z0-9_:-]{0,95}$') { return $code }
-    return $null
-}
-
-function Convert-BrokerReceiptForLog {
-    param([AllowEmptyString()][string] $Raw)
-    if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
-    try { return ($Raw | ConvertFrom-Json -AsHashtable -Depth 30) }
-    catch { return $Raw.Trim() }
-}
-
-function Write-BrokerReceiptLog {
-    param(
-        [string] $Path,
-        [string] $JobId,
-        [AllowEmptyString()][string] $AgentSecretRefRaw,
-        [AllowEmptyString()][string] $CredentialReportRaw
-    )
-    $log = [ordered]@{
-        schema = 'zh_asr.broker_receipts.v1'
-        job_id = $JobId
-        agent_secret_ref_receipt = Convert-BrokerReceiptForLog -Raw $AgentSecretRefRaw
-        credential_result_report_receipt = Convert-BrokerReceiptForLog -Raw $CredentialReportRaw
-    }
-    [IO.File]::WriteAllText($Path, ($log | ConvertTo-Json -Depth 30), $utf8NoBom)
-}
-
 function Save-PreviousCloudAttempt {
     param([string] $Root, [string] $JobId)
     $existing = @('provider', 'broker', 'result') | ForEach-Object {
@@ -164,28 +126,6 @@ function Save-PreviousCloudAttempt {
     return $indexPath
 }
 
-function Test-CredentialRecentlyHealthy {
-    param([string] $Path, [string] $CredentialRef)
-    try {
-        $health = Get-Content -LiteralPath $Path -Raw -Encoding utf8 -ErrorAction Stop | ConvertFrom-Json
-        $age = [DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse([string]$health.verified_utc)
-        return [string]$health.credential_ref -ceq $CredentialRef -and
-            $age -ge [TimeSpan]::Zero -and $age -lt [TimeSpan]::FromHours(24)
-    }
-    catch { return $false }
-}
-
-function Save-CredentialHealth {
-    param([string] $Path, [string] $CredentialRef, [AllowEmptyString()][string] $ReportRaw)
-    try { $receipt = $ReportRaw | ConvertFrom-Json -Depth 20 }
-    catch { return }
-    if ([string]$receipt.status -cne 'pass' -or $receipt.credential_update_required -ne $false) { return }
-    $temporary = $Path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
-    $health = [ordered]@{ credential_ref = $CredentialRef; verified_utc = [DateTimeOffset]::UtcNow.ToString('o') }
-    [IO.File]::WriteAllText($temporary, ($health | ConvertTo-Json), $utf8NoBom)
-    Move-Item -LiteralPath $temporary -Destination $Path -Force
-}
-
 function Get-CloudFailureAdvice {
     param(
         [AllowEmptyString()][string] $Status,
@@ -195,13 +135,8 @@ function Get-CloudFailureAdvice {
     if ($Status -ceq 'succeeded') {
         return [ordered]@{ cloud_retry_policy = 'not_needed'; local_fallback_recommendation = 'none' }
     }
-    if ($ErrorCode -ceq 'runtime_rebind_required') {
-        return [ordered]@{
-            cloud_retry_policy = 'retry_once_after_runtime_rebind'
-            local_fallback_recommendation = 'use_asr_smart_local_until_rebound'
-        }
-    }
-    if ($CredentialResult -cin @('Timeout', 'Rate-Limited', 'Provider-5xx', 'Network-Failure')) {
+    if ($ErrorCode -cne 'previous_outcome_unknown' -and
+        $CredentialResult -cin @('Timeout', 'Rate-Limited', 'Provider-5xx', 'Network-Failure')) {
         return [ordered]@{
             cloud_retry_policy = 'retry_cloud_once_if_still_authorized'
             local_fallback_recommendation = 'use_asr_smart_local'
@@ -287,7 +222,6 @@ $intentPath = Join-Path $resolvedRequestRoot ($jobId + '.intent.json')
 $requestPath = Join-Path $resolvedRequestRoot ($jobId + '.pending.json')
 $providerPath = Join-Path $resolvedRequestRoot ($jobId + '.provider.json')
 $resultPath = Join-Path $resolvedRequestRoot ($jobId + '.result.json')
-$brokerLogPath = Join-Path $resolvedRequestRoot ($jobId + '.broker.json')
 $intent = [ordered]@{
     schema = 'zh_asr.cloud_review_intent.v1'
     job_id = $jobId
@@ -340,37 +274,20 @@ $intentPath = [string]$prepared.intent_path
 $requestPath = [string]$prepared.request_path
 $providerPath = Join-Path $resolvedRequestRoot ($jobId + '.provider.json')
 $resultPath = Join-Path $resolvedRequestRoot ($jobId + '.result.json')
-$brokerLogPath = Join-Path $resolvedRequestRoot ($jobId + '.broker.json')
-$brokerTarget = [string]$prepared.secret_ref_target
-$credentialRef = [string]$prepared.credential_ref
-if (-not $brokerTarget -or -not $credentialRef) {
-    Write-BoundedReceipt -Status 'failed' -ErrorCode 'cloud_credential_route_missing' -ExitCode 3
-}
 $previousAttemptPath = Save-PreviousCloudAttempt -Root $resolvedRequestRoot -JobId $jobId
 
-$brokerOutput = ''
-$brokerExitCode = 1
+$transportOutput = ''
+$transportExitCode = 1
 $providerBefore = if (Test-Path -LiteralPath $providerPath -PathType Leaf) {
     (Get-Item -LiteralPath $providerPath).LastWriteTimeUtc.Ticks
 } else { 0 }
 try {
-    if ($PersonalDataGuard) {
-        $transmitArguments = @($pipelineScript, 'transmit', '--root', $resolvedRequestRoot,
-            '--intent', $intentPath, '--request', $requestPath, '--broker', $brokerPath, '--target', $brokerTarget)
-        if ($ProgressPath) { $transmitArguments += @('--progress', $ProgressPath) }
-        $brokerOutput = & $python @transmitArguments 2>&1 | Out-String
-        $brokerExitCode = $LASTEXITCODE
-    }
-    elseif (Test-Path -LiteralPath $brokerPath -PathType Leaf) {
-        # The broker writes directly to Console.Out; a child process makes that
-        # output capturable instead of leaking it into this entry's JSON stdout.
-        $brokerOutput = & pwsh -NoProfile -NonInteractive -File $brokerPath `
-            -Action AgentSecretRef `
-            -Query $brokerTarget `
-            -SecretRefRequestPath $requestPath `
-            -Json 2>&1 | Out-String
-        $brokerExitCode = $LASTEXITCODE
-    }
+    $transmitArguments = @($pipelineScript, 'transmit', '--root', $resolvedRequestRoot,
+        '--intent', $intentPath, '--request', $requestPath)
+    if ($PersonalDataGuard) { $transmitArguments += '--personal-data-guard' }
+    if ($ProgressPath) { $transmitArguments += @('--progress', $ProgressPath) }
+    $transportOutput = & $python @transmitArguments 2>&1 | Out-String
+    $transportExitCode = $LASTEXITCODE
 }
 finally {
     if (Test-Path -LiteralPath $requestPath -PathType Leaf) {
@@ -378,30 +295,20 @@ finally {
         Move-Item -LiteralPath $requestPath -Destination $unclaimedPath -Force
     }
 }
-Write-BrokerReceiptLog -Path $brokerLogPath -JobId $jobId `
-    -AgentSecretRefRaw $brokerOutput -CredentialReportRaw ''
-
-$brokerError = ''
+$transportError = ''
 $providerUpdated = (Test-Path -LiteralPath $providerPath -PathType Leaf) -and
     (Get-Item -LiteralPath $providerPath).LastWriteTimeUtc.Ticks -ne $providerBefore
 if (-not $providerUpdated) {
-    $brokerErrorCode = Get-SafeBrokerErrorCode -Raw $brokerOutput
-    $brokerError = if (-not (Test-Path -LiteralPath $brokerPath -PathType Leaf)) {
-        'secret_broker_unavailable'
+    try {
+        $transport = $transportOutput | ConvertFrom-Json -Depth 8
+        $transportError = if ($transport.error_code) { [string]$transport.error_code }
+            elseif ($transportExitCode -eq 0) { 'cloud_worker_result_missing' } else { 'cloud_transport_failed' }
     }
-    elseif ($brokerErrorCode) {
-        $brokerErrorCode
-    }
-    elseif ($brokerExitCode -eq 0) {
-        'cloud_worker_result_missing'
-    }
-    else {
-        'secret_broker_target_failed'
-    }
+    catch { $transportError = 'cloud_transport_receipt_invalid' }
 }
 $finalArguments = @($pipelineScript, 'finalize', '--root', $resolvedRequestRoot,
                     '--intent', $intentPath)
-if ($brokerError) { $finalArguments += @('--broker-error', $brokerError) }
+if ($transportError) { $finalArguments += @('--broker-error', $transportError) }
 else { $finalArguments += @('--provider', $providerPath) }
 $finalRaw = & $python @finalArguments 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
@@ -419,65 +326,10 @@ if (
     Write-BoundedReceipt -Status 'failed' -ErrorCode 'cloud_worker_result_invalid' -ExitCode 3
 }
 
-$allowedCredentialResults = @(
-    'Invalid',
-    'Revoked',
-    'Expired',
-    'Timeout',
-    'Rate-Limited',
-    'Provider-5xx',
-    'Network-Failure',
-    'Scope-Error',
-    'Permission-Denied',
-    'Provider-Unavailable',
-    'Success'
-)
-$credentialResult = [string]$result.credential_result
-$credentialReportStatus = 'not-reported'
-$reportOutput = ''
-$credentialHealthPath = Join-Path $resolvedRequestRoot 'credential-health.json'
-if ($credentialResult -cne 'Success') {
-    Remove-Item -LiteralPath $credentialHealthPath -Force -ErrorAction SilentlyContinue
-}
-if ($credentialResult -ceq 'Success' -and (Test-CredentialRecentlyHealthy -Path $credentialHealthPath -CredentialRef $credentialRef)) {
-    # A success report only clears update_required; with that already known to be
-    # false the broker changes nothing, so the seconds it costs buy nothing.
-    $credentialReportStatus = 'skipped_no_state_change'
-}
-elseif ($credentialResult -cin $allowedCredentialResults) {
-    try {
-        $reportOutput = & pwsh -NoProfile -NonInteractive -File $brokerPath `
-            -Action ReportCredentialResult `
-            -Query $credentialRef `
-            -ResultCode $credentialResult `
-            -OperationId $jobId `
-            -Json 2>&1 | Out-String
-        if ($LASTEXITCODE -eq 0) {
-            $credentialReportStatus = 'reported'
-            if ($credentialResult -ceq 'Success') {
-                Save-CredentialHealth -Path $credentialHealthPath -CredentialRef $credentialRef -ReportRaw $reportOutput
-            }
-        }
-        else {
-            $credentialReportStatus = 'report-failed'
-        }
-    }
-    catch {
-        $credentialReportStatus = 'report-failed'
-    }
-}
-Write-BrokerReceiptLog -Path $brokerLogPath -JobId $jobId `
-    -AgentSecretRefRaw $brokerOutput -CredentialReportRaw $reportOutput
-
 $result | Add-Member -NotePropertyName result_path -NotePropertyValue $resultPath -Force
-$result | Add-Member -NotePropertyName broker_log_path -NotePropertyValue $brokerLogPath -Force
 if ($previousAttemptPath) {
     $result | Add-Member -NotePropertyName previous_attempt_path -NotePropertyValue $previousAttemptPath -Force
 }
-$result | Add-Member `
-    -NotePropertyName credential_report_status `
-    -NotePropertyValue $credentialReportStatus `
-    -Force
 $result | Add-Member -NotePropertyName plaintext_returned -NotePropertyValue $false -Force
 $result | Add-Member -NotePropertyName secret_returned -NotePropertyValue $false -Force
 $advice = Get-CloudFailureAdvice `

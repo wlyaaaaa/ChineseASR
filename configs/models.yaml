@@ -119,8 +119,6 @@ cloud_review:
   region: cn-beijing
   # Exclusive Beijing-time cutoff; a date with unknown clock time stops at 00:00.
   credit_cycle: '2026-09-26-initial'
-  secret_ref_target: qwen-audio3-asr-important-once
-  credential_ref: qwen-default
   routes:
     short: short
     long: message

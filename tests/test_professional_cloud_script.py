@@ -84,17 +84,20 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
                     process.kill(); process.communicate(timeout=5)
                 kernel.CloseHandle(handle)
 
-    def test_json_stdout_contains_only_final_receipt_and_broker_receipts_are_logged(self) -> None:
+    def test_manual_call_uses_transmit_and_stdout_contains_only_final_receipt(self) -> None:
+        self._assert_cloud_receipt(relative_paths=False)
+
+    def test_guarded_relative_paths_follow_powershell_location(self) -> None:
+        self._assert_cloud_receipt(relative_paths=True, personal_data_guard=True)
+
+    def test_structured_transport_failure_reaches_finalize(self) -> None:
+        self._assert_cloud_receipt(relative_paths=False, transport_failure=True)
+
+    def test_resume_archives_previous_provider_and_result_before_transmitting(self) -> None:
         self._assert_cloud_receipt(relative_paths=False, first_failure=True)
 
-    def test_relative_paths_follow_powershell_location(self) -> None:
-        self._assert_cloud_receipt(relative_paths=True)
-
-    def test_background_credential_report_denial_keeps_success_and_never_retries_upload(self) -> None:
-        self._assert_cloud_receipt(relative_paths=True, report_denied=True)
-
-    def _assert_cloud_receipt(self, *, relative_paths: bool, first_failure: bool = False,
-                              report_denied: bool = False) -> None:
+    def _assert_cloud_receipt(self, *, relative_paths: bool, personal_data_guard: bool = False,
+                              transport_failure: bool = False, first_failure: bool = False) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scripts = root / "scripts"
@@ -105,75 +108,67 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
             _write_wav(audio)
             local_out_dir = caller / "本地结果 [输出]"
             local_out_dir.mkdir()
-            broker = scripts / "fake-broker.ps1"
             request_root = root / "outputs" / "cloud-jobs"
-            broker.write_text("""param([string]$Action, [string]$Query,
-    [string]$ResultCode, [string]$OperationId, [string]$SecretRefRequestPath, [switch]$Json)
-$root = '%s'
-if ($Action -eq 'AgentSecretRef') {
-    if (Test-Path (Join-Path $root 'deny.marker')) {
-        [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"error","error":"runtime_rebind_required"}')
-        exit 3
-    }
-    $provider = Join-Path $root ($Query + '.provider.json')
-    $body = '{}'
-    if (Test-Path (Join-Path $root 'network.marker')) {
-        $code = if (Test-Path -LiteralPath $provider) { 'previous_outcome_unknown' } else { 'network_failure' }
-        $body = @{ status = 'failed'; error_code = $code } | ConvertTo-Json -Compress
-    }
-    [IO.File]::WriteAllText($provider, $body)
-    [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"ok","action":"AgentSecretRef"}')
-    exit 0
-}
-if (Test-Path (Join-Path $root 'report-denied.marker')) {
-    [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"error","error":"trusted_desktop_ancestor_required","action":"ReportCredentialResult"}')
-    exit 3
-}
-[Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"ok","action":"ReportCredentialResult"}')
-exit 0
-""" % str(request_root).replace("'", "''"), encoding="utf-8")
-            pipeline = scripts / "cloud-review-pipeline.py"
-            pipeline.write_text("""import json
+            (scripts / "cloud-review-pipeline.py").write_text("""import json
 from pathlib import Path
 import sys
 
+args = sys.argv[2:]
+def value(flag):
+    return args[args.index(flag) + 1]
 action = sys.argv[1]
-root = Path(sys.argv[sys.argv.index('--root') + 1])
-intent = json.loads(Path(sys.argv[sys.argv.index('--intent') + 1]).read_text(encoding='utf-8'))
+root = Path(value('--root'))
+with (root / 'pipeline-calls.jsonl').open('a', encoding='utf-8') as calls:
+    calls.write(json.dumps({'action': action, 'args': args}) + '\\n')
+intent_path = Path(value('--intent'))
+intent = json.loads(intent_path.read_text(encoding='utf-8'))
 job_id = intent['job_id']
 if action == 'prepare':
-    if '--resume-job-id' in sys.argv:
-        job_id = sys.argv[sys.argv.index('--resume-job-id') + 1]
-    (root / (job_id + '.pending.json')).write_text('{}', encoding='utf-8')
-    print(json.dumps({'status': 'ready', 'secret_ref_target': job_id,
-                      'job_id': job_id, 'intent_path': str(root / (job_id + '.intent.json')),
-                      'request_path': str(root / (job_id + '.pending.json')),
-                      'credential_ref': 'fixture'}))
-else:
+    if '--resume-job-id' in args:
+        job_id = value('--resume-job-id')
+    request = root / (job_id + '.pending.json')
+    request.write_text('{}', encoding='utf-8')
+    print(json.dumps({'status': 'ready', 'job_id': job_id,
+                      'intent_path': str(root / (job_id + '.intent.json')),
+                      'request_path': str(request)}))
+elif action == 'transmit':
+    if (root / 'transport-failure.marker').exists():
+        print(json.dumps({'schema': 'zh_asr.chunk-transmission.v1', 'status': 'blocked',
+                          'secret_returned': False, 'error_code': 'personal_data_locked',
+                          'new_requests': 0, 'reused_requests': 0}))
+        sys.exit(3)
+    provider = root / (job_id + '.provider.json')
+    code = ''
+    if (root / 'network.marker').exists():
+        code = 'previous_outcome_unknown' if provider.exists() else 'network_failure'
+    provider.write_text(json.dumps({'status': 'failed' if code else 'succeeded',
+                                    'error_code': code}), encoding='utf-8')
+    print(json.dumps({'schema': 'zh_asr.chunk-transmission.v1', 'status': 'failed' if code else 'succeeded',
+                      'secret_returned': False, 'error_code': 'ignored_when_provider_updated' if code else '',
+                      'new_requests': 1, 'reused_requests': 0}))
+    sys.exit(3 if code else 0)
+elif action == 'finalize':
+    code = value('--broker-error') if '--broker-error' in args else json.loads(
+        Path(value('--provider')).read_text(encoding='utf-8'))['error_code']
     result = {'schema': 'chineseasr.qwen-audio3-quality-review-result.v1',
-              'job_id': job_id, 'purpose': 'quality_review',
-              'important_only': False, 'status': 'succeeded', 'error_code': '',
-              'credential_result': 'Success', 'cloud_upload_performed': True,
-              'text': 'fixture transcript'}
-    if '--broker-error' in sys.argv:
-        result.update(status='failed', error_code=sys.argv[sys.argv.index('--broker-error') + 1])
-    elif (root / 'network.marker').exists():
-        result.update(status='failed', credential_result='Network-Failure',
-                      error_code=json.loads((root / (job_id + '.provider.json')).read_text())['error_code'])
+              'job_id': job_id, 'purpose': 'quality_review', 'important_only': False,
+              'status': 'failed' if code else 'succeeded', 'error_code': code,
+              'credential_result': 'Network-Failure' if code == 'network_failure' else 'Success',
+              'cloud_upload_performed': code != 'personal_data_locked', 'text': 'fixture transcript'}
     (root / (job_id + '.result.json')).write_text(json.dumps(result), encoding='utf-8')
     print(json.dumps({'status': 'succeeded'}))
+else:
+    raise AssertionError(action)
 """, encoding="utf-8")
-            source = SCRIPT.read_text(encoding="utf-8")
-            original = "$brokerPath = 'C:\\ProgramData\\PCConfig\\AuthorityHost\\tools\\Invoke-SecretBroker.ps1'"
-            self.assertIn(original, source)
             relocated = scripts / SCRIPT.name
-            relocated.write_text(source.replace(original,
-                "$brokerPath = '" + str(broker).replace("'", "''") + "'").replace(
+            relocated.write_text(SCRIPT.read_text(encoding="utf-8").replace(
                 "Global\\ChineseASRCloudUploadOnce",
                 "Global\\ChineseASRCloudUploadTest" + uuid.uuid4().hex), encoding="utf-8")
             arguments = [str(relocated), "-Audio", str(audio),
                 "-LocalOutDir", str(local_out_dir), "-RequestRoot", str(request_root),
                 "-QualityReview", "-CloudUploadAuthorized", "-Json"]
+            if personal_data_guard:
+                arguments.append("-PersonalDataGuard")
             if relative_paths:
                 arguments[2] = audio.name
                 arguments[4] = local_out_dir.name
@@ -185,147 +180,97 @@ else:
                 invocation = ["-Command", command]
             else:
                 invocation = ["-File", *arguments]
-            if first_failure:
+            if first_failure or transport_failure:
                 request_root.mkdir(parents=True)
-                (request_root / "network.marker").touch()
-            if report_denied:
-                request_root.mkdir(parents=True, exist_ok=True)
-                (request_root / "report-denied.marker").touch()
-            result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", *invocation],
-                cwd=root, capture_output=True,
-                text=True, encoding="utf-8", errors="replace", timeout=60,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            self.assertEqual(3 if first_failure else 0, result.returncode, result.stdout + result.stderr)
-            decoder = json.JSONDecoder()
-            receipt, end = decoder.raw_decode(result.stdout.strip())
-            self.assertEqual(len(result.stdout.strip()), end)
-            self.assertEqual("failed" if first_failure else "succeeded", receipt["status"])
-            log_path = Path(receipt["broker_log_path"])
-            self.assertTrue(log_path.is_file())
-            self.assertEqual(request_root, log_path.parent)
-            intent_path = log_path.with_name(log_path.name.replace(".broker.json", ".intent.json"))
+                (request_root / ("network.marker" if first_failure else "transport-failure.marker")).touch()
+
+            def run(extra: list[str] | None = None) -> dict:
+                result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", *invocation, *(extra or [])],
+                    cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self.assertEqual(3 if first_failure or transport_failure else 0,
+                                 result.returncode, result.stdout + result.stderr)
+                decoder = json.JSONDecoder()
+                receipt, end = decoder.raw_decode(result.stdout.strip())
+                self.assertEqual(len(result.stdout.strip()), end, result.stdout)
+                self.assertNotIn("broker_log_path", receipt)
+                self.assertNotIn("credential_report_status", receipt)
+                return receipt
+
+            receipt = run()
+            self.assertEqual("failed" if first_failure or transport_failure else "succeeded", receipt["status"])
+            result_path = Path(receipt["result_path"])
+            self.assertTrue(result_path.is_file())
+            self.assertEqual(request_root, result_path.parent)
+            intent_path = request_root / (receipt["job_id"] + ".intent.json")
             intent = json.loads(intent_path.read_text(encoding="utf-8"))
             self.assertEqual(audio, Path(intent["audio_path"]))
             self.assertEqual(local_out_dir, Path(intent["local_out_dir"]))
-            log = json.loads(log_path.read_text(encoding="utf-8"))
-            self.assertEqual("AgentSecretRef", log["agent_secret_ref_receipt"]["action"])
-            self.assertEqual("ReportCredentialResult",
-                log["credential_result_report_receipt"]["action"])
-            if report_denied:
-                self.assertEqual("report-failed", receipt["credential_report_status"])
-                self.assertEqual("trusted_desktop_ancestor_required", log["credential_result_report_receipt"]["error"])
-                self.assertEqual("not_needed", receipt["cloud_retry_policy"])
-                self.assertEqual("none", receipt["local_fallback_recommendation"])
-            if not relative_paths:
+            calls_path = request_root / "pipeline-calls.jsonl"
+            calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(["prepare", "transmit", "finalize"], [call["action"] for call in calls])
+            transmit_args = calls[1]["args"]
+            self.assertEqual(personal_data_guard, "--personal-data-guard" in transmit_args)
+            self.assertNotIn("--broker", transmit_args)
+            self.assertNotIn("--target", transmit_args)
+            self.assertEqual(str(intent_path), transmit_args[transmit_args.index("--intent") + 1])
+            request_path = Path(transmit_args[transmit_args.index("--request") + 1])
+            self.assertFalse(request_path.exists())
+            self.assertTrue(request_path.with_name(receipt["job_id"] + ".unclaimed.json").is_file())
+            self.assertFalse((request_root / "credential-health.json").exists())
+            self.assertFalse(list(request_root.glob("*.broker.json")))
+            if transport_failure:
+                self.assertEqual("personal_data_locked", receipt["error_code"])
+                final_args = calls[-1]["args"]
+                self.assertEqual("personal_data_locked", final_args[final_args.index("--broker-error") + 1])
+                self.assertNotIn("--provider", final_args)
+                self.assertFalse(receipt["cloud_upload_performed"])
+                self.assertEqual("do_not_retry_cloud", receipt["cloud_retry_policy"])
+                self.assertEqual("use_asr_smart_local", receipt["local_fallback_recommendation"])
+            elif first_failure:
                 self.assertEqual("network_failure", receipt["error_code"])
+                self.assertIn("--provider", calls[-1]["args"])
+                self.assertNotIn("--broker-error", calls[-1]["args"])
+                self.assertEqual("retry_cloud_once_if_still_authorized", receipt["cloud_retry_policy"])
+                self.assertEqual("use_asr_smart_local", receipt["local_fallback_recommendation"])
                 attempts = request_root / (receipt["job_id"] + ".attempts")
                 self.assertFalse(attempts.exists())
                 previous = {kind: (request_root / (receipt["job_id"] + f".{kind}.json")).read_bytes()
-                            for kind in ("provider", "broker", "result")}
-                retry = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File",
-                    *arguments, "-ResumeJobId", receipt["job_id"]], cwd=root,
-                    capture_output=True, text=True, encoding="utf-8", timeout=60,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                self.assertEqual(3, retry.returncode, retry.stdout + retry.stderr)
-                retry_receipt, end = decoder.raw_decode(retry.stdout.strip())
-                self.assertEqual(len(retry.stdout.strip()), end)
+                            for kind in ("provider", "result")}
+                retry_receipt = run(["-ResumeJobId", receipt["job_id"]])
+                self.assertEqual(receipt["job_id"], retry_receipt["job_id"])
                 self.assertEqual("previous_outcome_unknown", retry_receipt["error_code"])
+                self.assertEqual("do_not_retry_cloud", retry_receipt["cloud_retry_policy"])
                 self.assertEqual(1, len(list(attempts.iterdir())))
                 index_path = Path(retry_receipt["previous_attempt_path"])
                 index = json.loads(index_path.read_text(encoding="utf-8"))
                 self.assertEqual(index_path.parent.name, index["attempt_id"])
                 self.assertEqual(receipt["job_id"], index["job_id"])
-                self.assertEqual(3, len(index["receipts"]))
+                self.assertEqual(2, len(index["receipts"]))
                 for entry in index["receipts"]:
                     kind = Path(entry["source_path"]).name.split(".")[-2]
                     self.assertEqual(previous[kind], Path(entry["path"]).read_bytes())
                     self.assertEqual(hashlib.sha256(previous[kind]).hexdigest(), entry["sha256"])
-                archived = json.loads((index_path.parent / (receipt["job_id"] + ".provider.json")).read_text())
-                self.assertEqual("network_failure", archived["error_code"])
-                (request_root / 'deny.marker').touch()
-                denied = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File",
-                    *arguments, "-ResumeJobId", receipt["job_id"]], cwd=root,
-                    capture_output=True, text=True, encoding="utf-8", timeout=60,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                self.assertEqual(3, denied.returncode, denied.stdout + denied.stderr)
-                denied_receipt = json.loads(denied.stdout)
-                self.assertEqual("runtime_rebind_required", denied_receipt["error_code"])
+                calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(["prepare", "transmit", "finalize"] * 2, [call["action"] for call in calls])
+                stale = {kind: (request_root / (receipt["job_id"] + f".{kind}.json")).read_bytes()
+                         for kind in ("provider", "result")}
+                (request_root / "transport-failure.marker").touch()
+                blocked_receipt = run(["-ResumeJobId", receipt["job_id"]])
+                self.assertEqual("personal_data_locked", blocked_receipt["error_code"])
                 self.assertEqual(2, len(list(attempts.iterdir())))
-                blocked_archive = Path(denied_receipt["previous_attempt_path"]).parent
-                blocked = json.loads((blocked_archive / (receipt["job_id"] + ".provider.json")).read_text())
-                self.assertEqual("previous_outcome_unknown", blocked["error_code"])
-
-    def test_success_report_is_skipped_only_while_credential_is_known_healthy(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            scripts = root / "scripts"
-            scripts.mkdir()
-            audio = root / "voice.wav"
-            _write_wav(audio)
-            request_root = root / "outputs" / "cloud-jobs"
-            broker = scripts / "fake-broker.ps1"
-            broker.write_text("""param([string]$Action, [string]$Query,
-    [string]$ResultCode, [string]$OperationId, [string]$SecretRefRequestPath, [switch]$Json)
-$root = '%s'
-if ($Action -eq 'AgentSecretRef') {
-    [IO.File]::WriteAllText((Join-Path $root ($Query + '.provider.json')), '{}')
-    [Console]::Out.WriteLine('{"status":"ok","action":"AgentSecretRef"}')
-    exit 0
-}
-Add-Content -LiteralPath (Join-Path $root 'reports.log') -Value $ResultCode
-[Console]::Out.WriteLine('{"status":"pass","credential_update_required":false}')
-""" % str(request_root).replace("'", "''"), encoding="utf-8")
-            (scripts / "cloud-review-pipeline.py").write_text("""import json
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[sys.argv.index('--root') + 1])
-intent_path = sys.argv[sys.argv.index('--intent') + 1]
-job_id = json.loads(Path(intent_path).read_text(encoding='utf-8'))['job_id']
-if sys.argv[1] == 'prepare':
-    (root / (job_id + '.pending.json')).write_text('{}', encoding='utf-8')
-    print(json.dumps({'status': 'ready', 'secret_ref_target': job_id, 'job_id': job_id,
-                      'intent_path': intent_path, 'request_path': str(root / (job_id + '.pending.json')),
-                      'credential_ref': 'fixture'}))
-else:
-    failing = (root / 'fail.marker').exists()
-    (root / (job_id + '.result.json')).write_text(json.dumps({
-        'schema': 'chineseasr.qwen-audio3-transcription-result.v1', 'job_id': job_id,
-        'purpose': 'transcription', 'important_only': False,
-        'status': 'failed' if failing else 'succeeded', 'error_code': '',
-        'credential_result': 'Network-Failure' if failing else 'Success',
-        'cloud_upload_performed': True, 'text': 'fixture'}), encoding='utf-8')
-    print('{}')
-""", encoding="utf-8")
-            source = SCRIPT.read_text(encoding="utf-8")
-            original = "$brokerPath = 'C:\\ProgramData\\PCConfig\\AuthorityHost\\tools\\Invoke-SecretBroker.ps1'"
-            relocated = scripts / SCRIPT.name
-            relocated.write_text(source.replace(original,
-                "$brokerPath = '" + str(broker).replace("'", "''") + "'"), encoding="utf-8")
-
-            def run() -> str:
-                result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(relocated),
-                    "-Audio", str(audio), "-CloudFirst", "-Json"], cwd=root, capture_output=True,
-                    text=True, encoding="utf-8", errors="replace", timeout=60,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                return json.loads(result.stdout)["credential_report_status"]
-
-            reports = request_root / "reports.log"
-            self.assertEqual("reported", run())
-            self.assertEqual("skipped_no_state_change", run())
-            self.assertEqual(["Success"], reports.read_text().split())
-
-            (request_root / "fail.marker").touch()
-            self.assertEqual("reported", run())
-            (request_root / "fail.marker").unlink()
-            self.assertEqual("reported", run())
-            self.assertEqual(["Success", "Network-Failure", "Success"], reports.read_text().split())
-
-            health = request_root / "credential-health.json"
-            state = json.loads(health.read_text(encoding="utf-8"))
-            state["verified_utc"] = "2020-01-01T00:00:00+00:00"
-            health.write_text(json.dumps(state), encoding="utf-8")
-            self.assertEqual("reported", run())
+                blocked_archive = Path(blocked_receipt["previous_attempt_path"]).parent
+                for kind, previous_bytes in stale.items():
+                    self.assertEqual(previous_bytes,
+                                     (blocked_archive / (receipt["job_id"] + f".{kind}.json")).read_bytes())
+                calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(["prepare", "transmit", "finalize"] * 3, [call["action"] for call in calls])
+                final_args = calls[-1]["args"]
+                self.assertEqual("personal_data_locked", final_args[final_args.index("--broker-error") + 1])
+                self.assertNotIn("--provider", final_args)
+            else:
+                self.assertEqual("not_needed", receipt["cloud_retry_policy"])
+                self.assertEqual("none", receipt["local_fallback_recommendation"])
 
     def test_relocated_script_uses_its_own_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -345,15 +290,6 @@ else:
             self.assertEqual("audio_file_missing", json.loads(result.stdout)["error_code"])
             self.assertFalse((root / "outputs" / "cloud-jobs").exists())
 
-    def test_cloud_failure_contract_is_bounded_and_recommends_local_smart(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("Get-SafeBrokerErrorCode", source)
-        self.assertIn("runtime_rebind_required", source)
-        self.assertIn("retry_once_after_runtime_rebind", source)
-        self.assertIn("retry_cloud_once_if_still_authorized", source)
-        self.assertIn("use_asr_smart_local", source)
-        self.assertNotIn("Start-Sleep", source)
-
     def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
@@ -372,7 +308,7 @@ else:
             timeout=30,
         )
 
-    def test_unlabelled_call_is_blocked_before_broker_or_queue(self) -> None:
+    def test_unlabelled_call_is_blocked_before_transport_or_queue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             audio = Path(tmp) / "ordinary.wav"
             queue = Path(tmp) / "queue"

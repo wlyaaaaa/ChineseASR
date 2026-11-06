@@ -78,10 +78,6 @@ def load_cloud_config(path: Path) -> dict[str, Any]:
         models, routes = config["models"], config["routes"]
         if config["region"] != "cn-beijing" or not isinstance(models, dict):
             raise ValueError("invalid region or models")
-        for name in ("secret_ref_target", "credential_ref"):
-            value = config.get(name)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError("cloud credential routing missing")
         if not isinstance(config["credit_cycle"], str) or not config["credit_cycle"].strip():
             raise ValueError("credit_cycle must identify the current grant")
         for name, model in models.items():
@@ -462,7 +458,7 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
                           state_path: Path | None = None,
                           resume_job_id: str = "",
                           now: datetime | None = None) -> dict[str, Any]:
-    """Prepare all audio and model policy before a SecretRef worker is invoked."""
+    """Prepare all audio and model policy before direct transmission."""
     from .audio_frontend import prepare_pcm16_mono
     from .audio_quality import extract_channel
 
@@ -567,8 +563,7 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
         if resumed["job_id"] != intent["job_id"] and fresh_work and not intent.get("vendor_request_sha256"):
             shutil.rmtree(work)
             intent_path.unlink()
-        return {**resumed, "secret_ref_target": config["secret_ref_target"],
-                "credential_ref": config["credential_ref"]}
+        return resumed
     chunks = _split_prepared_wav(prepared.path, work / "chunks",
         chunk_sec=chunk_sec, overlap_sec=overlap_sec, max_chunk_sec=int(model["max_chunk_sec"]))
     request = {"schema": TRANSPORT_SCHEMA, "job_id": intent["job_id"],
@@ -585,8 +580,7 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
         "created_utc": datetime.now(timezone.utc).isoformat()}
     if cloud_first:
         request["cloud_first"] = True
-    # Audio preparation and DashScope request construction belong here. The
-    # Password Center worker receives generic HTTP bodies / WebSocket frames.
+    # Preserve the existing request/checkpoint format across the transport move.
     request.update(vendor="qwen", mode="invoke",
                    result_path=str(root / (intent["job_id"] + ".provider.json")),
                    operations=prepare_vendor_operations(request, work))
@@ -606,8 +600,6 @@ def prepare_cloud_request(intent_path: Path, root: Path, config_path: Path, *,
     return {"status": "ready", "job_id": intent["job_id"],
             "intent_path": str(intent_path),
             "model": model["id"], "protocol": protocol,
-            "secret_ref_target": config["secret_ref_target"],
-            "credential_ref": config["credential_ref"],
             "request_path": str(pending), "billing_warning": billing_warning,
             "source_audio_seconds": duration_sec, "chunk_count": len(chunks)}
 
@@ -861,6 +853,7 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
                 "http_status": raw.get("http_status", single_provider.get("http_status")),
                 "transport_diagnostic": raw.get("transport_diagnostic", single_provider.get("transport_diagnostic")),
                 "first_failure": raw.get("first_failure", single_provider.get("first_failure")),
+                "key_copy_sync": raw.get("key_copy_sync"),
                 "status": "succeeded" if text else ("no_speech" if
                     provider.get("status") == "succeeded" or _chunk_completed(raw) else "failed"),
                 "provider_error_code": raw.get("provider_error_code"),

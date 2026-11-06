@@ -82,8 +82,8 @@ class FileJobTests(unittest.TestCase):
         self.gpu.assert_not_called()
         self.http.assert_not_called()
 
-    def test_cloud_denial_reason_survives_local_success_reuse_and_api_recovery(self):
-        reason = "background_asr_owner_state_unsettled"
+    def test_key_refresh_failure_reason_survives_local_success_reuse_and_api_recovery(self):
+        reason = "cloud_key_refresh_http_401"
         self.process.side_effect = [dict(status="blocked", error_code=reason),
                                     dict(status="queued", job_id="local")]
         self.http.return_value = {"job": dict(status="running", job_id="local")}

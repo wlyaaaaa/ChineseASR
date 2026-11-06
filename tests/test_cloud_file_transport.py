@@ -36,8 +36,7 @@ class CloudChunkTests(unittest.TestCase):
         self.request = Path(self.prepared["request_path"])
         self.sent = []
 
-    def send(self, path, target, broker):
-        self.assertEqual(target, "qwen-audio3-asr-important-once")
+    def send(self, path, root):
         part = json.loads(path.read_text("utf-8"))
         self.assertEqual(len(part["operations"]), 1)
         ident = part["operations"][0]["id"]
@@ -49,8 +48,7 @@ class CloudChunkTests(unittest.TestCase):
         return ""
 
     def run_chunks(self, access):
-        return transmit_cloud_chunks(self.request, self.intent, self.root, Path("fixture-broker.ps1"),
-                                     target="qwen-audio3-asr-important-once", access=access, send=self.send)
+        return transmit_cloud_chunks(self.request, self.intent, self.root, access=access, send=self.send)
 
     def test_lock_between_chunks_and_resume_without_resending_success(self):
         first = self.run_chunks(mock.Mock(side_effect=[True, False]))
@@ -69,7 +67,7 @@ class CloudChunkTests(unittest.TestCase):
             provider_path=self.root / (self.prepared["job_id"] + ".provider.json"), config_path=CONFIG)
         self.assertEqual((final["status"], len(final["chunks"])), ("succeeded", 3))
 
-    def test_unknown_chunk_checkpoint_never_calls_broker_again(self):
+    def test_unknown_chunk_checkpoint_never_sends_again(self):
         request = json.loads(self.request.read_text("utf-8"))
         directory = self.root / (self.prepared["job_id"] + ".work")
         marker = directory / "part-1.provider.json.checkpoints/1.json"
@@ -89,12 +87,11 @@ class CloudChunkTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
     def test_chunk_timeout_is_visible_and_preserves_completed_prefix(self):
-        def timeout(path, target, broker):
+        def timeout(path, root):
             if self.sent:
                 return "cloud_chunk_timeout"
-            return self.send(path, target, broker)
-        result = transmit_cloud_chunks(self.request, self.intent, self.root, Path("fixture.ps1"),
-                                       target="qwen-audio3-asr-important-once", access=lambda: True, send=timeout)
+            return self.send(path, root)
+        result = transmit_cloud_chunks(self.request, self.intent, self.root, access=lambda: True, send=timeout)
         self.assertEqual((result["status"], result["error_code"], len(result["results"])),
                          ("failed", "cloud_chunk_timeout", 1))
 
@@ -110,8 +107,10 @@ class CloudChunkTests(unittest.TestCase):
         (self.base / "configs/models.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
         # Relocate the real script/pipeline; only transport and privacy state are fixtures.
         pipeline = (project / "scripts/cloud-review-pipeline.py").read_text("utf-8")
-        patch = ("from zh_asr import file_job\n"
-                 "file_job._access_open = lambda: not (ROOT / 'locked.marker').exists()\n")
+        patch = ("from zh_asr import file_job, cloud_file_transport\nimport subprocess\n"
+                 "file_job._access_open = lambda: not (ROOT / 'locked.marker').exists()\n"
+                 "cloud_file_transport._send = lambda path, root: subprocess.run([sys.executable, "
+                 "str(ROOT / 'scripts/fixture-provider.py'), str(path), str(ROOT)], check=True).returncode or ''\n")
         pipeline = pipeline.replace("def main(argv:", patch + "\ndef main(argv:")
         (scripts / "cloud-review-pipeline.py").write_text(pipeline, encoding="utf-8")
         provider = scripts / "fixture-provider.py"
@@ -126,19 +125,7 @@ Path(r['result_path']).write_text(json.dumps(dict(schema='passwordcenter.vendor-
  results=[dict(id=i,http_status=200,raw_response={'output':{'text':'fixture '+i}})])),encoding='utf-8')
 if i=='1': (root/'locked.marker').touch()
 """, encoding="utf-8")
-        broker = scripts / "fixture-broker.ps1"
-        broker.write_text("""param($Action,$Query,$SecretRefRequestPath,$ResultCode,$OperationId,[switch]$Json)
-if ($Action -eq 'AgentSecretRef') {
- & '%s' '%s' $SecretRefRequestPath '%s'
- [Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"ok"}')
- exit 0
-}
-[Console]::Out.WriteLine('{"schema":"pcconfig.secret-broker-result.v1","status":"error","error":"trusted_desktop_ancestor_required"}')
-exit 3
-""" % tuple(str(value).replace("'", "''") for value in (sys.executable, provider, self.base)), encoding="utf-8")
         source = (project / "scripts/asr-professional-cloud.ps1").read_text("utf-8")
-        source = source.replace("$brokerPath = 'C:\\ProgramData\\PCConfig\\AuthorityHost\\tools\\Invoke-SecretBroker.ps1'",
-                                "$brokerPath = '" + str(broker).replace("'", "''") + "'")
         source = source.replace("$python = Join-Path $PSScriptRoot '..\\.venv\\Scripts\\python.exe'",
                                 "$python = '" + sys.executable.replace("'", "''") + "'")
         source = source.replace("Global\\ChineseASRCloudUploadOnce", "Global\\ASRCloudFixture" + uuid.uuid4().hex)
@@ -161,10 +148,8 @@ exit 3
         self.assertEqual((final["status"], final["job_id"], len(final["chunks"])),
                          ("succeeded", receipt["job_id"], 3))
         self.assertEqual((self.base / "sent.log").read_text().split(), ["1", "2", "3"])
-        self.assertEqual((final["credential_report_status"], final["cloud_retry_policy"]),
-                         ("report-failed", "not_needed"))
-        log = json.loads(Path(final["broker_log_path"]).read_text("utf-8"))
-        self.assertNotIn("results", log["agent_secret_ref_receipt"])
+        self.assertEqual(final["cloud_retry_policy"], "not_needed")
+        self.assertNotIn("broker_log_path", final)
 
 
 if __name__ == "__main__":

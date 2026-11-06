@@ -120,7 +120,7 @@ Windows 的一次性 worker 由固定脚本经 WMI 隐藏启动，脱离提交�
 
 直接调用云脚本时，同原音并发仍最多等 24 小时；统一 `file-job` 显式传 `-ConcurrentWaitSec 5`，后台只短等同一云请求。需要调整直接脚本的等待时可显式指定此参数。
 
-文件入口按块交给原 worker 持钥发送，调用方不取得凭据；每块前重查资料期，锁定后暂停，解锁复用同一云作业和已知成功分块，只发未发送的块。每块调用最多四分钟，超过五分钟没有块进度会终止本次自有进程树并留下失败原因；整段另有按原音时长计算的上限。未知请求不重传。`ReportCredentialResult` 上报失败只记在回执中，不会把成功稿件改成失败或触发再上传。
+文件入口由 ASR 读取本机加密 Key 副本并直接发送；每块前重查资料期，锁定后暂停，解锁复用同一云作业和已知成功分块，只发未发送的块。每次网络请求最长 180 秒，超过五分钟没有块进度会终止本次自有进程树并留下失败原因；整段另有按原音时长计算的上限。未知请求不重传，云端明确拒绝旧 Key 时的候选更新见下文。
 
 云产物仍在 `outputs/cloud-jobs`，本地产物仍由现有 API 作业管理；单文件进度在 `outputs/api/file-jobs/<原音SHA256>.json`。`transcript-readback` 也会按 SHA 直接读取这一份已完成产物引用并复用原解析与哈希校验，API 裁剪到最近 200 个终态后仍可回读。成功须通过现有 `transcript-readback` 校验；只有全文、缺句级时间时仍成功并返回 `timestamps=unavailable`，云分块范围不冒充句级时间，不为补时间再次识别全文。云成功但产物暂时不可回读时保留失败原因，后续只重读产物。云已发送、结果未知或身份被拒绝时不会自动重传、换身份或改凭据绑定；本地失败后的再次调用可重试本地，成功稿件不重复转写。
 
@@ -209,7 +209,7 @@ cd <repo-root>
 
 `scripts\asr-professional-cloud.ps1` 是唯一的云上传入口。3.1 Flash 用 HTTPS Base64，按配置每段最多 120 秒；3.1 Flash-Message 用 WebSocket，把本地录音切成最多 30 秒的单声道 PCM 段逐段送入。Message 是实时接口，不能直接提交长文件。录音原件及声道来源不改动；需要说话人分离时选 Flash，返回的说话人编号只在单段内有效。Filetrans 虽能处理长录音，但要求公网可访问 URL，本项目不使用。
 
-AI 处理当前选定的录音时直接使用下面的入口，不需要已有本地作业或本地质量结果；重要证据在命令中加 `-Important`，普通录音不加。`-CloudFirst` 沿用配置免费期与停用检查，失败或过期时保留回执，按 [项目规则](AGENTS.md) 本地兜底。不同内容的音频可以同时上传（实测 6 条同时全部成功），内容相同的轮流。单声道 16 位 WAV 在程序内转采样，不启动 ffmpeg。成功结果向密码中心的上报只会清除“凭据需要更新”标记，所以 24 小时内确认过状态正常、之后又没有失败时跳过（回执 `credential_report_status=skipped_no_state_change`，状态记在 `outputs/cloud-jobs/credential-health.json`，删除它下次就照常上报）；任何失败都当场上报。
+AI 处理当前选定的录音时直接使用下面的入口，不需要已有本地作业或本地质量结果；重要证据在命令中加 `-Important`，普通录音不加。`-CloudFirst` 沿用配置免费期与停用检查，失败或过期时保留回执，按 [项目规则](AGENTS.md) 本地兜底。不同内容的音频可以同时上传（原传输路线实测 6 条同时全部成功），内容相同的轮流。单声道 16 位 WAV 在程序内转采样，不启动 ffmpeg。
 
 ```powershell
 .\scripts\asr-professional-cloud.ps1 -Audio '<原录音绝对路径>' -CloudFirst -Json
@@ -221,11 +221,11 @@ AI 处理当前选定的录音时直接使用下面的入口，不需要已有�
 1. `-Important`：当前录音已被明确归类为重要或专业录音。请求仍写入 `importance=important`，回执仍为 `important_only=true`；
 2. `-CloudFirst` 不加 `-Important` 时是普通录音转写，`purpose=transcription`；不能和 `-QualityReview` 同时使用。`-QualityReview` 仍用于当前选定的本地存疑转写复核，`purpose=quality_review`、`important_only=false`；
 3. `-CloudFirst` 自带免费期内的自动上传依据，无需 `-CloudUploadAuthorized` 或 `-LocalOutDir`。既有 `-AutomaticReview -LocalOutDir <本地结果目录>` 保留为本地疑难结果的补跑路线；`-CloudUploadAuthorized` 仍表示调用方已取得本次明确上传授权；
-4. Password Center 对配置的受管目标及 worker 哈希的完整性验证通过。当前配置仍指向已有 `qwen-audio3-asr-important-once`；厂商一把 Key 的最终登记形式由 PCConfig 相关调查确定，本项目不绕过既有固定哈希。
+4. 本机共享加密 Key 副本可读；缺失或不可读时返回具体原因，文件入口沿用本地兜底。
 
 `-Important` 和 `-QualityReview` 不能同时使用。云入口不会自动启动 FireRed、Qwen 或其它本地双引擎；是否补本地证据链及如何回核分歧，按 [项目规则](AGENTS.md) 和当次证据用途决定。
 
-持钥传输由密码中心 `vendor_api_worker.py` 负责（受管目标 `qwen-audio3-asr-important-once`，PCConfig 安装并固定哈希），本项目只准备请求。
+ASR 使用 PCConfig 的 `vendor_key_copy.py` 只读本机副本，自行发送 HTTP 或 WebSocket 请求；正常发送不经密码中心取 Key 或转发。资料期查询仍只读既有保护入口。
 
 每次尝试都在被 Git 忽略的 `outputs\cloud-jobs` 留请求、供应商原始结果、投影结果、原音哈希、模型、时间及每段 usage；这些是作业记录，本地不预留或计算剩余额度。百炼官方的 3.1 计量是 Token，但本地不以此拦截调用。
 
@@ -235,17 +235,17 @@ AI 处理当前选定的录音时直接使用下面的入口，不需要已有�
 
 `outputs\cloud-jobs\auto-cloud-state.json` 保存停用状态。`python scripts/cloud-review-state.py status` 回执含 `enabled`、`free_until`、各自动路由模型的 `model_free_until`、`reason` 和 `failure_reason`；只读状态不查询账号额度。主动停用使用 `python scripts/cloud-review-state.py pause --reason "暂停原因"`，本人说恢复时用 `python scripts/cloud-review-state.py resume`；状态恢复与错误分类的规则归 [项目规则](AGENTS.md)。
 
-本地转写的 `quality.review.json` 标 `needs_review`、两引擎分歧、`[疑似]`、`provisional` 或作业的 `-Important` 标记会触发自动复核。本地 API 服务只在 `cloud.review.json` 标记 `pending_ai_session`，并把状态放入 `asr-smart.ps1 -Json` 的 `cloud_review` 字段；服务自身不上传。`asr-smart` 若先返回运行中，AI 应按 `next_status_command` 查询终态，再读取 `cloud_review`。处理该录音的 AI 会话读到待补跑状态后，在自己的进程链中执行侧车给出的 `asr-professional-cloud.ps1 -Audio <原音> -QualityReview`（重要录音改用 `-Important`）`-AutomaticReview -LocalOutDir <结果目录> -EvidenceStatus <本地状态> -Json`。密码中心自己认出实际调用方（Codex 桌面版、Claude 会话及它们派出的子代理），不用传调用方参数。停用或所选模型免费期到期时，本地只记录原因，不安排上传。
+本地转写的 `quality.review.json` 标 `needs_review`、两引擎分歧、`[疑似]`、`provisional` 或作业的 `-Important` 标记会触发自动复核。本地 API 服务只在 `cloud.review.json` 标记 `pending_ai_session`，并把状态放入 `asr-smart.ps1 -Json` 的 `cloud_review` 字段；服务自身不上传。`asr-smart` 若先返回运行中，AI 应按 `next_status_command` 查询终态，再读取 `cloud_review`。处理该录音的 AI 会话读到待补跑状态后，执行侧车给出的 `asr-professional-cloud.ps1 -Audio <原音> -QualityReview`（重要录音改用 `-Important`）`-AutomaticReview -LocalOutDir <结果目录> -EvidenceStatus <本地状态> -Json`。停用或所选模型免费期到期时，本地只记录原因，不安排上传。
 
 配置、音频检查或提示写入失败时，本地作业仍为 `succeeded`，原有 `cloud_review` 字段标 `failed` / `cloud_review_not_scheduled`，写明「云复核未安排成功」及异常原因；即使 `cloud.review.json` 未能写入，失败仍随作业历史保存，重启后可查询。本地稿保留，修好原因后可沿下面的批量或单次入口恢复；已恢复的侧车结果优先于历史失败提示。
 
 `python scripts/cloud-review-batch.py --dry-run` 列出现有疑难作业、待补跑状态以及源音失效的作业号；在 `E:\Music` 找到同名且 SHA-256 完全一致的源音时，预览会显示恢复的新路径。也可用 `--recover-root <目录>` 指定搜索位置；找不到的作业须由 AI 确认新源音路径后单独补跑。批量执行由 AI 会话运行 `python scripts/cloud-review-batch.py`；先用 `--dry-run` 查看候选。去掉 `--dry-run` 才上传。云结果保存在被 Git 忽略的 `outputs\cloud-jobs`，本地结果目录另写 `cloud.review.json` 并排保留文本与差异，不静默覆盖正文。云调用失败会
-明确返回失败原因，不会静默冒充本地结果。运行时重绑缺失时不上传，重绑后可按原用途重试；网络、
+明确返回失败原因，不会静默冒充本地结果。Key 副本缺失时不上传；网络、
 限流、超时或供应商 5xx 只影响本次，不盲目自动重发同一段音频；需要时以原音和已留结果检查后再试。其它云失败明确建议改用本地
 `asr-smart`，并保持云结果与本地证据链分开。对于要当证据用的录音，云结果是能力优先的
 专业候选，本地证据链按当次证据用途和真实分歧需要补做，不能把云转写本身当作证据认证。
 
-`asr-professional-cloud.ps1 -Json` 的标准输出只给最终转写回执，密钥代理的两份原始回执保存在回执所列 `outputs\cloud-jobs\<job>.broker.json`；批量补跑会先按原音哈希、用途和声道复用已成功的云结果，修正误记的失败侧车，再决定是否上传。
+`asr-professional-cloud.ps1 -Json` 的标准输出只给最终转写回执，直接传输结果保存在 `outputs\cloud-jobs\<job>.provider.json`；批量补跑会先按原音哈希、用途和声道复用已成功的云结果，修正误记的失败侧车，再决定是否上传。
 
 显式复核可以带 `-Hotwords @{'省高院'=2;'最高院'=2}`、`-SpeakerDiarization` 或 `-KeepDialect`；前者使用官方即时热词权重，两个声学选项不可同时开启。重要录音用 `-Important`，普通存疑质量复核用 `-QualityReview`。官方接口与计量见[语音识别模型表](https://help.aliyun.com/zh/model-studio/asr-model)、[Flash HTTP 参数](https://help.aliyun.com/zh/model-studio/fun-asr-flash-recorded-speech-recognition-http-api)、[Message WebSocket 参数](https://help.aliyun.com/zh/model-studio/qwen-asr-message-client-events)及[模型价格](https://help.aliyun.com/zh/model-studio/model-pricing)。
 
@@ -651,29 +651,29 @@ LocalGpuBroker 不可用、同族 ChineseASR 已在运行、Ollama 重型请求/
 
 ### 厂商 Key 与云请求续作
 
-云端 Key 的产品登记属于密码中心，机器路径/哈希由 PCConfig 安装合成。ASR 沿用
-`qwen-default` 和 `qwen-audio3-asr-important-once`；`cloud_review.py` 先准备 HTTP body
-或 WebSocket 帧，再通过 `-SecretRefRequestPath` 提交精确请求。切段、声道和业务用途判断
-由 ASR 负责，不产生新凭据登记。密码中心的无桌面用途门只校验协议、路径、方法及区分
-大小写的 Qwen 转写模型家族（模型名以 `qwen` 开头且含 `asr`），不校验音频内容或消息结构。
-换到其他请求路径或不属于该家族的模型时，要同步改密码中心用途门，否则后台会退回本地。
+云端 Key 的原始登记属于密码中心，共享副本由 PCConfig 的
+`E:\PCConfig\tools\vendor_key_copy.py` 管理，保存为 `E:\Data\VendorKeys\qwen.dpapi`。
+ASR 的正常请求只调用 `load_key('qwen')` 读取副本，HTTP 使用 Bearer 请求头，WebSocket
+使用握手鉴权；明文不进参数、请求 JSON、正文或日志。`cloud_review.py` 继续准备 HTTP body
+和 WebSocket 帧，切段、声道、模型、热词及业务用途判断仍归 ASR，不随传输重新登记。
+
+只有 HTTP 401 或厂商明确报无效 Key 时，才调用共享模块
+`sync_key('qwen', validate=callback)`：只读取得候选，先在内存重试本次已知失败请求，
+成功才原子替换同名副本。候选请求失败时旧文件不变，回执保留具体 `cloud_key_refresh_*`
+或 `cloud_key_sync_*` 原因；每次只同步一次。网络结果未知、超时、限流或其他错误不触发刷新。
+候选转写已成功但保存副本失败时保留成功稿件，`key_copy_sync` 记录保存结果，不重传。
+手动同步与 stdin 导入由 PCConfig 的共享工具负责，未验证候选不替换副本。
+资料期仍经既有 `CheckPersonalDataAccess` 只读查询；这项查询保留，不代表云请求仍经密码中心发送。
 
 一次调用保留 `<job_id>.intent.json`、`<job_id>.unclaimed.json`、`.provider.json` 和检查点。
 再次运行同样的云入口命令时，会按音频 SHA-256、用途、声道、模型及请求参数接续未完成作业，
 沿用原作业 ID 和请求；也可用 `-ResumeJobId <原作业 ID>` 指定，参数不一致时会说明无法续作。
-已经成功的 operation 由密码中心检查点跳过，不重发。
-`previous_outcome_unknown` 表示服务端是否完成尚不清楚，不自动新建作业。明确允许重试该
-不确定项后，才在原请求添加 `retry_uncertain: true`；请求体、模型及音频摘要仍必须相同。
+已经成功的 operation 由 ASR 检查点跳过，不重发，兼容原传输留下的摘要和成功记录。
+`previous_outcome_unknown` 表示服务端是否完成尚不清楚，不自动重发或新建作业；
+请求体、模型及音频摘要仍保留供核对。
 成功作业的原始录音、最终正文和云回执保留，生成的 `.work` 切段与 Base64/PCM 中间副本会清理；
 失败、未完成或原始录音已不在的作业继续保留中间文件。空文字或 `ASR_RESPONSE_HAVE_NO_WORDS`
-在结果中标为单段“无语音”；密码中心在中途停下而后续段尚未处理时，整份仍保留失败状态。
+在结果中标为单段“无语音”；中途停下而后续段尚未处理时，整份仍保留失败状态。
 
-厂商传输的执行状态回执现在带有封闭错误码；非法官方主机、管道交付失败和传输失败不会笼统
-显示为 `internal_error`。ASR 的上传授权、免费期和用途判断仍由流水线负责，不能把这些业务
-规则解释成“只有 AI 进程才能获得 key”：密码中心同一厂商目标另有普通终端交付方式，可将
-明文交还给当前用户调用进程链的上级进程。撤销 Claude/Codex 桌面主体不会禁用该方式，要撤销
-受信设备或删除厂商登记；已经交出的明文不能追回。现有主体撤销还会推进共享撤销 epoch，使旧受信设备封套暂时返回 `trusted_device_unlock_rebind_required`；这不等于为原生交付建立了按主体的权限隔离。合法重绑受信设备后，该路径仍不检查被撤销的桌面主体。本次未放宽这个 epoch 校验。
-
-与 AICLI 一起回退时，先以 Git 回退提交恢复消费者源码并核对旧登记所指 worker 的哈希，再由
-管理员恢复受保护安装。程序快照不得先覆盖活动检出的 worker，否则后续 Git 回退会遇到脏文件。
-候选/整合工作副本保留到验收或回退结束，供恢复脚本读取安装器与产品源码。
+回退本次传输改动使用 Git 恢复源码和配置；副本的手动同步或停用由 PCConfig 共享工具维护，
+不要求重装、重载密码中心。
