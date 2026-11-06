@@ -361,6 +361,91 @@ class TranscriptReadbackTests(unittest.TestCase):
         self.assertFalse(payload["lookup_scope"]["original_audio_read"])
         self.assertFalse(payload["lookup_scope"]["model_run"])
 
+    def test_successful_cloud_with_silent_chunk_keeps_full_transcript_reusable(self):
+        from zh_asr.file_job import _reuse
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            digest = hashlib.sha256(b"selected cloud source").hexdigest()
+            path = self._write_cloud_result(root / "outputs/cloud-jobs", digest)
+            result = json.loads(path.read_bytes())
+            result["chunks"][0]["text"] = ""
+            result["chunks"][0].update(status="no_speech", provider_request_id=None)
+            path.write_text(json.dumps(result), encoding="utf-8")
+            reused = _reuse(digest, root)
+            self.assertEqual((reused["status"], reused["timestamps"]), ("succeeded", "unavailable"))
+            result["chunks"][1]["text"] = ""
+            path.write_text(json.dumps(result), encoding="utf-8")
+            self.assertEqual(_reuse(digest, root)["status"], "unavailable")
+
+    def test_long_success_reuses_hash_bound_text_without_inventing_sentence_times(self):
+        from zh_asr.audio_outcome import aggregate_objective_result
+        from zh_asr.file_job import _reuse
+        from zh_asr.strict_writer import write_strict_bundle
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "long.wav"
+            source.write_bytes(b"synthetic selected long recording")
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            outputs = write_strict_bundle(audio_path=source, primary_engine="sensevoice",
+                primary_result=[{"text": "完整录音转写"}], secondary_engine="paraformer",
+                secondary_result=[{"text": "完整录音转写"}], out_dir=root / "chunk")
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(dict(audio_sha256=digest, resolved_primary_engine="sensevoice",
+                resolved_secondary_engine="paraformer", evidence_status=outputs["evidence_status"],
+                chunks=[dict(chunk_id="chunk-1", status="succeeded", evidence_status=outputs["evidence_status"],
+                    outputs={k: str(v) for k, v in outputs.items() if isinstance(v, Path)})])), encoding="utf-8")
+            objective = root / "objective-result.json"
+            objective.write_text(json.dumps(aggregate_objective_result(audio_path=source, mode="long-strict",
+                engines=["sensevoice", "paraformer"], children=[json.loads(outputs["objective_result"].read_bytes())])), encoding="utf-8")
+            snapshot = root / "outputs/api/jobs.json"
+            snapshot.parent.mkdir(parents=True)
+            snapshot.write_text(json.dumps({"jobs": [dict(job_id="long-job", status="succeeded",
+                request=dict(mode="long-strict", audio_sha256=digest), outputs=dict(manifest=str(manifest),
+                    transcript=str(outputs["final"]), objective_result=str(objective)))]}), encoding="utf-8")
+            reused = _reuse(digest, root)
+            self.assertEqual((reused["status"], reused["timestamps"]), ("succeeded", "unavailable"))
+            self.assertEqual(reused["artifact"]["transcript"]["path"], str(outputs["final"]))
+            outputs["primary_json"].write_text("damaged", encoding="utf-8")
+            self.assertEqual(_reuse(digest, root)["status"], "unavailable")
+
+    def test_file_job_keeps_validated_local_artifact_after_api_history_pruning(self):
+        for timestamped in (True, False):
+            with self.subTest(timestamped=timestamped):
+                self._assert_file_job_survives_pruning(timestamped)
+
+    def _assert_file_job_survives_pruning(self, timestamped):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            api = root / "outputs/api"
+            api.mkdir(parents=True)
+            snapshot, digest, raw, _ = self._write_bundle(api, timestamped=timestamped)
+            final = api / "transcript.md"
+            final.write_text("完整全文", encoding="utf-8")
+            original = json.loads(snapshot.read_bytes())
+            original["jobs"][0]["outputs"]["markdown"] = str(final)
+            snapshot.write_text(json.dumps(original), encoding="utf-8")
+            selected = read_transcript_readback(digest, snapshot)
+            retained = api / "file-jobs" / (digest + ".json")
+            retained.parent.mkdir()
+            retained.write_text(json.dumps(dict(schema="zh_asr.file-job.v1", route="local",
+                status="succeeded", source_audio_sha256=digest, job_id="job-1",
+                artifact=selected["artifact"], evidence_status=selected["evidence_status"])), encoding="utf-8")
+            snapshot.write_text('{"jobs": []}', encoding="utf-8")
+            (api / "source.mp3").unlink()
+            recovered = read_transcript_readback(digest, snapshot)
+            self.assertEqual(recovered["status"], "ok" if timestamped else "gap")
+            if not timestamped:
+                self.assertEqual(recovered["gap"]["code"], "timestamps_unavailable")
+            self.assertEqual(recovered["artifact"], selected["artifact"])
+            self.assertTrue(recovered["lookup_scope"]["retained_file_job_found"])
+            self.assertFalse(recovered["lookup_scope"]["original_audio_read"])
+            from zh_asr.file_job import _reuse
+            self.assertEqual(_reuse(digest, root)["status"], "succeeded")
+            final.unlink()
+            self.assertEqual(_reuse(digest, root)["status"], "unavailable")
+            raw.write_text("damaged", encoding="utf-8")
+            self.assertEqual(read_transcript_readback(digest, snapshot)["lookup_scope"]["valid_candidates"], 0)
+
     def test_cloud_quality_result_with_importance_label_is_rejected(self):
         from zh_asr.transcript_readback import read_transcript_readback
 

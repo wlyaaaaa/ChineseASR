@@ -91,7 +91,11 @@ def read_transcript_readback(
         lookup_scope["jobs_snapshot_gap"] = {
             "code": "jobs_snapshot_invalid", "message": "The owner-managed jobs snapshot has no jobs list."}
 
-    jobs = payload["jobs"]
+    jobs = list(payload["jobs"])
+    retained = _read_file_job_snapshot(snapshot, requested_hash)
+    lookup_scope["retained_file_job_found"] = retained is not None
+    if retained is not None and not any(job.get("job_id") == retained["job_id"] for job in jobs if isinstance(job, Mapping)):
+        jobs.append(retained)
     lookup_scope["jobs_examined"] = len(jobs)
     valid_candidates: list[dict[str, Any]] = []
     rejected: list[dict[str, str]] = []
@@ -131,6 +135,11 @@ def read_transcript_readback(
 
         raw_values = _raw_output_values(outputs)
         if not raw_values:
+            if request.get("mode") == "long-strict":
+                candidate = _read_long_transcript(job, request_hash, objective_path)
+                if candidate is not None:
+                    valid_candidates.append(candidate)
+                    continue
             _record_rejection(rejected, job_id, "raw_artifact_reference_missing")
             continue
 
@@ -144,7 +153,7 @@ def read_transcript_readback(
                 objective_path=objective_path,
             )
             if candidate is not None:
-                candidate["artifact"]["transcript"] = {"path": outputs.get("final") or outputs.get("markdown")}
+                candidate["artifact"]["transcript"] = {"path": outputs.get("final") or outputs.get("markdown") or outputs.get("transcript")}
                 valid_candidates.append(candidate)
             else:
                 _record_rejection(rejected, job_id, reason, output_key)
@@ -240,6 +249,67 @@ def read_transcript_readback(
         selection_reason=selected["selection_reason"],
         lookup_scope=lookup_scope,
     )
+
+
+def _read_file_job_snapshot(snapshot: Path, digest: str) -> dict | None:
+    """One SHA-addressed record keeps successful local artifacts past API pruning."""
+    try:
+        state = json.loads((snapshot.parent / "file-jobs" / (digest + ".json")).read_bytes())
+        if (state.get("schema") != "zh_asr.file-job.v1" or state.get("source_audio_sha256") != digest
+                or state.get("route") != "local"
+                or not (state.get("status") == "succeeded" or state.get("transcript_completed"))):
+            return None
+        artifact = state.get("artifact", {})
+        outputs = dict(state.get("outputs", {}))
+        for key in ("raw_json", "objective_result", "manifest", "transcript"):
+            ref = artifact.get(key)
+            if not isinstance(ref, Mapping) or not ref.get("path"):
+                continue
+            path = _resolve_path(ref["path"])
+            if ref.get("sha256"):
+                data = path.read_bytes()
+                if len(data) != ref["size_bytes"] or hashlib.sha256(data).hexdigest() != ref["sha256"]:
+                    return None
+            outputs[key] = str(path)
+        if not outputs:
+            return None
+        return dict(job_id=state.get("job_id") or "file:" + digest, status="succeeded", outputs=outputs,
+            request=dict(audio_sha256=digest, mode=artifact.get("mode", "quick")),
+            evidence_status=state.get("evidence_status", "unknown"))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _read_long_transcript(job: Mapping[str, Any], digest: str, objective_path: Path) -> dict | None:
+    """Retain validated long-form text without inventing sentence timestamps."""
+    from .service import _long_manifest_evidence
+    try:
+        outputs = job["outputs"]
+        manifest_path = _resolve_path(outputs["manifest"])
+        manifest = json.loads(manifest_path.read_bytes())
+        objective = json.loads(objective_path.read_bytes())
+        if (manifest.get("audio_sha256") != digest or validate_objective_result(objective)
+                or objective["execution"]["status"] != "completed"
+                or objective["audio"]["raw_sha256"] != digest
+                or objective["idempotency_basis"]["source_audio_sha256"] != digest):
+            return None
+        evidence, failures = _long_manifest_evidence(str(manifest_path))
+        if evidence not in {"verified", "provisional"}:
+            return None
+        transcript = _resolve_path(outputs["transcript"])
+        if not transcript.read_text(encoding="utf-8").strip():
+            return None
+        refs = {}
+        for key, path in (("transcript", transcript), ("manifest", manifest_path), ("objective_result", objective_path)):
+            data = path.read_bytes()
+            refs[key] = dict(path=str(path), sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data))
+        return dict(job_id=str(job.get("job_id") or ""), engine=manifest.get("resolved_primary_engine", "unknown"),
+            segments=[], total_segments=0, timed_segments=0, evidence_status=evidence,
+            objective_outcome=objective["objective_outcome"], quality={**objective["quality"], "evidence_failures": failures},
+            coverage=objective["coverage"], artifact={"job_id": job.get("job_id"), "mode": "long-strict", **refs},
+            selection_reason="Selected a hash-bound long transcript with validated child bundles; sentence timing is unavailable.")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
 
 
 def _read_batch_candidates(root: Path, requested_hash: str, rejected: list) -> list[dict[str, Any]]:
@@ -450,6 +520,8 @@ def _inspect_cloud_result_candidate(
     segments, chunk_metadata, coverage = _normalize_cloud_chunks(chunks)
     if segments is None:
         return None, True, "cloud_result_chunks_invalid"
+    if not segments:
+        return None, True, "cloud_result_transcript_empty"
 
     result_hash = hashlib.sha256(result_bytes).hexdigest()
     artifact = {
@@ -522,9 +594,9 @@ def _normalize_cloud_chunks(
             or end is None
             or end <= start
             or not isinstance(text, str)
-            or not text.strip()
             or not _SHA256_RE.fullmatch(chunk_hash)
-            or not provider_request_id
+            or (text.strip() and not provider_request_id)
+            or (not text.strip() and value.get("status") != "no_speech")
         ):
             return None, [], {}
         seen_indexes.add(index)
@@ -548,7 +620,7 @@ def _normalize_cloud_chunks(
     indexed.sort(key=lambda item: (item[1], item[2], item[0]))
     coverage = _cloud_chunk_coverage([(item[1], item[2]) for item in indexed])
     return (
-        [item[3] for item in indexed],
+        [item[3] for item in indexed if item[3]["text"].strip()],
         [item[4] for item in indexed],
         coverage,
     )

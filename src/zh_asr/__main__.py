@@ -70,6 +70,10 @@ def main(argv: list[str] | None = None) -> int:
 
     subparsers.add_parser("doctor", help="Check local runtime state without loading ASR models.")
 
+    file_job_cmd = subparsers.add_parser("file-job", help="Submit or poll one recording using the configured cloud/local route.")
+    file_job_cmd.add_argument("--audio", type=Path, required=True)
+    file_job_cmd.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+
     subparsers.add_parser("alignment-info", help="Describe local text/audio alignment without loading a model.")
     align = subparsers.add_parser("align", help="Align supplied text to one existing audio file; never transcribe or regenerate it.")
     align.add_argument("audio", type=Path)
@@ -436,6 +440,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"Failed: {summary.failed}"
             )
             return 1 if summary.failed else 0
+        if args.command == "file-job":
+            from .file_job import file_job
+            payload = file_job(args.audio, worker=args.worker)
+            print(json.dumps(payload, ensure_ascii=False))
+            return int(payload["status"] == "failed")
         if args.command == "transcript-readback":
             payload = read_transcript_readback(
                 args.audio_sha256,
