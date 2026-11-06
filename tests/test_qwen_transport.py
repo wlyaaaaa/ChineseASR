@@ -160,6 +160,7 @@ class DirectTests(unittest.TestCase):
         with mock.patch("websockets.sync.client.connect", return_value=socket):
             result = direct.websocket_transport("wss://fixture", operation, "synthetic-key", self.root)
         self.assertEqual(len(result["raw_events"]), 3)
+        self.assertEqual(result["provider_request_id"], "test")
         self.assertEqual(socket.send.call_args_list[1:3], [mock.call(b"ab"), mock.call(b"cd")])
         for error in (direct.provider_error("ASR_RESPONSE_HAVE_NO_WORDS", ""), direct.CloudSendError("provider_task_timeout", uncertain=True)):
             with mock.patch.object(direct, "websocket_transport", side_effect=error):

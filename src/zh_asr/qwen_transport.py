@@ -95,6 +95,15 @@ def http_transport(url, operation, key, root):
     return dict(http_status=status, raw_response=body, provider_request_id=body.get("request_id"), usage=body.get("usage"))
 
 
+def websocket_request_id(events, expected):
+    """Use the server's completed task echo only when every event matches its binding."""
+    if not events or any(not isinstance(e, dict) or not isinstance(e.get("header"), dict) for e in events): return None
+    headers = [event["header"] for event in events]
+    if not expected or any(header.get("task_id") != expected for header in headers): return None
+    finished = [header for header in headers if header.get("event") == "task-finished"]
+    return finished[0]["task_id"] if len(finished) == 1 else None
+
+
 def websocket_transport(url, operation, key, root):
     from websockets.sync.client import connect
     from websockets.exceptions import InvalidStatus
@@ -156,7 +165,10 @@ def websocket_transport(url, operation, key, root):
         raise provider_error("", "", exc.response.status_code) from None
     except TimeoutError: raise CloudSendError("provider_task_timeout", uncertain=True, credential_result="Timeout") from None
     except Exception: raise CloudSendError("websocket_failure", uncertain=True, credential_result="Network-Failure") from None
-    return {"raw_events": events}
+    expected = next((b["value"] for b in operation.get("event_bindings", []) if b["field"] == ["header", "task_id"]), None)
+    request_id = websocket_request_id(events, expected)
+    if not request_id: raise CloudSendError("provider_event_binding_mismatch", uncertain=True)
+    return {"raw_events": events, "provider_request_id": request_id}
 
 
 def transmit(operation, root, cutoff, store, keys):

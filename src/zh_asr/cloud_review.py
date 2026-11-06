@@ -16,6 +16,7 @@ import uuid
 import wave
 
 from .text_comparison import normalize_comparison, strip_audit_markers
+from .qwen_transport import websocket_request_id
 
 
 class CloudReviewError(RuntimeError):
@@ -847,6 +848,9 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
         single_provider = provider if len(expected_chunks) == 1 else {}
         for raw in raw_chunks:
             text = _provider_chunk_text(raw, str(provider.get("protocol")))
+            if text and provider.get("protocol") == "websocket" and not raw.get("provider_request_id"):
+                expected_task = str(uuid.uuid5(uuid.UUID(job_id), str(raw["index"])))
+                raw = {**raw, "provider_request_id": websocket_request_id(raw.get("raw_events"), expected_task)}
             chunks.append({"index": raw["index"], "start_ms": raw["start_ms"],
                 "end_ms": raw["end_ms"], "audio_sha256": raw["audio_sha256"],
                 "provider_request_id": raw.get("provider_request_id", single_provider.get("provider_request_id")),

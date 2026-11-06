@@ -453,23 +453,42 @@ class CloudPipelineTests(unittest.TestCase):
         ready = prepare_cloud_request(intent, self.root, CONFIG)
         request = json.loads(Path(ready["request_path"]).read_text(encoding="utf-8"))
         chunk = request["chunks"][0]
+        task_id = request["operations"][0]["event_bindings"][0]["value"]
         provider = self.root / (request["job_id"] + ".provider.json")
-        provider.write_text(json.dumps({"schema": "zh_asr.dashscope_transport_result.v1",
-            "job_id": request["job_id"], "status": "succeeded", "model": request["model"],
-            "protocol": "websocket", "credential_result": "Success",
-            "cloud_upload_performed": True, "source_audio_sha256": request["source_audio_sha256"],
-            "chunks": [{"index": chunk["index"], "start_ms": chunk["start_ms"],
-                "end_ms": chunk["end_ms"], "audio_sha256": chunk["audio_sha256"],
-                "provider_request_id": "task-1", "raw_events": [{"header": {
-                    "event": "result-generated"}, "payload": {"output": {"sentence": {
+        provider.write_text(json.dumps({"schema": "passwordcenter.vendor-result.v1", "vendor": "qwen",
+            "request_sha256": json.loads(intent.read_text("utf-8"))["vendor_request_sha256"],
+            "status": "succeeded", "credential_result": "Success", "new_requests": 1,
+            "results": [{"id": str(chunk["index"]),
+                "raw_events": [{"header": {
+                    "event": "result-generated", "task_id": task_id}, "payload": {"output": {"sentence": {
                     "sentence_id": 1, "sentence_end": True, "text": "第一句"}}}},
-                    {"header": {"event": "task-finished"},
+                    {"header": {"event": "task-finished", "task_id": task_id},
                      "payload": {"usage": {"total_tokens": 4}}}],
                 "usage": {"total_tokens": 4}}]}, ensure_ascii=False), encoding="utf-8")
+        original_provider = provider.read_bytes()
+        self.audio.unlink()  # Retained responses recover without reading the source or sending again.
         final = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
         self.assertEqual("succeeded", final["status"])
         self.assertEqual("第一句", final["text"])
         self.assertEqual(4, final["chunks"][0]["usage"]["total_tokens"])
+        self.assertEqual(task_id, final["chunks"][0]["provider_request_id"])
+        self.assertEqual(original_provider, provider.read_bytes())
+        candidate, matched, rejected = _inspect_cloud_result_candidate(Path(final["result_path"]), request["source_audio_sha256"])
+        self.assertTrue(matched)
+        self.assertEqual(rejected, "")
+        self.assertIsNotNone(candidate)
+        for defect in ("wrong_task", "no_task", "no_finish", "duplicate_finish"):
+            body = json.loads(original_provider)
+            events = body["results"][0]["raw_events"]
+            if defect == "wrong_task": events[0]["header"]["task_id"] = "other"
+            elif defect == "no_task": events[0]["header"].pop("task_id")
+            elif defect == "no_finish": events.pop()
+            else: events.append(events[-1])
+            provider.write_text(json.dumps(body), encoding="utf-8")
+            invalid = finalize_cloud_result(intent, self.root, provider_path=provider, config_path=CONFIG)
+            candidate, _, rejected = _inspect_cloud_result_candidate(Path(invalid["result_path"]), request["source_audio_sha256"])
+            self.assertIsNone(candidate, defect)
+            self.assertEqual(rejected, "cloud_result_chunks_invalid", defect)
 
     def test_websocket_usage_prefers_final_task_and_sums_one_snapshot_per_chunk(self) -> None:
         _wav(self.audio, frames=16000 * 12)
