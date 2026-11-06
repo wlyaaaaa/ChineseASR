@@ -62,7 +62,7 @@ AI 文件转写通过 [唯一云入口](#重要录音与存疑质量复核云入
 
 `personal-use v0.1` 当前处于维护态，维护验收按下述关闭标准执行。
 
-CI 在干净 Windows 运行器上安装 FFmpeg 和无 GPU 测试依赖，仍使用同一条 `unittest discover` 命令。需要预先下载 Qwen 模型缓存的个别测试在缓存缺失时明确跳过，其余测试继续执行；完整本机环境仍跑全部可用测试。
+推送前在本机运行上述 `unittest discover` 命令。需要预先下载 Qwen 模型缓存的个别测试在缓存缺失时明确跳过，其余测试继续执行；完整本机环境仍跑全部可用测试。
 
 软件测试和公开样例的结果只说明实际验证过的集成、恢复和故障边界，不能代表个人麦克风效果或通用中文准确率。默认模型提升仍需要同口径 holdout 证据。Skill 的调用/维护说明和 PCConfig 的机器恢复契约已同步，项目业务事实仍以本仓库配置与实现为准。
 
@@ -260,7 +260,7 @@ ASR 使用 PCConfig 的 `vendor_key_copy.py` 只读本机副本，自行发送 H
 
 核心依赖文件 `requirements-core.txt` 固定 `funasr==1.4.14`。先完成 CUDA/PyTorch 与核心依赖安装，再按需下载模型。
 
-`pyproject.toml` 有意不声明运行依赖：`pip install .` 只安装项目入口，不会下载 CUDA/PyTorch、模型框架或模型权重。完整本机环境按上面的安装脚本和 `requirements-core.txt` 配置；CI 直接读取项目的核心、听写和 Qwen 依赖文件安装测试环境，不另列软件包清单，不下载模型权重或运行 GPU 推理。
+`pyproject.toml` 有意不声明运行依赖：`pip install .` 只安装项目入口，不会下载 CUDA/PyTorch、模型框架或模型权重。完整本机环境按上面的安装脚本和 `requirements-core.txt` 配置。
 
 下载 quick / secondary 默认需要的 SenseVoice：
 
