@@ -24,6 +24,25 @@ def load_batch():
 
 
 class CloudBatchTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch("zh_asr.file_job._access_open", return_value=True))
+
+    def test_locked_batch_returns_reason_before_reading_or_changing_jobs(self):
+        batch = load_batch()
+        output = io.StringIO()
+        with (patch.object(batch.file_job, "_access_open", return_value=False),
+              patch.object(batch, "candidates") as read_jobs,
+              patch.object(batch.subprocess, "run") as upload,
+              patch.object(batch, "_write_sidecar") as write,
+              redirect_stdout(output)):
+            code = batch.main(["--jobs", "not-read.json"])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(output.getvalue()), {"status": "blocked",
+            "error_code": "personal_access_protection_required", "cloud_upload_performed": False})
+        read_jobs.assert_not_called()
+        upload.assert_not_called()
+        write.assert_not_called()
+
     def test_pending_job_remains_candidate_and_missing_source_is_reported(self):
         batch = load_batch()
         with tempfile.TemporaryDirectory() as tmp:

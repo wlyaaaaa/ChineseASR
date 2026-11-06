@@ -18,6 +18,7 @@ RESULT_SCHEMAS = {"important_evidence": "chineseasr.qwen-audio3-important-result
 sys.path.insert(0, str(ROOT / "src"))
 from zh_asr.cloud_review import (CloudReviewError, auto_cloud_status,
     compare_text, load_cloud_config, local_review_signals, pause_message, cleanup_completed_cloud_work)
+from zh_asr import file_job
 
 
 def _write_sidecar(out_dir: str, payload: dict) -> None:
@@ -235,6 +236,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recover-root", type=Path, action="append",
                         help="search matching filenames here; accept only an exact SHA-256 match")
     args = parser.parse_args(argv)
+    if not file_job._access_open():
+        print(json.dumps({"status": "blocked", "error_code": "personal_access_protection_required",
+                          "cloud_upload_performed": False}))
+        return 2
     try:
         missing_sources: list[dict] = []
         recovery_roots = args.recover_root if args.recover_root is not None else [Path("E:/Music")]

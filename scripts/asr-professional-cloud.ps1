@@ -40,6 +40,7 @@ param(
 
     [string] $RequestRoot = '',
 
+    # Compatibility only: every invocation now checks personal-data access.
     [switch] $PersonalDataGuard,
 
     [string] $ProgressPath = '',
@@ -88,6 +89,10 @@ function Write-BoundedReceipt {
     }
     if ($Message) { $receipt['message'] = $Message }
     if ($BillingWarning) { $receipt['billing_warning'] = $BillingWarning }
+    if ($ErrorCode -ceq 'personal_access_protection_required') {
+        $receipt['cloud_retry_policy'] = 'wait_for_personal_data_access'
+        $receipt['message'] = '个人资料已锁定或状态无法确认，云端未跑'
+    }
     if ($Json) {
         $receipt | ConvertTo-Json -Depth 8 -Compress | Write-Output
     }
@@ -130,12 +135,16 @@ function Get-CloudFailureAdvice {
     param(
         [AllowEmptyString()][string] $Status,
         [AllowEmptyString()][string] $ErrorCode,
-        [AllowEmptyString()][string] $CredentialResult
+        [AllowEmptyString()][string] $CredentialResult,
+        [bool] $OutcomeUnknown = $false
     )
     if ($Status -ceq 'succeeded') {
         return [ordered]@{ cloud_retry_policy = 'not_needed'; local_fallback_recommendation = 'none' }
     }
-    if ($ErrorCode -cne 'previous_outcome_unknown' -and
+    if ($ErrorCode -ceq 'personal_access_protection_required') {
+        return [ordered]@{ cloud_retry_policy = 'wait_for_personal_data_access'; local_fallback_recommendation = 'none' }
+    }
+    if (-not $OutcomeUnknown -and $ErrorCode -cne 'previous_outcome_unknown' -and
         $CredentialResult -cin @('Timeout', 'Rate-Limited', 'Provider-5xx', 'Network-Failure')) {
         return [ordered]@{
             cloud_retry_policy = 'retry_cloud_once_if_still_authorized'
@@ -192,6 +201,15 @@ if ($OverlapSec -ge $ChunkSec) {
 $resolvedRequestRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RequestRoot)
 if ($resolvedRequestRoot -cne $canonicalRequestRoot) {
     Write-BoundedReceipt -Status 'blocked' -ErrorCode 'request_root_not_allowed' -ExitCode 2
+}
+try {
+    $accessRaw = & $python $pipelineScript 'check-access' 2>&1 | Out-String
+    $accessExit = $LASTEXITCODE
+    $access = $accessRaw | ConvertFrom-Json -Depth 8
+    if ($accessExit -ne 0 -or [string]$access.status -cne 'pass') { throw 'access_not_confirmed' }
+}
+catch {
+    Write-BoundedReceipt -Status 'blocked' -ErrorCode 'personal_access_protection_required' -ExitCode 2
 }
 $audioPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Audio)
 if (-not (Test-Path -LiteralPath $audioPath -PathType Leaf)) {
@@ -335,7 +353,8 @@ $result | Add-Member -NotePropertyName secret_returned -NotePropertyValue $false
 $advice = Get-CloudFailureAdvice `
     -Status ([string]$result.status) `
     -ErrorCode ([string]$result.error_code) `
-    -CredentialResult ([string]$result.credential_result)
+    -CredentialResult ([string]$result.credential_result) `
+    -OutcomeUnknown ($result.PSObject.Properties.Name -contains 'outcome_unknown' -and $result.outcome_unknown -eq $true)
 $result | Add-Member `
     -NotePropertyName cloud_retry_policy `
     -NotePropertyValue $advice.cloud_retry_policy `

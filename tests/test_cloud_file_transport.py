@@ -129,16 +129,34 @@ if i=='1': (root/'locked.marker').touch()
         source = source.replace("$python = Join-Path $PSScriptRoot '..\\.venv\\Scripts\\python.exe'",
                                 "$python = '" + sys.executable.replace("'", "''") + "'")
         source = source.replace("Global\\ChineseASRCloudUploadOnce", "Global\\ASRCloudFixture" + uuid.uuid4().hex)
+        hash_marker = self.base / "source-hash-read.marker"
+        source = source.replace("$audioContentHash =", "[IO.File]::WriteAllText('" +
+            str(hash_marker).replace("'", "''") + "', '')\n$audioContentHash =")
         script = scripts / "asr-professional-cloud.ps1"
         script.write_text(source, encoding="utf-8")
         command = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script), "-Audio", str(self.audio),
-                   "-CloudFirst", "-PersonalDataGuard", "-ChunkSec", "1", "-OverlapSec", "0", "-Json"]
+                   "-CloudFirst", "-ChunkSec", "1", "-OverlapSec", "0", "-Json"]
+        # A caller that never learned the old guard flag must stop before preparation.
+        (self.base / "locked.marker").touch()
+        locked = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=60,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        receipt = json.loads(locked.stdout)
+        self.assertEqual((receipt["status"], receipt["error_code"], receipt["cloud_upload_performed"]),
+                         ("blocked", "personal_access_protection_required", False))
+        self.assertEqual(receipt["cloud_retry_policy"], "wait_for_personal_data_access")
+        self.assertFalse((self.base / "sent.log").exists())
+        self.assertFalse(hash_marker.exists(), "locked entry read source audio before checking access")
+        self.assertTrue(self.audio.is_file())
+        (self.base / "locked.marker").unlink()
         first = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=60,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(first.returncode, 3, first.stdout + first.stderr)
+        self.assertTrue(hash_marker.exists())
         receipt = json.loads(first.stdout)
         self.assertEqual((receipt["status"], receipt["error_code"], len(receipt["chunks"])),
                          ("blocked", "personal_access_protection_required", 1))
+        self.assertEqual((receipt["cloud_retry_policy"], receipt["local_fallback_recommendation"]),
+                         ("wait_for_personal_data_access", "none"))
         (self.base / "locked.marker").unlink()
         resumed = subprocess.run(command + ["-ResumeJobId", receipt["job_id"]], capture_output=True,
                                  text=True, encoding="utf-8", timeout=60,

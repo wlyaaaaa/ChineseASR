@@ -98,9 +98,11 @@ def _schedule_worker(state: dict, audio: Path, root: Path) -> dict:
 
 def _access_open() -> bool:
     try:
-        return _json_process([sys.executable, "-B", str(ACCESS_CHECK),
-                              "--privacy-level", "factor"], project_root(), 40).get("status") == "pass"
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+        checked = _json_process([sys.executable, "-B", str(ACCESS_CHECK),
+                                 "--privacy-level", "factor"], project_root(), 40)
+        return isinstance(checked, dict) and checked.get("status") == "pass"
+    except Exception:
+        # An unavailable decision is closed, including an unexpected checker failure.
         return False
 
 

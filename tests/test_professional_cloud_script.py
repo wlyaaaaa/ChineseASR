@@ -54,7 +54,8 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
             self.assertEqual(metadata.returncode, 0, metadata.stderr)
             self.assertEqual(int(metadata.stdout.strip()), 24 * 3600)
             (scripts / "cloud-review-pipeline.py").write_text(
-                'print(\'{"status":"blocked","error_code":"fixture_prepare_reached"}\')', encoding="utf-8")
+                'import sys; print(\'{"status":"pass"}\' if sys.argv[1]=="check-access" else '
+                '\'{"status":"blocked","error_code":"fixture_prepare_reached"}\')', encoding="utf-8")
             handle = kernel.CreateMutexW(None, True, prefix + "-" + hashlib.sha256(audio.read_bytes()).hexdigest().upper())
             self.assertTrue(handle)
             held, process = True, None
@@ -96,8 +97,12 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
     def test_resume_archives_previous_provider_and_result_before_transmitting(self) -> None:
         self._assert_cloud_receipt(relative_paths=False, first_failure=True)
 
+    def test_unknown_candidate_result_never_recommends_cloud_retry(self) -> None:
+        self._assert_cloud_receipt(relative_paths=False, uncertain_failure=True)
+
     def _assert_cloud_receipt(self, *, relative_paths: bool, personal_data_guard: bool = False,
-                              transport_failure: bool = False, first_failure: bool = False) -> None:
+                              transport_failure: bool = False, first_failure: bool = False,
+                              uncertain_failure: bool = False) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scripts = root / "scripts"
@@ -113,6 +118,9 @@ class ProfessionalCloudScriptTests(unittest.TestCase):
 from pathlib import Path
 import sys
 
+if sys.argv[1] == 'check-access':
+    print(json.dumps({'status': 'pass'}))
+    sys.exit(0)
 args = sys.argv[2:]
 def value(flag):
     return args[args.index(flag) + 1]
@@ -141,6 +149,8 @@ elif action == 'transmit':
     code = ''
     if (root / 'network.marker').exists():
         code = 'previous_outcome_unknown' if provider.exists() else 'network_failure'
+    if (root / 'unknown.marker').exists():
+        code = 'cloud_key_refresh_cloud_transport_failed'
     provider.write_text(json.dumps({'status': 'failed' if code else 'succeeded',
                                     'error_code': code}), encoding='utf-8')
     print(json.dumps({'schema': 'zh_asr.chunk-transmission.v1', 'status': 'failed' if code else 'succeeded',
@@ -153,7 +163,8 @@ elif action == 'finalize':
     result = {'schema': 'chineseasr.qwen-audio3-quality-review-result.v1',
               'job_id': job_id, 'purpose': 'quality_review', 'important_only': False,
               'status': 'failed' if code else 'succeeded', 'error_code': code,
-              'credential_result': 'Network-Failure' if code == 'network_failure' else 'Success',
+              'credential_result': 'Network-Failure' if code in ('network_failure', 'cloud_key_refresh_cloud_transport_failed') else 'Success',
+              'outcome_unknown': code == 'cloud_key_refresh_cloud_transport_failed',
               'cloud_upload_performed': code != 'personal_data_locked', 'text': 'fixture transcript'}
     (root / (job_id + '.result.json')).write_text(json.dumps(result), encoding='utf-8')
     print(json.dumps({'status': 'succeeded'}))
@@ -183,12 +194,15 @@ else:
             if first_failure or transport_failure:
                 request_root.mkdir(parents=True)
                 (request_root / ("network.marker" if first_failure else "transport-failure.marker")).touch()
+            if uncertain_failure:
+                request_root.mkdir(parents=True)
+                (request_root / 'unknown.marker').touch()
 
             def run(extra: list[str] | None = None) -> dict:
                 result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", *invocation, *(extra or [])],
                     cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                self.assertEqual(3 if first_failure or transport_failure else 0,
+                self.assertEqual(3 if first_failure or transport_failure or uncertain_failure else 0,
                                  result.returncode, result.stdout + result.stderr)
                 decoder = json.JSONDecoder()
                 receipt, end = decoder.raw_decode(result.stdout.strip())
@@ -198,7 +212,7 @@ else:
                 return receipt
 
             receipt = run()
-            self.assertEqual("failed" if first_failure or transport_failure else "succeeded", receipt["status"])
+            self.assertEqual("failed" if first_failure or transport_failure or uncertain_failure else "succeeded", receipt["status"])
             result_path = Path(receipt["result_path"])
             self.assertTrue(result_path.is_file())
             self.assertEqual(request_root, result_path.parent)
@@ -219,7 +233,10 @@ else:
             self.assertTrue(request_path.with_name(receipt["job_id"] + ".unclaimed.json").is_file())
             self.assertFalse((request_root / "credential-health.json").exists())
             self.assertFalse(list(request_root.glob("*.broker.json")))
-            if transport_failure:
+            if uncertain_failure:
+                self.assertTrue(receipt['outcome_unknown'])
+                self.assertEqual(receipt['cloud_retry_policy'], 'do_not_retry_cloud')
+            elif transport_failure:
                 self.assertEqual("personal_data_locked", receipt["error_code"])
                 final_args = calls[-1]["args"]
                 self.assertEqual("personal_data_locked", final_args[final_args.index("--broker-error") + 1])
@@ -279,6 +296,7 @@ else:
             scripts.mkdir()
             relocated = scripts / SCRIPT.name
             relocated.write_bytes(SCRIPT.read_bytes())
+            (scripts / "cloud-review-pipeline.py").write_text('print(\'{"status":"pass"}\')', encoding="utf-8")
             result = subprocess.run(
                 ["pwsh", "-NoProfile", "-File", str(relocated),
                  "-Audio", str(root / "missing.wav"), "-Important",
