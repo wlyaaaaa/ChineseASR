@@ -803,7 +803,8 @@ class ServiceTests(unittest.TestCase):
                 root=root,
             )
 
-            audio.write_bytes(b"RIFX")
+            audio.write_bytes(audio.read_bytes()[:-1] + b"\x01")
+            self.assertEqual(original_stat.st_size, audio.stat().st_size)
             os.utime(audio, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
             second_request = JobRequest.from_payload(
                 {"audio": str(audio), "mode": "long-strict"},
@@ -1238,7 +1239,12 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(short.fingerprint(), extended.fingerprint())
 
     def test_http_api_serves_health_submit_status_and_cancel(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("zh_asr.audio_quality.subprocess.run", side_effect=AssertionError(
+                "synthetic PCM requests must not launch an external duration probe"
+            )) as external_probe,
+        ):
             root = Path(temp_dir)
             audio = _write_audio(root / "sample.wav")
             service = TranscriptionService(root=root, gpu_process_detector=lambda: [], autostart=False)
@@ -1263,6 +1269,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(submitted["job"]["job_id"], status["job"]["job_id"])
             self.assertEqual("canceled", canceled["job"]["status"])
             self.assertEqual("unavailable", canceled["job"]["evidence_status"])
+            external_probe.assert_not_called()
 
     def test_http_api_uses_service_default_output_root_when_payload_omits_out_root(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1290,7 +1297,11 @@ class ServiceTests(unittest.TestCase):
 
 
 def _write_audio(path: Path) -> Path:
-    path.write_bytes(b"RIFF")
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\0\0" * 160)
     return path
 
 

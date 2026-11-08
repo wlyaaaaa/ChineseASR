@@ -129,7 +129,22 @@ class CloudPipelineTests(unittest.TestCase):
             prepare_cloud_request(self.intent(local_out_dir=None), self.root, CONFIG)
 
     def test_cloud_first_script_accepts_no_local_result_and_rejects_quality_purpose(self) -> None:
-        script = ROOT / "scripts" / "asr-professional-cloud.ps1"
+        scripts = self.base / "scripts"
+        scripts.mkdir()
+        script = scripts / "asr-professional-cloud.ps1"
+        source = (ROOT / "scripts" / script.name).read_text(encoding="utf-8")
+        python_assignment = "$python = Join-Path $PSScriptRoot '..\\.venv\\Scripts\\python.exe'"
+        self.assertIn(python_assignment, source)
+        script.write_text(source.replace(python_assignment,
+            "$python = '" + sys.executable.replace("'", "''") + "'"), encoding="utf-8")
+        access_calls = scripts / "access.calls.jsonl"
+        # Keep real PowerShell validation; no real privacy or credential provider is loaded.
+        (scripts / "cloud-review-pipeline.py").write_text(
+            "import json, sys\nfrom pathlib import Path\n"
+            "assert sys.argv[1:] == ['check-access'], sys.argv[1:]\n"
+            "with Path(__file__).with_name('access.calls.jsonl').open('a', encoding='utf-8') as log:\n"
+            "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "print('{\"status\":\"pass\"}')\n", encoding="utf-8")
         for flags, expected in ((["-CloudFirst"], "audio_file_missing"),
                 (["-CloudFirst", "-Important"], "audio_file_missing"),
                 (["-CloudFirst", "-QualityReview"], "cloud_use_purpose_ambiguous")):
@@ -139,6 +154,9 @@ class CloudPipelineTests(unittest.TestCase):
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             self.assertEqual(2, result.returncode, result.stdout + result.stderr)
             self.assertEqual(expected, json.loads(result.stdout)["error_code"])
+        self.assertEqual([["check-access"], ["check-access"]],
+                         [json.loads(line) for line in access_calls.read_text("utf-8").splitlines()])
+        self.assertEqual([], list(self.root.iterdir()))
 
     def test_automatic_expiry_skips_and_writes_plain_reason(self) -> None:
         intent = self.intent()
