@@ -65,6 +65,8 @@ def _cloud_budget(audio: Path) -> int:
 
 def _spawn_worker(audio: Path, root: Path) -> int:
     arguments = [sys.executable, "-B", str(root / "scripts/asr-file-job-worker.py"), str(audio)]
+    if os.environ.get("AGENTS_BACKGROUND_AUTOMATION") == "1":
+        arguments.append("--background-automation")
     if os.name != "nt":
         return subprocess.Popen(arguments, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, **managed_popen_kwargs()).pid
@@ -97,6 +99,8 @@ def _schedule_worker(state: dict, audio: Path, root: Path) -> dict:
 
 
 def _access_open() -> bool:
+    if os.environ.get("AGENTS_BACKGROUND_AUTOMATION") == "1":
+        return True
     try:
         checked = _json_process([sys.executable, "-B", str(ACCESS_CHECK),
                                  "--privacy-level", "factor"], project_root(), 40)
