@@ -10,6 +10,9 @@ import sys
 import time
 import urllib.request
 
+sys.path.append(r"E:\.agents\tools")
+from automation_context import is_background_automation
+
 from .config import project_root
 from .model_lifecycle import write_json_atomic
 from .process_control import managed_popen_kwargs, terminate_process_tree
@@ -65,7 +68,7 @@ def _cloud_budget(audio: Path) -> int:
 
 def _spawn_worker(audio: Path, root: Path) -> int:
     arguments = [sys.executable, "-B", str(root / "scripts/asr-file-job-worker.py"), str(audio)]
-    if os.environ.get("AGENTS_BACKGROUND_AUTOMATION") == "1":
+    if is_background_automation():
         arguments.append("--background-automation")
     if os.name != "nt":
         return subprocess.Popen(arguments, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -99,7 +102,7 @@ def _schedule_worker(state: dict, audio: Path, root: Path) -> dict:
 
 
 def _access_open() -> bool:
-    if os.environ.get("AGENTS_BACKGROUND_AUTOMATION") == "1":
+    if is_background_automation():
         return True
     try:
         checked = _json_process([sys.executable, "-B", str(ACCESS_CHECK),
