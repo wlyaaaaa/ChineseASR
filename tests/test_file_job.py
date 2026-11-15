@@ -349,15 +349,17 @@ class FileJobTests(unittest.TestCase):
 
     @unittest.skipUnless(jobs.os.name == "nt", "Windows detached startup")
     def test_detached_worker_uses_fixed_script_via_wmi_and_only_audio_argument(self):
-        with mock.patch.object(jobs.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b'{"pid":4321}')) as run:
-            self.assertEqual(REAL_SPAWN(self.audio, self.root), 4321)
-        payload = json.loads(run.call_args.kwargs["input"])
-        self.assertEqual(payload["cwd"], str(self.root))
-        self.assertIn("asr-file-job-worker.py", payload["command"])
-        self.assertIn(str(self.audio), payload["command"])
-        self.assertIn("Win32_Process", run.call_args.args[0][-1])
-        self.assertNotIn("ProcessStartupInformation", run.call_args.args[0][-1])
-        self.assertIn("pythonw.exe", payload["command"])
+        for background in ("", "1"):
+            with mock.patch.dict(jobs.os.environ, {"AGENTS_BACKGROUND_AUTOMATION": background}), mock.patch.object(jobs.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b'{"pid":4321}')) as run:
+                self.assertEqual(REAL_SPAWN(self.audio, self.root), 4321)
+            payload = json.loads(run.call_args.kwargs["input"])
+            self.assertEqual(payload["cwd"], str(self.root))
+            self.assertIn("asr-file-job-worker.py", payload["command"])
+            self.assertIn(str(self.audio), payload["command"])
+            self.assertIn("Win32_Process", run.call_args.args[0][-1])
+            self.assertNotIn("ProcessStartupInformation", run.call_args.args[0][-1])
+            self.assertIn("pythonw.exe", payload["command"])
+            self.assertEqual("--background-automation" in payload["command"], background == "1")
 
     def test_cloud_idle_supervisor_terminates_only_its_owned_process_tree(self):
         fake = mock.Mock()

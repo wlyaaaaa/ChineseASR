@@ -112,7 +112,7 @@ strict 模式即使一路模型失败，也会保留可用输出并生成审计�
 .\.venv\Scripts\python.exe -B -m zh_asr file-job --audio 'E:\selected.wav'
 ```
 
-首次调用隐藏启动一个一次性文件 worker，立即返回 JSON；随后用同一命令查询。状态为 `queued`、`running`、`waiting_gpu`、`succeeded` 或 `failed`，同时返回 `route=cloud|local`、`reason`、`error`、`timestamps=available|unavailable`，已有任务还带 `job_id`、`out_dir` 和结果路径。入口与 worker 都先检查个人资料期，锁住时返回 `queued/reason=personal_access_required`，下次调用再补，不自动解锁。
+首次调用隐藏启动一个一次性文件 worker，立即返回 JSON；随后用同一命令查询。状态为 `queued`、`running`、`waiting_gpu`、`succeeded` 或 `failed`，同时返回 `route=cloud|local`、`reason`、`error`、`timestamps=available|unavailable`，已有任务还带 `job_id`、`out_dir` 和结果路径。按时间或事件自行启动的后台任务携带 `AGENTS_BACKGROUND_AUTOMATION=1`，入口与 worker 不查资料锁，锁定、到期或未知都照常运行；Windows 脱离式 worker 只接收本次来源标记，不修改系统或共享进程环境。对话及对话派出的任务仍先检查个人资料期，锁住时返回 `queued/reason=personal_access_required`，下次调用再补，不自动解锁。
 
 Windows 的一次性 worker 由固定脚本经 WMI 隐藏启动，脱离提交方计划任务的进程组；不会新建计划任务或常驻调度器。本地 API 消失时先查已完成稿件，再由下一次查询安排原入口恢复，返回 `queued/reason=local_api_recovering`，不会永久等待旧作业编号。旧本地作业超过一小时会取消并标记可重试失败，不挡住其他录音。
 
@@ -120,7 +120,7 @@ Windows 的一次性 worker 由固定脚本经 WMI 隐藏启动，脱离提交�
 
 直接调用云脚本时，同原音并发仍最多等 24 小时；统一 `file-job` 显式传 `-ConcurrentWaitSec 5`，后台只短等同一云请求。需要调整直接脚本的等待时可显式指定此参数。
 
-文件入口由 ASR 读取本机加密 Key 副本并直接发送；每块前重查资料期，锁定后暂停，解锁复用同一云作业和已知成功分块，只发未发送的块。每次网络请求最长 180 秒，超过五分钟没有块进度会终止本次自有进程树并留下失败原因；整段另有按原音时长计算的上限。未知请求不重传，云端明确拒绝旧 Key 时的候选更新见下文。
+文件入口由 ASR 读取本机加密 Key 副本并直接发送；后台来源沿同一标记继续发送；对话来源每块前重查资料期，锁定后暂停，解锁复用同一云作业和已知成功分块，只发未发送的块。每次网络请求最长 180 秒，超过五分钟没有块进度会终止本次自有进程树并留下失败原因；整段另有按原音时长计算的上限。未知请求不重传，云端明确拒绝旧 Key 时的候选更新见下文。
 
 云产物仍在 `outputs/cloud-jobs`，本地产物仍由现有 API 作业管理；单文件进度在 `outputs/api/file-jobs/<原音SHA256>.json`。`transcript-readback` 也会按 SHA 直接读取这一份已完成产物引用并复用原解析与哈希校验，API 裁剪到最近 200 个终态后仍可回读。成功须通过现有 `transcript-readback` 校验；只有全文、缺句级时间时仍成功并返回 `timestamps=unavailable`，云分块范围不冒充句级时间，不为补时间再次识别全文。云成功但产物暂时不可回读时保留失败原因，后续只重读产物。云已发送、结果未知或身份被拒绝时不会自动重传、换身份或改凭据绑定；本地失败后的再次调用可重试本地，成功稿件不重复转写。
 
@@ -225,7 +225,7 @@ AI 处理当前选定的录音时直接使用下面的入口，不需要已有�
 
 `-Important` 和 `-QualityReview` 不能同时使用。云入口不会自动启动 FireRed、Qwen 或其它本地双引擎；是否补本地证据链及如何回核分歧，按 [项目规则](AGENTS.md) 和当次证据用途决定。
 
-ASR 使用 PCConfig 的 `vendor_key_copy.py` 只读本机副本，自行发送 HTTP 或 WebSocket 请求；正常发送不经密码中心取 Key 或转发。资料期查询仍只读既有保护入口。
+ASR 使用 PCConfig 的 `vendor_key_copy.py` 只读本机副本，自行发送 HTTP 或 WebSocket 请求；正常发送不经密码中心取 Key 或转发。对话来源的资料期查询仍只读既有保护入口；上述自行启动的后台任务不查资料锁。
 
 每次尝试都在被 Git 忽略的 `outputs\cloud-jobs` 留请求、供应商原始结果、投影结果、原音哈希、模型、时间及每段 usage；这些是作业记录，本地不预留或计算剩余额度。百炼官方的 3.1 计量是 Token，但本地不以此拦截调用。
 
@@ -663,7 +663,7 @@ ASR 的正常请求只调用 `load_key('qwen')` 读取副本，HTTP 使用 Beare
 或 `cloud_key_sync_*` 原因；每次只同步一次。网络结果未知、超时、限流或其他错误不触发刷新。
 候选转写已成功但保存副本失败时保留成功稿件，`key_copy_sync` 记录保存结果，不重传。
 手动同步与 stdin 导入由 PCConfig 的共享工具负责，未验证候选不替换副本。
-资料期仍经既有 `CheckPersonalDataAccess` 只读查询；这项查询保留，不代表云请求仍经密码中心发送。
+对话来源的资料期仍经既有 `CheckPersonalDataAccess` 只读查询，自行启动的后台任务按上述来源标记免查资料锁；这项查询保留，不代表云请求仍经密码中心发送。
 
 一次调用保留 `<job_id>.intent.json`、`<job_id>.unclaimed.json`、`.provider.json` 和检查点。
 再次运行同样的云入口命令时，会按音频 SHA-256、用途、声道、模型及请求参数接续未完成作业，
