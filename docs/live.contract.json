@@ -104,7 +104,7 @@
       "mode": "static",
       "unit": "段",
       "public": "same",
-      "stale_after": 172800
+      "stale_after": 172800, "note": "两条路线有重叠，同一原音可能都转过，不能直接相加；重叠数见更多数据。"
     },
     {
       "id": "cloud_complete",
@@ -115,7 +115,7 @@
       "mode": "static",
       "unit": "段",
       "public": "same",
-      "stale_after": 172800
+      "stale_after": 172800, "note": "两条路线有重叠，同一原音可能都转过，不能直接相加；重叠数见更多数据。"
     },
     {
       "id": "cloud_latest",
@@ -229,7 +229,7 @@
       "mode": "live",
       "unit": "份",
       "public": "same",
-      "stale_after": 3600
+      "stale_after": 172800, "note": "原每晚自检及云稿完成出口刷新；超过两天未更新才标旧。"
     },
     {
       "id": "cloud_hours",
@@ -240,7 +240,7 @@
       "mode": "live",
       "unit": "小时",
       "public": "same",
-      "stale_after": 3600
+      "stale_after": 172800, "note": "原每晚自检及云稿完成出口刷新；超过两天未更新才标旧。"
     },
     {
       "id": "dictation_history",
@@ -266,7 +266,7 @@
       "mode": "live",
       "unit": "份",
       "public": "same",
-      "stale_after": 3600
+      "stale_after": 172800, "note": "原每晚自检及云稿完成出口刷新；超过两天未更新才标旧。"
     },
     {
       "id": "overlap",
