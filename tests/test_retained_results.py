@@ -44,4 +44,6 @@ class RetainedResultsTests(unittest.TestCase):
                 first = write_snapshot(root, root, output, owner, sources)
                 self.assertNotIn(b"\r\n", output.read_bytes())
                 self.assertNotIn(b"\r\n", owner.read_bytes())
-                self.assertEqual(first, write_snapshot(root, root, output, owner, sources))
+                second = write_snapshot(root, root, output, owner, sources)
+                self.assertNotEqual(first.pop("checked_at"), second.pop("checked_at"))
+                self.assertEqual(first, second)

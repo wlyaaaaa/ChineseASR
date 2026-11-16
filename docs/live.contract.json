@@ -225,22 +225,22 @@
       "label": "云端留存成功稿",
       "source": "asr.snapshot",
       "pointer": "/metrics/cloud_results",
-      "time": "/times/cloud_results",
+      "time": "/checked_at",
       "mode": "live",
       "unit": "份",
       "public": "same",
-      "stale_after": 172800, "note": "原每晚自检及云稿完成出口刷新；超过两天未更新才标旧。"
+      "stale_after": 172800, "note": "沿原每晚自检及云稿完成出口成功核对；按核对时刻判断，超过两天才标旧。"
     },
     {
       "id": "cloud_hours",
       "label": "云稿覆盖的录音时长",
       "source": "asr.snapshot",
       "pointer": "/metrics/cloud_hours",
-      "time": "/times/cloud_hours",
+      "time": "/checked_at",
       "mode": "live",
       "unit": "小时",
       "public": "same",
-      "stale_after": 172800, "note": "原每晚自检及云稿完成出口刷新；超过两天未更新才标旧。"
+      "stale_after": 172800, "note": "沿原每晚自检及云稿完成出口成功核对；按核对时刻判断，超过两天才标旧。"
     },
     {
       "id": "dictation_history",
@@ -262,11 +262,11 @@
       "label": "没记完成时刻的旧云稿",
       "source": "asr.snapshot",
       "pointer": "/metrics/cloud_undated",
-      "time": "/times/cloud_undated",
+      "time": "/checked_at",
       "mode": "live",
       "unit": "份",
       "public": "same",
-      "stale_after": 172800, "note": "原每晚自检及云稿完成出口刷新；超过两天未更新才标旧。"
+      "stale_after": 172800, "note": "沿原每晚自检及云稿完成出口成功核对；按核对时刻判断，超过两天才标旧。"
     },
     {
       "id": "overlap",
