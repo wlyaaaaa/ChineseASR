@@ -1,0 +1,354 @@
+{
+  "v": 1,
+  "id": "chineseasr",
+  "name": "中文速记员",
+  "about": "把录音转成文字，也管电脑上按 Win+H 说话打字。",
+  "headline": "complete_audio",
+  "tasks": [
+    "task-15271e7647f872143321e8ee"
+  ],
+  "skills": [
+    "chinese-asr"
+  ],
+  "bindings_complete": true,
+  "sections": [
+    {
+      "id": "inventory",
+      "label": "转好了多少",
+      "about": "到底替我转好了多少，本地和云端各干了多少？",
+      "metrics": [
+        "complete_audio",
+        "local_complete",
+        "cloud_complete"
+      ],
+      "note": "两边都转过的原音只算一次，重叠段数在更多数据里；是现在还留着的稿，没人逐字核过。当前按需更新，标明取数日。"
+    },
+    {
+      "id": "activity",
+      "label": "最近还在干活吗",
+      "about": "最近一次云端和本地转写是哪天？",
+      "metrics": [
+        "cloud_latest",
+        "local_latest"
+      ],
+      "note": "日期是转写那天，不是录音那天；本地日期取完整结果回执的落盘时间。"
+    },
+    {
+      "id": "models",
+      "label": "为它装了什么",
+      "about": "装了多少组件，占多少硬盘？",
+      "metrics": [
+        "models_bytes",
+        "model_components"
+      ],
+      "note": "包括识别、断句、分说话人、对时间等，不是同样数量的可替换听写引擎；容量以 2^30 字节为 1 GB 显示。"
+    },
+    {
+      "id": "receipt-states",
+      "label": "留存回执的三组结果",
+      "about": "执行完、覆盖完整和质量有把握分别有多少份？",
+      "metrics": [
+        "receipt_states"
+      ],
+      "note": "分母是排除明确样例后的本地留存回执数，不是去重后的录音数，也不是准确率；三组各用同一分母，不能相加。时刻是该次分类扫描时刻。"
+    },
+    {
+      "id": "recent",
+      "label": "最近转好的稿",
+      "about": "有日期的最近二十段完整正文，是什么时候、走哪条路线转好的？",
+      "metrics": [
+        "recent"
+      ],
+      "note": "同原音只取有日期的最新完整结果；更新的失败或不完整尝试不会遮住旧完整稿。没记完成时刻的旧云稿纳入库存，不参与日期排序，份数见更多数据。公开只给匿名编号、转写日期、路线和时长。"
+    },
+    {
+      "id": "more-data",
+      "label": "更多数据",
+      "about": "好奇：还留了多少记录、云稿覆盖多久、历史模型耗时和组件明细？",
+      "metrics": [
+        "local_audio",
+        "local_receipts",
+        "local_complete_receipts",
+        "cloud_results",
+        "cloud_hours",
+        "dictation_history",
+        "overlap",
+        "cloud_undated",
+        "cloud_unnamed",
+        "local_missing_duration",
+        "local_missing_duration_audio",
+        "file_job_success",
+        "api_retained_jobs"
+      ],
+      "note": "段数、回执份数和成功稿份数分别统计，不能相加。云端时长按每段原音最大区间并集计算，排除重叠和缺口；只覆盖云稿，不是全部转写时长。历史听写计时只含模型调用到返回，不含停顿检测和实际输入。 统一入口成功索引和本地接口作业只是留存窗口，不是全部成果；缺时长的记录仍计入已转好，不据此补全项目总时长。 成功索引只数原音哈希索引，不含同一作业的进度镜像。"
+    }
+  ],
+  "metrics": [
+    {
+      "id": "complete_audio",
+      "label": "已转好的录音",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/complete_audio",
+      "time": "/times/inventory",
+      "mode": "static",
+      "unit": "段",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "local_complete",
+      "label": "其中本地转好",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/local_complete",
+      "time": "/times/inventory",
+      "mode": "static",
+      "unit": "段",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "cloud_complete",
+      "label": "其中云端转好",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/cloud_complete",
+      "time": "/times/inventory",
+      "mode": "static",
+      "unit": "段",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "cloud_latest",
+      "label": "最近一次云端转写",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/cloud_latest",
+      "time": "/times/cloud_latest",
+      "mode": "live",
+      "unit": "",
+      "public": "same",
+      "stale_after": 86400
+    },
+    {
+      "id": "local_latest",
+      "label": "最近一次本地转写",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/local_latest",
+      "time": "/times/inventory",
+      "mode": "static",
+      "unit": "",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "models_bytes",
+      "label": "本机语音模型占地",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/models_bytes",
+      "time": "/times/models_bytes",
+      "mode": "static",
+      "unit": "bytes",
+      "public": "same"
+    },
+    {
+      "id": "model_components",
+      "label": "本机语音模型",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/model_components",
+      "time": "/times/model_list",
+      "mode": "live",
+      "unit": "套",
+      "public": "same",
+      "stale_after": 604800,
+      "records": "/metrics/model_list",
+      "shape": "list"
+    },
+    {
+      "id": "receipt_states",
+      "label": "执行、覆盖、质量分类",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/receipt_states",
+      "time": "/times/inventory",
+      "mode": "static",
+      "unit": "份回执",
+      "public": "same",
+      "records": "/receipt_records",
+      "shape": "table",
+      "stale_after": 172800
+    },
+    {
+      "id": "recent",
+      "label": "有日期的最近二十段完整稿",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/recent",
+      "time": "/times/recent",
+      "mode": "static",
+      "unit": "份",
+      "public": "same",
+      "shape": "table",
+      "stale_after": 172800
+    },
+    {
+      "id": "local_audio",
+      "label": "本地留过回执的不同原音",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/local_audio",
+      "time": "/times/inventory",
+      "mode": "static",
+      "unit": "段",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "local_receipts",
+      "label": "本地留存回执",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/local_receipts",
+      "time": "/times/inventory",
+      "mode": "static",
+      "unit": "份",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "local_complete_receipts",
+      "label": "本地完整转写记录",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/local_complete_receipts",
+      "time": "/times/inventory",
+      "mode": "static",
+      "unit": "份",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "cloud_results",
+      "label": "云端留存成功稿",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/cloud_results",
+      "time": "/times/cloud_results",
+      "mode": "live",
+      "unit": "份",
+      "public": "same",
+      "stale_after": 3600
+    },
+    {
+      "id": "cloud_hours",
+      "label": "云稿覆盖的录音时长",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/cloud_hours",
+      "time": "/times/cloud_hours",
+      "mode": "live",
+      "unit": "小时",
+      "public": "same",
+      "stale_after": 3600
+    },
+    {
+      "id": "dictation_history",
+      "label": "历史听写模型返回用时",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/dictation_history",
+      "time": "/metrics/dictation_history/through",
+      "mode": "live",
+      "unit": "",
+      "public": "rewrite",
+      "stale_after": 604800,
+      "scope": "/scope",
+      "public_pointer": "/metrics/dictation_history/text",
+      "public_time": "/metrics/dictation_history/through",
+      "public_scope": "/scope"
+    },
+    {
+      "id": "cloud_undated",
+      "label": "没记完成时刻的旧云稿",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/cloud_undated",
+      "time": "/times/cloud_undated",
+      "mode": "live",
+      "unit": "份",
+      "public": "same",
+      "stale_after": 3600
+    },
+    {
+      "id": "overlap",
+      "label": "本地和云端都转好的原音",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/overlap",
+      "time": "/times/inventory",
+      "mode": "static",
+      "unit": "段",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "cloud_unnamed",
+      "label": "没记原录音文件名的云稿",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/cloud_unnamed",
+      "time": "/times/cloud_unnamed",
+      "mode": "static",
+      "unit": "份",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "local_missing_duration",
+      "label": "没记时长的本地完整记录",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/local_missing_duration",
+      "time": "/times/local_missing_duration",
+      "mode": "static",
+      "unit": "份",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "local_missing_duration_audio",
+      "label": "本地完整记录缺时长涉及的原音",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/local_missing_duration_audio",
+      "time": "/times/local_missing_duration_audio",
+      "mode": "static",
+      "unit": "段",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "file_job_success",
+      "label": "统一入口留存的成功索引",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/file_job_success",
+      "time": "/times/file_job_success",
+      "mode": "static",
+      "unit": "份",
+      "public": "same",
+      "stale_after": 172800
+    },
+    {
+      "id": "api_retained_jobs",
+      "label": "本地接口留存作业窗口",
+      "source": "asr.snapshot",
+      "pointer": "/metrics/api_retained_jobs",
+      "time": "/times/api_retained_jobs",
+      "mode": "static",
+      "unit": "个",
+      "public": "same",
+      "stale_after": 172800
+    }
+  ],
+  "artifacts": {
+    "source": "asr.snapshot",
+    "pointer": "/artifacts"
+  },
+  "size": {
+    "source": "asr.snapshot",
+    "pointer": "/size"
+  },
+  "links": [
+    {
+      "id": "intro",
+      "label": "项目介绍",
+      "href": "https://github.com/wlyaaaaa/ChineseASR#readme"
+    }
+  ],
+  "skills_href": "/skills/?project=chineseasr"
+}

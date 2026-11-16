@@ -56,6 +56,10 @@ _GPU_LEASE_AUTHENTICATED = contextvars.ContextVar(
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0] == "live-snapshot":
+        from .live_snapshot import main as live_snapshot
+        return live_snapshot(arguments[1:])
     try:
         model_config = load_model_config()
     except Exception as exc:
@@ -69,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("doctor", help="Check local runtime state without loading ASR models.")
+    subparsers.add_parser("live-snapshot", help="Summarize retained metadata without running ASR; use live-snapshot --help.")
 
     file_job_cmd = subparsers.add_parser("file-job", help="Submit or poll one recording using the configured cloud/local route.")
     file_job_cmd.add_argument("--audio", type=Path, required=True)

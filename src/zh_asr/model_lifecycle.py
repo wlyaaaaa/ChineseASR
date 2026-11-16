@@ -30,10 +30,10 @@ def project_path(config: ModelConfig, value: str) -> Path:
     return path.resolve() if path.is_absolute() else (root / path).resolve()
 
 
-def write_json_atomic(path: Path, value: Any) -> None:
+def write_json_atomic(path: Path, value: Any, *, newline: str | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".partial")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline=newline)
     temporary.replace(path)
 
 

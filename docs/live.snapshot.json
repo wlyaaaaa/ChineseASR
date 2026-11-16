@@ -1,0 +1,333 @@
+{
+  "v": 1,
+  "at": "2026-11-16T02:37:09.405539+00:00",
+  "scope": "排除明确样例的现存结果；不是全部历史或人工准确认证",
+  "metrics": {
+    "complete_audio": 810,
+    "local_complete": 705,
+    "cloud_complete": 143,
+    "overlap": 38,
+    "local_audio": 961,
+    "local_receipts": 1035,
+    "local_complete_receipts": 761,
+    "cloud_results": 179,
+    "cloud_hours": 5.2704,
+    "cloud_latest": "2026-11-16T01:53:57.019993+00:00",
+    "cloud_undated": 104,
+    "cloud_unnamed": 29,
+    "local_missing_duration": 77,
+    "local_missing_duration_audio": 75,
+    "local_latest": "2026-11-05T14:57:49.800637+00:00",
+    "file_job_success": 24,
+    "api_retained_jobs": 200,
+    "receipt_states": {
+      "text": "1035 份回执；分三组统计，不是准确率",
+      "denominator": 1035,
+      "execution": {
+        "completed": 863,
+        "unsupported": 137,
+        "failed": 35
+      },
+      "coverage": {
+        "complete": 845,
+        "partial": 22,
+        "unknown": 168
+      },
+      "quality": {
+        "sufficient": 661,
+        "low_confidence": 215,
+        "unknown": 159
+      }
+    },
+    "model_components": 8,
+    "models_bytes": 28499852470,
+    "model_list": [
+      {
+        "text": "Qwen3-ForcedAligner-0.6B",
+        "state_text": "已下载组件"
+      },
+      {
+        "text": "FireRedASR2-LLM",
+        "state_text": "已下载组件"
+      },
+      {
+        "text": "punc_ct-transformer_cn-en-common-vocab471067-large",
+        "state_text": "已下载组件"
+      },
+      {
+        "text": "SenseVoiceSmall",
+        "state_text": "已下载组件"
+      },
+      {
+        "text": "speech_campplus_sv_zh-cn_16k-common",
+        "state_text": "已下载组件"
+      },
+      {
+        "text": "speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        "state_text": "已下载组件"
+      },
+      {
+        "text": "speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        "state_text": "已下载组件"
+      },
+      {
+        "text": "Qwen3-ASR-1.7B",
+        "state_text": "已下载组件"
+      }
+    ],
+    "dictation_history": {
+      "text": "历史模型返回中位 0.360 秒；361 条；截至 10-22 12:01",
+      "median_seconds": 0.36,
+      "samples": 361,
+      "through": "2026-10-22T12:01:42.515000+08:00"
+    },
+    "recent": [
+      {
+        "at": "2026-11-16T01:53:57.019993+00:00",
+        "route": "cloud",
+        "duration_seconds": 214.04,
+        "state_text": "留存正文完整",
+        "text": "稿件 01 · 云端 · 214.04 秒"
+      },
+      {
+        "at": "2026-11-16T01:49:52.958213+00:00",
+        "route": "cloud",
+        "duration_seconds": 45.72,
+        "state_text": "留存正文完整",
+        "text": "稿件 02 · 云端 · 45.72 秒"
+      },
+      {
+        "at": "2026-11-16T00:49:45.872411+00:00",
+        "route": "cloud",
+        "duration_seconds": 75.94,
+        "state_text": "留存正文完整",
+        "text": "稿件 03 · 云端 · 75.94 秒"
+      },
+      {
+        "at": "2026-11-15T09:36:56.313773+00:00",
+        "route": "cloud",
+        "duration_seconds": 6.24,
+        "state_text": "留存正文完整",
+        "text": "稿件 04 · 云端 · 6.24 秒"
+      },
+      {
+        "at": "2026-11-13T19:14:44.297321+00:00",
+        "route": "cloud",
+        "duration_seconds": 11.42,
+        "state_text": "留存正文完整",
+        "text": "稿件 05 · 云端 · 11.42 秒"
+      },
+      {
+        "at": "2026-11-13T07:47:35.052430+00:00",
+        "route": "cloud",
+        "duration_seconds": 24.3,
+        "state_text": "留存正文完整",
+        "text": "稿件 06 · 云端 · 24.3 秒"
+      },
+      {
+        "at": "2026-11-13T07:47:33.774742+00:00",
+        "route": "cloud",
+        "duration_seconds": 53.78,
+        "state_text": "留存正文完整",
+        "text": "稿件 07 · 云端 · 53.78 秒"
+      },
+      {
+        "at": "2026-11-13T05:46:59.115166+00:00",
+        "route": "cloud",
+        "duration_seconds": 84.26,
+        "state_text": "留存正文完整",
+        "text": "稿件 08 · 云端 · 84.26 秒"
+      },
+      {
+        "at": "2026-11-13T05:17:17.286493+00:00",
+        "route": "cloud",
+        "duration_seconds": 119.52,
+        "state_text": "留存正文完整",
+        "text": "稿件 09 · 云端 · 119.52 秒"
+      },
+      {
+        "at": "2026-11-13T04:45:13.873055+00:00",
+        "route": "cloud",
+        "duration_seconds": 38.16,
+        "state_text": "留存正文完整",
+        "text": "稿件 10 · 云端 · 38.16 秒"
+      },
+      {
+        "at": "2026-11-13T04:45:12.286935+00:00",
+        "route": "cloud",
+        "duration_seconds": 18.88,
+        "state_text": "留存正文完整",
+        "text": "稿件 11 · 云端 · 18.88 秒"
+      },
+      {
+        "at": "2026-11-13T02:46:11.243026+00:00",
+        "route": "cloud",
+        "duration_seconds": 162.58,
+        "state_text": "留存正文完整",
+        "text": "稿件 12 · 云端 · 162.58 秒"
+      },
+      {
+        "at": "2026-11-11T08:15:46.664816+00:00",
+        "route": "cloud",
+        "duration_seconds": 2.78,
+        "state_text": "留存正文完整",
+        "text": "稿件 13 · 云端 · 2.78 秒"
+      },
+      {
+        "at": "2026-11-11T08:15:44.422746+00:00",
+        "route": "cloud",
+        "duration_seconds": 2.18,
+        "state_text": "留存正文完整",
+        "text": "稿件 14 · 云端 · 2.18 秒"
+      },
+      {
+        "at": "2026-11-11T08:15:43.517584+00:00",
+        "route": "cloud",
+        "duration_seconds": 8.18,
+        "state_text": "留存正文完整",
+        "text": "稿件 15 · 云端 · 8.18 秒"
+      },
+      {
+        "at": "2026-11-09T02:17:35.662223+00:00",
+        "route": "cloud",
+        "duration_seconds": 3.56,
+        "state_text": "留存正文完整",
+        "text": "稿件 16 · 云端 · 3.56 秒"
+      },
+      {
+        "at": "2026-11-08T13:16:55.247133+00:00",
+        "route": "cloud",
+        "duration_seconds": 12.04,
+        "state_text": "留存正文完整",
+        "text": "稿件 17 · 云端 · 12.04 秒"
+      },
+      {
+        "at": "2026-11-07T07:47:43.215061+00:00",
+        "route": "cloud",
+        "duration_seconds": 16.64,
+        "state_text": "留存正文完整",
+        "text": "稿件 18 · 云端 · 16.64 秒"
+      },
+      {
+        "at": "2026-11-07T06:47:03.161632+00:00",
+        "route": "cloud",
+        "duration_seconds": 8.76,
+        "state_text": "留存正文完整",
+        "text": "稿件 19 · 云端 · 8.76 秒"
+      },
+      {
+        "at": "2026-11-07T05:50:12.031292+00:00",
+        "route": "cloud",
+        "duration_seconds": 6.36,
+        "state_text": "留存正文完整",
+        "text": "稿件 20 · 云端 · 6.36 秒"
+      }
+    ]
+  },
+  "times": {
+    "complete_audio": "2026-11-16T02:00:00.546317+00:00",
+    "local_complete": "2026-11-16T01:34:58.537371+00:00",
+    "cloud_complete": "2026-11-16T02:00:00.546317+00:00",
+    "overlap": "2026-11-16T01:34:58.537371+00:00",
+    "local_audio": "2026-11-16T01:34:58.537371+00:00",
+    "local_receipts": "2026-11-16T01:34:58.537371+00:00",
+    "local_complete_receipts": "2026-11-16T01:34:58.537371+00:00",
+    "cloud_results": "2026-11-16T02:00:00.546317+00:00",
+    "cloud_hours": "2026-11-16T02:00:00.546317+00:00",
+    "cloud_latest": "2026-11-16T02:00:00.546317+00:00",
+    "cloud_undated": "2026-11-16T01:34:58.537371+00:00",
+    "cloud_unnamed": "2026-11-16T02:00:00.546317+00:00",
+    "local_missing_duration": "2026-11-16T02:00:00.546317+00:00",
+    "local_missing_duration_audio": "2026-11-16T02:00:00.546317+00:00",
+    "local_latest": "2026-11-16T01:34:58.537371+00:00",
+    "file_job_success": "2026-11-16T02:00:00.546317+00:00",
+    "api_retained_jobs": "2026-11-16T02:00:00.546317+00:00",
+    "receipt_states": "2026-11-16T01:34:58.537371+00:00",
+    "model_components": "2026-11-16T01:34:58.537371+00:00",
+    "models_bytes": "2026-11-16T01:34:58.537371+00:00",
+    "model_list": "2026-11-16T01:34:58.537371+00:00",
+    "dictation_history": "2026-11-16T02:06:23.446333+00:00",
+    "recent": "2026-11-16T02:00:00.546317+00:00",
+    "inventory": "2026-11-16T02:00:00.546317+00:00"
+  },
+  "receipt_records": [
+    {
+      "dimension": "execution",
+      "state": "completed",
+      "count": 863,
+      "denominator": 1035,
+      "text": "执行 · 完成：863/1035",
+      "state_text": "完成"
+    },
+    {
+      "dimension": "execution",
+      "state": "failed",
+      "count": 35,
+      "denominator": 1035,
+      "text": "执行 · 失败：35/1035",
+      "state_text": "失败"
+    },
+    {
+      "dimension": "execution",
+      "state": "unsupported",
+      "count": 137,
+      "denominator": 1035,
+      "text": "执行 · 不支持：137/1035",
+      "state_text": "不支持"
+    },
+    {
+      "dimension": "coverage",
+      "state": "complete",
+      "count": 845,
+      "denominator": 1035,
+      "text": "覆盖 · 完整：845/1035",
+      "state_text": "完整"
+    },
+    {
+      "dimension": "coverage",
+      "state": "partial",
+      "count": 22,
+      "denominator": 1035,
+      "text": "覆盖 · 部分：22/1035",
+      "state_text": "部分"
+    },
+    {
+      "dimension": "coverage",
+      "state": "unknown",
+      "count": 168,
+      "denominator": 1035,
+      "text": "覆盖 · 未知：168/1035",
+      "state_text": "未知"
+    },
+    {
+      "dimension": "quality",
+      "state": "low_confidence",
+      "count": 215,
+      "denominator": 1035,
+      "text": "质量 · 把握较低：215/1035",
+      "state_text": "把握较低"
+    },
+    {
+      "dimension": "quality",
+      "state": "sufficient",
+      "count": 661,
+      "denominator": 1035,
+      "text": "质量 · 有把握：661/1035",
+      "state_text": "有把握"
+    },
+    {
+      "dimension": "quality",
+      "state": "unknown",
+      "count": 159,
+      "denominator": 1035,
+      "text": "质量 · 未知：159/1035",
+      "state_text": "未知"
+    }
+  ],
+  "size": {
+    "docs_chars": 55828,
+    "code_lines": 45096,
+    "at": "2026-11-16T02:37:09.405539+00:00"
+  },
+  "artifacts": []
+}
