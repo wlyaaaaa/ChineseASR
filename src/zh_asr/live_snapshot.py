@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import statistics
 import subprocess
+import sys
 
 from .model_lifecycle import write_json_atomic
 from .retained_results import read_latest_complete_results
@@ -184,6 +185,22 @@ def write_snapshot(data_root, code_root, output, owner_output, sources_output):
     if manifest and _json(manifest_path) != manifest:
         write_json_atomic(manifest_path, manifest, newline="\n")
     return public
+
+
+def refresh_after_change(data_root):
+    from .process_control import managed_popen_kwargs, terminate_process_tree
+    output = data_root / 'outputs'
+    try:
+        process = subprocess.Popen([sys.executable, '-B', '-m', 'zh_asr.live_snapshot', '--data-root', str(data_root),
+            '--output', str(output/'live.snapshot.json'), '--owner-output', str(output/'live.owner.snapshot.json'),
+            '--sources-output', str(output/'live.sources.json')], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **managed_popen_kwargs())
+        try:
+            if process.wait(timeout=120): raise subprocess.CalledProcessError(process.returncode, 'live_snapshot')
+        finally: terminate_process_tree(process)
+    except Exception as error:
+        import logging
+        logging.getLogger(__name__).warning('live_refresh_failed: %s', type(error).__name__)
 
 
 def main(argv=None):

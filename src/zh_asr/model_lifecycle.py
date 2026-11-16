@@ -416,6 +416,9 @@ def main(argv: list[str] | None = None) -> int:
         result = fetch_aligner(config, args.download_dir)
     else:
         result = actions[args.command](config)
+    if args.command in ('fetch-aligner', 'activate-profile', 'rollback-profile'):
+        from .live_snapshot import refresh_after_change
+        refresh_after_change(config.path.resolve().parent.parent)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 2 if result.get("eligible") is False else 0
 

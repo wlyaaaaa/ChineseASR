@@ -919,6 +919,9 @@ def finalize_cloud_result(intent_path: Path, root: Path, *,
     _local_sidecar(intent, final)
     if final["status"] == "succeeded":
         cleanup_completed_cloud_work(result_path)
+        from .live_snapshot import refresh_after_change
+        data_root = config_path.resolve().parent.parent if config_path else root.parent.parent
+        if root == data_root/'outputs/cloud-jobs': refresh_after_change(data_root)
     return final
 
 
