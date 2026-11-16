@@ -134,7 +134,7 @@ def collect(data_root, code_root):
         text = path.read_text(encoding="utf-8-sig")
         size["docs_chars" if path.suffix.lower() == ".md" else "code_lines"] += (
             sum(not c.isspace() for c in text) if path.suffix.lower() == ".md" else len(text.splitlines()))
-    recent, named, artifacts, aliases = [], [], [], {}
+    recent, named, artifacts, aliases = [], [], [], {"asr.transcripts": dict(path=str(out.resolve()), format="exists")}
     ordered = sorted(latest.values(), key=lambda r: datetime.fromisoformat(r["at"]).timestamp(), reverse=True)[:20]
     for index, row in enumerate(ordered, 1):
         route = "云端" if row["route"] == "cloud" else "本地"
@@ -144,10 +144,8 @@ def collect(data_root, code_root):
         named.append(dict(record, text=row["source_name"]))
         path = row["transcript"]
         if path and path.is_file():
-            alias = f"asr.artifact.{index:02d}"
-            aliases[alias] = dict(path=str(path.resolve()), format="exists")
             artifacts.append(dict(at=row["at"], kind="transcript", title=f"{row['source_name']} · {route} · {duration}",
-                                  status="completed", public="owner", open=dict(source=alias)))
+                                  status="completed", public="owner", open=dict(source="asr.transcripts", path=path.relative_to(out).as_posix())))
     metrics["recent"] = recent
     return metrics, receipt_rows, size, dict(metrics=dict(recent_named=named), artifacts=artifacts), aliases
 
