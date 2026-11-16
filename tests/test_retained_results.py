@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -40,10 +41,12 @@ class RetainedResultsTests(unittest.TestCase):
             metrics = dict.fromkeys(("complete_audio", "local_complete", "cloud_complete", "overlap", "local_audio",
                                      "local_receipts", "local_complete_receipts", "local_latest", "receipt_states"), 1)
             sample = (metrics, [], {"code_lines": 2}, {"metrics": {}, "artifacts": []}, {})
-            with patch("zh_asr.live_snapshot.collect", side_effect=lambda *args: json.loads(json.dumps(sample))):
+            times = [datetime(2026, 11, 16, hour, tzinfo=timezone.utc) for hour in (1, 2)]
+            with patch("zh_asr.live_snapshot.collect", side_effect=lambda *args: json.loads(json.dumps(sample))), patch("zh_asr.live_snapshot.datetime") as clock:
+                clock.now.side_effect = times
                 first = write_snapshot(root, root, output, owner, sources)
                 self.assertNotIn(b"\r\n", output.read_bytes())
                 self.assertNotIn(b"\r\n", owner.read_bytes())
                 second = write_snapshot(root, root, output, owner, sources)
-                self.assertNotEqual(first.pop("checked_at"), second.pop("checked_at"))
+                self.assertEqual([first.pop("checked_at"), second.pop("checked_at")], [at.isoformat() for at in times])
                 self.assertEqual(first, second)
