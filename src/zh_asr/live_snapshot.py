@@ -162,7 +162,7 @@ def write_snapshot(data_root, code_root, output, owner_output, sources_output):
     times["inventory"] = previous.get("times", {}).get("inventory", now) if all(
         previous.get("metrics", {}).get(key) == metrics[key] for key in inventory) else now
     size["at"] = previous.get("size", {}).get("at", now) if all(previous.get("size", {}).get(k) == v for k, v in size.items()) else now
-    public = dict(v=1, at=now, checked_at=now, scope="排除明确样例的现存结果；不是全部历史或人工准确认证", metrics=metrics,
+    public = dict(v=1, at=now, checked_at=now, scope="本机留存的转写结果", metrics=metrics,
                   times=times, receipt_records=receipts, size=size, artifacts=[])
     public["at"] = previous.get("at", now) if all(previous.get(k) == v for k, v in public.items() if k not in {"at", "checked_at"}) else now
     owner.update(v=1, at=public["at"], scope="同原音合并后的最近二十份留存完整正文；文件名和正文仅本人")
