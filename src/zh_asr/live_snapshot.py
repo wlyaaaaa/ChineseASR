@@ -155,7 +155,10 @@ def write_snapshot(data_root, code_root, output, owner_output, sources_output):
     output, owner_output, sources_output = (p.resolve() for p in (output, owner_output, sources_output))
     metrics, receipts, size, owner, aliases = collect(data_root, code_root)
     previous, now = _json(output), datetime.now(timezone.utc).isoformat()
-    times = {key: previous.get("times", {}).get(key, now) if previous.get("metrics", {}).get(key) == value else now
+    checked = {"models_bytes", "model_list", "cloud_unnamed",
+               "local_missing_duration", "local_missing_duration_audio"}
+    times = {key: previous.get("times", {}).get(key, now)
+             if key not in checked and previous.get("metrics", {}).get(key) == value else now
              for key, value in metrics.items()}
     inventory = ("complete_audio", "local_complete", "cloud_complete", "overlap", "local_audio",
                  "local_receipts", "local_complete_receipts", "local_latest", "receipt_states")
@@ -164,7 +167,8 @@ def write_snapshot(data_root, code_root, output, owner_output, sources_output):
     size["at"] = previous.get("size", {}).get("at", now) if all(previous.get("size", {}).get(k) == v for k, v in size.items()) else now
     public = dict(v=1, at=now, checked_at=now, scope="本机留存的转写结果", metrics=metrics,
                   times=times, receipt_records=receipts, size=size, artifacts=[])
-    public["at"] = previous.get("at", now) if all(previous.get(k) == v for k, v in public.items() if k not in {"at", "checked_at"}) else now
+    public["at"] = previous.get("at", now) if all(previous.get(k) == v for k, v in public.items()
+                                                if k not in {"at", "checked_at", "times"}) else now
     owner.update(v=1, at=public["at"], scope="同原音合并后的最近二十份留存完整正文；文件名和正文仅本人")
     for path, payload in ((output, public), (owner_output, owner)):
         if _json(path) != payload:
