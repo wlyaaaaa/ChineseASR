@@ -124,8 +124,9 @@ def collect(data_root, code_root):
                    local_latest=max((r["at"] for r in complete), default=None))
     index = out / "api/file-jobs"
     metrics["file_job_success"] = sum(_json(p).get("status") == "succeeded" for p in index.glob("*.json") if re.fullmatch("[0-9a-f]{64}", p.stem)) if index.is_dir() else None
-    jobs = out / "api/jobs.json"
-    metrics["api_retained_jobs"] = len(_json(jobs)["jobs"]) if jobs.is_file() else None
+    jobs = _json(out / "api/jobs.json")
+    metrics["api_retained_jobs"] = len(jobs["jobs"]) if "jobs" in jobs else None
+    metrics["api_retained_jobs_at"] = jobs.get("updated_at")
     metrics["receipt_states"] = dict(text=f"{len(local)} 份回执；分三组统计，不是准确率", denominator=len(local),
                                     **{key: dict(value) for key, value in states.items()})
     receipt_rows = [dict(dimension=key, state=state, count=count, denominator=len(local),
@@ -166,12 +167,15 @@ def collect(data_root, code_root):
 def write_snapshot(data_root, code_root, output, owner_output, sources_output):
     output, owner_output, sources_output = (p.resolve() for p in (output, owner_output, sources_output))
     metrics, receipts, size, owner, aliases = collect(data_root, code_root)
+    jobs_at = metrics.pop("api_retained_jobs_at", None)
     previous, now = _json(output), datetime.now(timezone.utc).isoformat()
     checked = {"models_bytes", "model_list", "cloud_unnamed",
                "local_missing_duration", "local_missing_duration_audio"}
     times = {key: previous.get("times", {}).get(key, now)
              if key not in checked and previous.get("metrics", {}).get(key) == value else now
              for key, value in metrics.items()}
+    times["api_retained_jobs"] = (datetime.fromtimestamp(jobs_at, timezone.utc).isoformat()
+                                  if type(jobs_at) in (int, float) else None)
     inventory = ("complete_audio", "local_complete", "cloud_complete", "overlap", "local_audio",
                  "local_receipts", "local_complete_receipts", "local_latest", "receipt_states")
     times["inventory"] = previous.get("times", {}).get("inventory", now) if all(

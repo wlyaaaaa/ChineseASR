@@ -48,6 +48,20 @@ class RetainedResultsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 read_latest_complete_results(paths, normalize)
 
+    def test_retained_jobs_timestamp_changes_when_the_count_stays_the_same(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            jobs = root / "outputs/api/jobs.json"
+            jobs.parent.mkdir(parents=True)
+            public, owner, sources = (root / f"{name}.json" for name in ("public", "owner", "sources"))
+            with patch("zh_asr.live_snapshot.subprocess.check_output", return_value=b""):
+                for day in (24, 25):
+                    at = datetime(2026, 11, day, tzinfo=timezone.utc)
+                    jobs.write_text(json.dumps(dict(updated_at=at.timestamp(), jobs=[{}] * 200)))
+                    result = write_snapshot(root, root, public, owner, sources)
+                    self.assertEqual(result["metrics"]["api_retained_jobs"], 200)
+                    self.assertEqual(result["times"]["api_retained_jobs"], at.isoformat())
+
     def test_duration_excludes_overlap_and_gaps_and_unchanged_snapshot_keeps_time(self):
         self.assertEqual(covered_ms([dict(start_ms=a, end_ms=b) for a, b in [(0, 10), (5, 20), (30, 40)]]), 30)
         with tempfile.TemporaryDirectory() as folder:
