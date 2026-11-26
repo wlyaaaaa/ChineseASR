@@ -37,6 +37,7 @@ _WM_KEYDOWN = 0x0100
 _WM_KEYUP = 0x0101
 _WM_SYSKEYDOWN = 0x0104
 _WM_SYSKEYUP = 0x0105
+_WM_TIMER = 0x0113
 _WM_QUIT = 0x0012
 _VK_ESCAPE = 0x1B
 _VK_H = 0x48
@@ -76,6 +77,8 @@ _PANEL_HEIGHT = 75
 _PM_NOREMOVE = 0
 _MONITORINFOF_PRIMARY = 0x00000001
 _TOPOLOGY_REFRESH_SECONDS = 1.0
+_HOOK_REFRESH_MS = 5000
+_HOOK_IDLE_SECONDS = 10.0
 
 _MUTEX_NAME = r"Local\ChineseASR.DictationHost.v1"
 _QUIT_EVENT_NAME = r"Local\ChineseASR.DictationHost.Quit.v1"
@@ -292,12 +295,13 @@ class _Platform(Protocol):
     def named_mutex_exists(self, name: str) -> bool: ...
     def event_is_signaled(self, handle: int) -> bool: ...
     def install_keyboard_hook(self, callback: object) -> int: ...
-    def uninstall_keyboard_hook(self, handle: int) -> None: ...
+    def uninstall_keyboard_hook(self, handle: int) -> bool: ...
     def call_next_hook(self, handle: int, n_code: int, w_param: int, l_param: int) -> int: ...
     def current_thread_id(self) -> int: ...
     def ensure_message_queue(self) -> None: ...
-    def pump_messages(self) -> None: ...
+    def pump_messages(self, on_timer: Callable[[], None]) -> None: ...
     def post_thread_quit(self, thread_id: int) -> bool: ...
+    def shortcut_keys_down(self) -> bool: ...
     def get_foreground_window(self) -> int: ...
     def get_root_window(self, hwnd: int) -> int: ...
     def get_window_process_id(self, hwnd: int) -> int: ...
@@ -338,6 +342,10 @@ class _WinApi:
         self.user32.PeekMessageW.restype = _BOOL
         self.user32.GetMessageW.argtypes = [ctypes.POINTER(_MSG), _HWND, wintypes.UINT, wintypes.UINT]
         self.user32.GetMessageW.restype = ctypes.c_int
+        self.user32.SetTimer.argtypes = [_HWND, _WPARAM, wintypes.UINT, ctypes.c_void_p]
+        self.user32.SetTimer.restype = _WPARAM
+        self.user32.KillTimer.argtypes = [_HWND, _WPARAM]
+        self.user32.KillTimer.restype = _BOOL
         self.user32.TranslateMessage.argtypes = [ctypes.POINTER(_MSG)]
         self.user32.TranslateMessage.restype = _BOOL
         self.user32.DispatchMessageW.argtypes = [ctypes.POINTER(_MSG)]
@@ -443,11 +451,13 @@ class _WinApi:
 
     def install_keyboard_hook(self, callback: object) -> int:
         module = self.kernel32.GetModuleHandleW(None)
-        return _handle_value(self.user32.SetWindowsHookExW(_WH_KEYBOARD_LL, callback, module, 0))
+        handle = _handle_value(self.user32.SetWindowsHookExW(_WH_KEYBOARD_LL, callback, module, 0))
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return handle
 
-    def uninstall_keyboard_hook(self, handle: int) -> None:
-        if handle:
-            self.user32.UnhookWindowsHookEx(_HHOOK(handle))
+    def uninstall_keyboard_hook(self, handle: int) -> bool:
+        return bool(self.user32.UnhookWindowsHookEx(_HHOOK(handle)))
 
     def call_next_hook(self, handle: int, n_code: int, w_param: int, l_param: int) -> int:
         return int(self.user32.CallNextHookEx(_HHOOK(handle), n_code, w_param, l_param))
@@ -459,17 +469,32 @@ class _WinApi:
         message = _MSG()
         self.user32.PeekMessageW(ctypes.byref(message), None, 0, 0, _PM_NOREMOVE)
 
-    def pump_messages(self) -> None:
+    def pump_messages(self, on_timer: Callable[[], None]) -> None:
         message = _MSG()
-        while True:
-            result = int(self.user32.GetMessageW(ctypes.byref(message), None, 0, 0))
-            if result <= 0:
-                return
-            self.user32.TranslateMessage(ctypes.byref(message))
-            self.user32.DispatchMessageW(ctypes.byref(message))
+        timer = self.user32.SetTimer(None, 0, _HOOK_REFRESH_MS, None)
+        if not timer:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            while True:
+                result = int(self.user32.GetMessageW(ctypes.byref(message), None, 0, 0))
+                if result == -1:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                if result == 0:
+                    return
+                if message.message == _WM_TIMER and not message.hwnd and message.wParam == timer:
+                    on_timer()
+                    continue
+                self.user32.TranslateMessage(ctypes.byref(message))
+                self.user32.DispatchMessageW(ctypes.byref(message))
+        finally:
+            self.user32.KillTimer(None, timer)
 
     def post_thread_quit(self, thread_id: int) -> bool:
         return bool(self.user32.PostThreadMessageW(thread_id, _WM_QUIT, 0, 0))
+
+    def shortcut_keys_down(self) -> bool:
+        return any(self.user32.GetAsyncKeyState(key) & 0x8000
+                   for key in (*_MODIFIER_KEYS, _VK_H, _VK_ESCAPE))
 
     def get_foreground_window(self) -> int:
         return _handle_value(self.user32.GetForegroundWindow())
@@ -779,9 +804,8 @@ class WindowsHost:
         self._hook_handle = 0
         self._hook_thread: threading.Thread | None = None
         self._hook_thread_id = 0
-        self._hook_ready = threading.Event()
         self._hook_stop = threading.Event()
-        self._hook_error = ""
+        self._hook_last_activity = 0.0
         self._quit_event_handle = 0
         self._start_event_handle = 0
         self._quit_notified = False
@@ -1065,7 +1089,10 @@ class WindowsHost:
             self._install_hook()
             self._start_tray()
             self._poll()
-            self._root.mainloop()
+            if self._running:
+                self._root.mainloop()
+            if not self._close_requested:
+                raise RuntimeError("Dictation desktop event loop exited unexpectedly")
             return True
         finally:
             self._finalize_close()
@@ -1613,8 +1640,6 @@ class WindowsHost:
         if self._hook_thread is not None and self._hook_thread.is_alive():
             return
         self._hook_stop.clear()
-        self._hook_ready.clear()
-        self._hook_error = ""
         self._hook_handle = 0
         self._hook_thread_id = 0
         self._hook_thread = threading.Thread(
@@ -1623,40 +1648,52 @@ class WindowsHost:
             daemon=True,
         )
         self._hook_thread.start()
-        if not self._hook_ready.wait(1.5):
-            self._hook_error = "keyboard hook worker did not become ready"
-            self._stop_hook_worker()
-        if not self._hook_handle:
-            self.show("听写快捷键不可用", "可通过托盘开始或停止听写", error=True)
 
     def _hook_worker(self) -> None:
-        handle = 0
         try:
             self._api.ensure_message_queue()
             with self._lock:
                 self._hook_thread_id = self._api.current_thread_id()
-            self._hook_proc = _HOOKPROC(self._low_level_hook_callback)
-            handle = self._api.install_keyboard_hook(self._hook_proc)
-            with self._lock:
-                self._hook_handle = handle
-            if not handle:
-                self._hook_error = "SetWindowsHookExW returned no hook"
-        except Exception as exc:
-            self._hook_error = f"{type(exc).__name__} while installing keyboard hook"
-        finally:
-            self._hook_ready.set()
-
-        if not handle:
-            return
-        try:
             if not self._hook_stop.is_set():
-                self._api.pump_messages()
+                self._hook_proc = _HOOKPROC(self._low_level_hook_callback)
+                self._renew_keyboard_hook()
+                self._api.pump_messages(self._refresh_idle_hook)
+        except Exception:
+            LOG.exception("dictation keyboard hook message pump failed")
         finally:
-            self._api.uninstall_keyboard_hook(handle)
+            if self._hook_handle:
+                self._api.uninstall_keyboard_hook(self._hook_handle)
+                self._hook_handle = 0
             with self._lock:
-                if self._hook_handle == handle:
-                    self._hook_handle = 0
                 self._hook_thread_id = 0
+
+    def _renew_keyboard_hook(self) -> None:
+        previous = self._hook_handle
+        try:
+            self._hook_handle = self._api.install_keyboard_hook(self._hook_proc)
+        except OSError as error:
+            LOG.warning("could not register dictation keyboard hook; will retry: %s", error)
+            return
+        if not previous:
+            LOG.info("dictation keyboard hook registered for Win+H and Ctrl+Win+H")
+        elif not self._api.uninstall_keyboard_hook(previous):
+            LOG.warning("registered a replacement; Windows could not remove the previous keyboard hook")
+        self._hook_last_activity = time.monotonic()
+
+    def _refresh_idle_hook(self) -> None:
+        # Windows can silently drop a timed-out low-level hook while its thread
+        # stays alive. Refresh during quiet periods without injecting probe keys.
+        if self._hook_handle:
+            if (time.monotonic() - self._hook_last_activity < _HOOK_IDLE_SECONDS
+                    or self._api.shortcut_keys_down()):
+                return
+            with self._lock:
+                self._win_keys.clear()
+                self._ctrl_keys.clear()
+                self._alt_keys.clear()
+                self._shift_keys.clear()
+                self._suppress_h = self._suppress_escape = False
+        self._renew_keyboard_hook()
 
     def _stop_hook_worker(self) -> None:
         self._hook_stop.set()
@@ -1676,6 +1713,7 @@ class WindowsHost:
     def _low_level_hook_callback(self, n_code: int, w_param: int, l_param: int) -> int:
         try:
             if n_code >= 0:
+                self._hook_last_activity = time.monotonic()
                 raw = ctypes.cast(l_param, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
                 event = KeyboardEvent(
                     vk_code=int(raw.vkCode),
@@ -1761,20 +1799,28 @@ class WindowsHost:
         if self._close_requested:
             self._finalize_close()
             return
-        self._drain_ui_calls()
-        if self._quit_event_handle and self._api.event_is_signaled(self._quit_event_handle):
-            self._events.put("quit")
-        elif self._start_event_handle and self._api.event_is_signaled(self._start_event_handle):
-            self._events.put("toggle")
-        self._dispatch_pending_events()
-        if self._close_requested:
-            self._finalize_close()
+        if self._hook_thread is not None and not self._hook_thread.is_alive():
+            LOG.error("dictation keyboard hook thread stopped; exiting for scheduled restart")
+            self._running = False
+            self._root.quit()
             return
-        self._render_overlay()
-        # A close request can arrive during rendering. Always schedule one more
-        # turn while running, otherwise the request loses its only UI wake-up.
-        if self._running:
-            self._root.after(25, self._poll)
+        try:
+            self._drain_ui_calls()
+            if self._quit_event_handle and self._api.event_is_signaled(self._quit_event_handle):
+                self._events.put("quit")
+            elif self._start_event_handle and self._api.event_is_signaled(self._start_event_handle):
+                self._events.put("toggle")
+            self._dispatch_pending_events()
+            if self._close_requested:
+                self._finalize_close()
+                return
+            self._render_overlay()
+        except Exception:
+            LOG.exception("dictation UI poll failed")
+        finally:
+            # A display/driver error during rendering must not strand the host.
+            if self._running:
+                self._root.after(25, self._poll)
 
     def _drain_ui_calls(self) -> None:
         while True:

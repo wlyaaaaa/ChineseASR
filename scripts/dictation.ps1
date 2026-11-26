@@ -167,7 +167,8 @@ try {
         $Action = New-ScheduledTaskAction -Execute $Pythonw -Argument '-m zh_asr.dictation' -WorkingDirectory $Root
         $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $User
         $Principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
-        $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+        # The hotkey must respond at interactive priority even though the task starts hidden.
+        $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Priority 5
         Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Description 'Local ChineseASR Win+H dictation for the signed-in user. Restore with scripts\dictation.ps1 -Mode Install.' -Force | Out-Null
         Install-DictationShortcut
         Start-ScheduledTask -TaskName $TaskName -TaskPath '\'
@@ -192,6 +193,7 @@ try {
         running = Test-DictationRunning
         task_name = $TaskName
         task_state = if ($Task) { [string]$Task.State } else { 'NotInstalled' }
+        task_priority = if ($Task) { [int]$Task.Settings.Priority } else { $null }
         hotkey = 'Win+H'
         hotkeys = @('Win+H', 'Ctrl+Win+H')
         config = (Join-Path $Root 'configs\dictation.yaml')

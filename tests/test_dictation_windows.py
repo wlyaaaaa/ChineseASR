@@ -46,12 +46,14 @@ class FakeWindowsApi:
         self.exposed_events: set[str] = set()
         self.signaled_events: set[str] = set()
         self.hook_callback = None
+        self.hook_installs = 0
         self.unhooked: list[int] = []
+        self.keys_down = False
         self.menu_masks = 0
         self.nonactivation_calls: list[tuple[int, bool]] = []
         self.move_calls: list[tuple[int, int, int]] = []
         self.own_process_windows: set[int] = set()
-        self.message_queue_ready = threading.Event()
+        self.message_pump_ready = threading.Event()
         self.message_quit = threading.Event()
         self.posted_thread_quits: list[int] = []
         self.monitors: list[_DisplayMonitor] = []
@@ -101,10 +103,12 @@ class FakeWindowsApi:
 
     def install_keyboard_hook(self, callback: object) -> int:
         self.hook_callback = callback
-        return 701
+        self.hook_installs += 1
+        return 700 + self.hook_installs
 
-    def uninstall_keyboard_hook(self, handle: int) -> None:
+    def uninstall_keyboard_hook(self, handle: int) -> bool:
         self.unhooked.append(handle)
+        return True
 
     def call_next_hook(self, *_args: object) -> int:
         return 0
@@ -113,10 +117,14 @@ class FakeWindowsApi:
         return threading.get_ident()
 
     def ensure_message_queue(self) -> None:
-        self.message_queue_ready.set()
+        pass
 
-    def pump_messages(self) -> None:
+    def pump_messages(self, _on_timer) -> None:
+        self.message_pump_ready.set()
         self.message_quit.wait(1)
+
+    def shortcut_keys_down(self) -> bool:
+        return self.keys_down
 
     def post_thread_quit(self, thread_id: int) -> bool:
         self.posted_thread_quits.append(thread_id)
@@ -255,7 +263,7 @@ class WindowsHostTests(unittest.TestCase):
         host = self.make_host()
         host._install_hook()
         try:
-            self.assertTrue(self.api.message_queue_ready.wait(0.2))
+            self.assertTrue(self.api.message_pump_ready.wait(1))
             self.assertEqual(701, host._hook_handle)
             self.assertIsNotNone(host._hook_thread)
         finally:
@@ -264,6 +272,25 @@ class WindowsHostTests(unittest.TestCase):
         self.assertEqual([701], self.api.unhooked)
         self.assertEqual(0, host._hook_handle)
         self.assertEqual(1, len(self.api.posted_thread_quits))
+
+    def test_idle_hook_renewal_keeps_held_keys_and_clears_a_missed_release(self):
+        host = self.make_host()
+        host._renew_keyboard_hook()
+        host._handle_keyboard_event(KeyboardEvent(_VK_LMENU, _WM_KEYDOWN))
+        host._hook_last_activity = time.monotonic() - 20
+        self.api.keys_down = True
+        host._refresh_idle_hook()
+        self.assertEqual(701, host._hook_handle)
+
+        self.api.keys_down = False
+        host._refresh_idle_hook()
+        host._refresh_idle_hook()
+        self.assertEqual(702, host._hook_handle)
+        self.assertEqual([701], self.api.unhooked)
+        host._handle_keyboard_event(KeyboardEvent(_VK_LWIN, _WM_KEYDOWN))
+        self.assertTrue(host._handle_keyboard_event(KeyboardEvent(_VK_H, _WM_KEYDOWN)))
+        host._dispatch_pending_events()
+        self.assertEqual(["toggle"], self.calls)
 
     def test_tray_uses_our_daemon_thread_and_can_be_stopped_boundedly(self):
         tray = FakeTray()
@@ -721,6 +748,20 @@ class WindowsHostTests(unittest.TestCase):
         next_turn()
         self.assertTrue(host._finalized)
         self.assertFalse(host._running)
+
+    def test_failed_render_keeps_polling_for_shortcuts(self):
+        host = self.make_host()
+        root = FakeScheduledRoot()
+        host._root = root
+        host._running = True
+        with patch.object(host, "_render_overlay", side_effect=RuntimeError("display changed")):
+            with self.assertLogs("zh_asr.dictation.windows", level="ERROR"):
+                host._poll()
+
+        host._events.put("toggle")
+        _delay, next_turn = root.scheduled.pop()
+        next_turn()
+        self.assertEqual(["toggle"], self.calls)
 
     def test_overlay_reapplies_nonactivation_after_tk_finishes_wrapping_window(self):
         host = self.make_host()

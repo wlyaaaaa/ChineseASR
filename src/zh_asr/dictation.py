@@ -15,6 +15,11 @@ import sys
 import threading
 import time
 
+if __name__ == "__main__" and sys.platform == "win32":
+    # The desktop path handles one audio stream. Avoid starting a desktop-wide
+    # OpenBLAS thread pool in both the host and its model child on Windows.
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import numpy as np
 
 from .config import get_engine_spec, load_model_config, project_root
@@ -845,7 +850,11 @@ def main(argv=None) -> int:
         return 0
     controller = DictationController(host, settings)
     controller.start()
-    host.run()
+    try:
+        host.run()
+    except Exception:
+        LOG.exception("dictation desktop host failed")
+        return 1
     return 0
 
 
