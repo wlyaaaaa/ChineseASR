@@ -5,11 +5,26 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from zh_asr.live_snapshot import covered_ms, write_snapshot
+from zh_asr.live_snapshot import covered_ms, dictation_history, write_snapshot
 from zh_asr.retained_results import read_latest_complete_results
 
 
 class RetainedResultsTests(unittest.TestCase):
+    def test_dictation_history_keeps_retained_samples_after_log_rotation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            log = Path(folder) / "runtime.log"
+            rotated = log.with_suffix(".log.1")
+            self.assertIsNone(dictation_history(log))
+            rotated.write_text("2026-11-25 10:05:06,000 INFO dictation model operation=transcribe seconds=1.3\n")
+            log.write_text("2026-11-25 11:05:07,000 INFO dictation model operation=prepare seconds=2.4\n")
+            old_only = dictation_history(log)
+            self.assertEqual((old_only["samples"], old_only["median_seconds"]), (1, 1.3))
+            with log.open("a") as stream:
+                stream.write("2026-11-25 12:05:08,000 INFO dictation model operation=transcribe seconds=2.7\n")
+            both = dictation_history(log)
+            self.assertEqual((both["samples"], both["median_seconds"]), (2, 2.0))
+            self.assertEqual(both["through"], "2026-11-26T03:05:08+08:00")
+
     def test_batch_uses_latest_complete_once_per_original_with_real_timezones(self):
         with tempfile.TemporaryDirectory() as folder:
             paths, seen = [], []

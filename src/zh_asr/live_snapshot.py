@@ -39,6 +39,27 @@ def covered_ms(chunks):
     return total
 
 
+def dictation_history(log):
+    samples = []
+    # The listener retains one rotated file. Read it first so a rollover cannot count the same file twice.
+    for path in (log.with_suffix(".log.1"), log):
+        try:
+            lines = path.read_text(encoding="utf-8-sig").splitlines()
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            match = re.search(r"model[^\n]*?operation=transcribe[^\n]*?seconds=([\d.]+)", line)
+            if match:
+                instant = datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=timezone(timedelta(hours=-7)))
+                samples.append((instant.astimezone(timezone(timedelta(hours=8))), float(match[1])))
+    if not samples:
+        return None
+    through = max(at for at, _ in samples)
+    median = statistics.median(seconds for _, seconds in samples)
+    return dict(text=f"历史模型返回中位 {median:.3f} 秒；{len(samples)} 条；截至 {through:%m-%d %H:%M}",
+                median_seconds=median, samples=len(samples), through=through.isoformat())
+
+
 def collect(data_root, code_root):
     out = data_root / "outputs"
     if not out.is_dir():
@@ -116,16 +137,7 @@ def collect(data_root, code_root):
     metrics.update(model_components=sum(p.is_dir() for p in components) if models.is_dir() else None,
                    models_bytes=sum(p.stat().st_size for p in models.rglob("*") if p.is_file()) if models.is_dir() else None)
     metrics["model_list"] = [dict(text=p.name, state_text="已下载组件") for p in sorted(components) if p.is_dir()]
-    log = out / "dictation/runtime.log"
-    samples = []
-    if log.is_file():
-        for line in log.read_text(encoding="utf-8-sig").splitlines():
-            match = re.search(r"model[^\n]*?operation=transcribe[^\n]*?seconds=([\d.]+)", line)
-            if match:
-                instant = datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=timezone(timedelta(hours=-7)))
-                samples.append((instant.astimezone(timezone(timedelta(hours=8))).isoformat(), float(match[1])))
-    metrics["dictation_history"] = (dict(text=f"历史模型返回中位 {statistics.median(v for _, v in samples):.3f} 秒；{len(samples)} 条；截至 {datetime.fromisoformat(samples[-1][0]):%m-%d %H:%M}",
-                                        median_seconds=statistics.median(v for _, v in samples), samples=len(samples), through=samples[-1][0]) if samples else None)
+    metrics["dictation_history"] = dictation_history(out / "dictation/runtime.log")
     files = subprocess.check_output(["git", "-C", str(code_root), "ls-files", "-z"]).decode("utf-8").split("\0")
     size = dict(docs_chars=0, code_lines=0)
     for name in filter(None, files):
