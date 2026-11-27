@@ -29,6 +29,7 @@ class FileJobTests(unittest.TestCase):
         self.process = self.enterContext(mock.patch.object(jobs, "_json_process"))
         self.http = self.enterContext(mock.patch.object(jobs, "_http"))
         self.spawn = self.enterContext(mock.patch.object(jobs, "_spawn_worker", return_value=1234))
+        self.refresh = self.enterContext(mock.patch.object(jobs, "refresh_after_change"))
         self.enterContext(mock.patch.object(jobs, "_cloud_budget", return_value=600))
         self.enterContext(mock.patch.object(jobs, "_alive", return_value=True))
 
@@ -52,12 +53,21 @@ class FileJobTests(unittest.TestCase):
     def test_same_sha_success_is_reused_across_paths_without_new_work(self):
         _, artifact = self._artifact()
         self.reuse.return_value = dict(status="succeeded", route="cloud", timestamps="unavailable", job_id="kept", artifact=artifact)
+
+        def check_committed(root):
+            path = root / "outputs/api/file-jobs" / (self.digest + ".json")
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "succeeded")
+            with jobs._claim(path.with_suffix(".lock")) as claimed:
+                self.assertTrue(claimed)
+
+        self.refresh.side_effect = check_committed
         first = jobs.file_job(self.audio, root=self.root)
         renamed = self.root / "renamed.wav"
         renamed.write_bytes(self.audio.read_bytes())
         second = jobs.file_job(renamed, root=self.root)
         self.assertEqual((first["job_id"], second["job_id"]), ("kept", "kept"))
         self.reuse.assert_called_once_with(self.digest, self.root)
+        self.refresh.assert_called_once_with(self.root)
         self.spawn.assert_not_called()
         self.process.assert_not_called()
 
@@ -67,6 +77,7 @@ class FileJobTests(unittest.TestCase):
         self.spawn.assert_called_once()
         self.spawn.assert_called_once_with(self.audio.resolve(), self.root)
         self.process.assert_not_called()
+        self.refresh.assert_not_called()
 
     def test_cloud_success_without_sentence_times_does_not_run_local(self):
         self.process.return_value = dict(status="succeeded", source_audio_sha256=self.digest,

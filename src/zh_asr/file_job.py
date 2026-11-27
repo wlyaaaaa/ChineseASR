@@ -14,6 +14,7 @@ sys.path.append(r"E:\.agents\tools")
 from automation_context import is_background_automation
 
 from .config import project_root
+from .live_snapshot import refresh_after_change
 from .model_lifecycle import write_json_atomic
 from .process_control import managed_popen_kwargs, terminate_process_tree
 from .result_writer import file_sha256
@@ -395,6 +396,7 @@ def file_job(audio: Path, *, worker: bool = False, root: Path | None = None) -> 
                     "completed_chunks": progress.get("completed_chunks", 0)}
         if state["status"] == "succeeded" and _saved_success(state):
             return state
+        was_successful = state["status"] == "succeeded"
         if state["status"] == "succeeded" or state.get("cloud_completed") or state.get("transcript_completed"):
             # A completed cloud transcript with a readback gap is rechecked,
             # never uploaded again or recognized a second time just for timing.
@@ -429,4 +431,6 @@ def file_job(audio: Path, *, worker: bool = False, root: Path | None = None) -> 
                 write_json_atomic(path, state)
                 state = _schedule_worker(state, audio, root)
         write_json_atomic(path, state)
-        return state
+    if state["status"] == "succeeded" and not was_successful:
+        refresh_after_change(root)
+    return state

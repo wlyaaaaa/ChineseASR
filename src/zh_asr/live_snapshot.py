@@ -219,8 +219,17 @@ def refresh_after_change(data_root):
             if process.wait(timeout=120): raise subprocess.CalledProcessError(process.returncode, 'live_snapshot')
         finally: terminate_process_tree(process)
     except Exception as error:
-        import logging
-        logging.getLogger(__name__).warning('live_refresh_failed: %s', type(error).__name__)
+        reason = f'live_refresh_failed: {type(error).__name__}'
+        if sys.stderr is not None:
+            import logging
+            logging.getLogger(__name__).warning(reason)
+        else:
+            # The detached Windows worker uses pythonw, which has no stderr.
+            try:
+                write_json_atomic(output / 'live.refresh-error.json',
+                                  dict(at=datetime.now(timezone.utc).isoformat(), reason=reason))
+            except OSError:
+                pass
 
 
 def main(argv=None):
